@@ -10,8 +10,9 @@ use zeroize::Zeroize;
 
 use crate::{
     ActorId, AuditKind, AuditRecord, DeviceId, DeviceRegistration, ExplicitPreferences,
-    FocusSession, Goal, GoalId, IdempotencyKey, Intervention, InterventionDecisionWrite,
-    ModelRouteApproval, PendingInterventionDelivery, PermissionGrant, PolicyDecision, PortFuture,
+    FocusSession, FocusSessionState, Goal, GoalId, GrantState, IdempotencyKey, Intervention,
+    InterventionDecisionWrite, InterventionOutcome, InterventionState, ModelRouteApproval,
+    OutboxState, PendingInterventionDelivery, PermissionGrant, PolicyDecision, PortFuture,
     ResourceBinding, SelectedResourceDeletionTombstone, SteinIdentity,
 };
 
@@ -171,6 +172,428 @@ impl Drop for NativeResourceCleanup {
     }
 }
 
+/// Private durable obligation to delete a provider credential after its model
+/// route authority has already been revoked. The opaque secret reference is
+/// bounded metadata, never the secret value, and never enters public views.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SecretDeletionCleanup {
+    pub owner: ActorId,
+    pub model_route_approval_id: crate::ModelRouteApprovalId,
+    pub secret_ref: crate::SecretRef,
+    pub created_at: OffsetDateTime,
+}
+
+/// One durable focus-workflow state transition and its content-free lifecycle
+/// audit. Repositories commit this write as one atomic unit so a crash cannot
+/// leave the new authority/lifecycle state without its corresponding audit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FocusSessionLifecycleWrite {
+    pub session: FocusSession,
+    pub expected_revision: u64,
+    pub audit: AuditRecord,
+}
+
+impl FocusSessionLifecycleWrite {
+    pub fn validate(&self) -> Result<(), RepositoryError> {
+        if self.expected_revision == u64::MAX
+            || self.session.revision != self.expected_revision + 1
+            || self.audit.owner != self.session.owner
+            || self.audit.kind != AuditKind::FocusSessionStateChanged
+            || self.audit.subject_id != self.session.id.as_uuid()
+            || self.audit.reason_codes.is_empty()
+            || self.audit.expires_at <= self.audit.occurred_at
+        {
+            return Err(RepositoryError {
+                kind: RepositoryErrorKind::Corrupt,
+                summary: "A focus-session lifecycle audit does not match its revision transition.",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn validate_against(&self, current: &FocusSession) -> Result<(), RepositoryError> {
+        self.validate()?;
+        if current.id != self.session.id
+            || current.owner != self.session.owner
+            || current.goal_id != self.session.goal_id
+            || current.goal_revision != self.session.goal_revision
+            || current.revision != self.expected_revision
+            || !valid_focus_session_state_transition(current.state, self.session.state)
+        {
+            return Err(RepositoryError {
+                kind: RepositoryErrorKind::Conflict,
+                summary: "The focus-session lifecycle transition is stale or invalid.",
+            });
+        }
+        Ok(())
+    }
+}
+
+const fn valid_focus_session_state_transition(
+    current: FocusSessionState,
+    next: FocusSessionState,
+) -> bool {
+    matches!(
+        (current, next),
+        (FocusSessionState::Requested, FocusSessionState::Starting)
+            | (FocusSessionState::Requested, FocusSessionState::Stopping)
+            | (FocusSessionState::Requested, FocusSessionState::Ended)
+            | (FocusSessionState::Requested, FocusSessionState::Failed)
+            | (FocusSessionState::Starting, FocusSessionState::Active)
+            | (FocusSessionState::Starting, FocusSessionState::Recovering)
+            | (FocusSessionState::Starting, FocusSessionState::Stopping)
+            | (FocusSessionState::Starting, FocusSessionState::Ended)
+            | (FocusSessionState::Starting, FocusSessionState::Failed)
+            | (FocusSessionState::Active, FocusSessionState::Recovering)
+            | (FocusSessionState::Active, FocusSessionState::Stopping)
+            | (FocusSessionState::Active, FocusSessionState::Ended)
+            | (FocusSessionState::Active, FocusSessionState::Failed)
+            | (FocusSessionState::Recovering, FocusSessionState::Active)
+            | (FocusSessionState::Recovering, FocusSessionState::Stopping)
+            | (FocusSessionState::Recovering, FocusSessionState::Ended)
+            | (FocusSessionState::Recovering, FocusSessionState::Failed)
+            | (FocusSessionState::Stopping, FocusSessionState::Ended)
+    )
+}
+
+/// One permission-grant revocation and its content-free audit record.
+/// Repositories commit both records atomically before adapter cleanup begins.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PermissionGrantRevocationWrite {
+    pub grant: PermissionGrant,
+    pub expected_revision: u64,
+    pub audit: AuditRecord,
+}
+
+impl PermissionGrantRevocationWrite {
+    pub fn validate(&self) -> Result<(), RepositoryError> {
+        if self.expected_revision == u64::MAX
+            || self.grant.revision != self.expected_revision + 1
+            || self.grant.state != GrantState::Revoked
+            || self.grant.revoked_at.is_none()
+            || self
+                .grant
+                .revocation_reason
+                .as_ref()
+                .is_none_or(String::is_empty)
+            || self.audit.owner != self.grant.owner
+            || self.audit.kind != AuditKind::PermissionRevoked
+            || self.audit.subject_id != self.grant.id.as_uuid()
+            || self.audit.reason_codes.is_empty()
+            || self.audit.expires_at <= self.audit.occurred_at
+        {
+            return Err(RepositoryError {
+                kind: RepositoryErrorKind::Corrupt,
+                summary: "A permission-revocation audit does not match its revision transition.",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn validate_against(&self, current: &PermissionGrant) -> Result<(), RepositoryError> {
+        self.validate()?;
+        let mut expected = current.clone();
+        expected.revision = self.grant.revision;
+        expected.state = GrantState::Revoked;
+        expected.revoked_at = self.grant.revoked_at;
+        expected
+            .revocation_reason
+            .clone_from(&self.grant.revocation_reason);
+        if current.revision != self.expected_revision
+            || current.state != GrantState::Active
+            || expected != self.grant
+        {
+            return Err(RepositoryError {
+                kind: RepositoryErrorKind::Conflict,
+                summary: "The permission-grant revocation is stale or invalid.",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Optional outbox mutation committed with an intervention transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PendingDeliveryTransition {
+    Enqueue(PendingInterventionDelivery),
+    Update {
+        delivery: PendingInterventionDelivery,
+        expected_state: OutboxState,
+    },
+}
+
+impl PendingDeliveryTransition {
+    #[must_use]
+    pub const fn delivery(&self) -> &PendingInterventionDelivery {
+        match self {
+            Self::Enqueue(delivery) | Self::Update { delivery, .. } => delivery,
+        }
+    }
+
+    pub fn validate_against(
+        &self,
+        current: Option<&PendingInterventionDelivery>,
+    ) -> Result<(), RepositoryError> {
+        match (self, current) {
+            (Self::Enqueue(next), None) => validate_new_pending_delivery(next),
+            (
+                Self::Update {
+                    delivery: next,
+                    expected_state,
+                },
+                Some(current),
+            ) if current.state == *expected_state => {
+                validate_pending_delivery_update(current, next)
+            }
+            (Self::Enqueue(_), Some(_)) | (Self::Update { .. }, None) => Err(RepositoryError {
+                kind: RepositoryErrorKind::Conflict,
+                summary: "The pending-delivery transition is stale.",
+            }),
+            (Self::Update { .. }, Some(_)) => Err(RepositoryError {
+                kind: RepositoryErrorKind::Conflict,
+                summary: "The pending-delivery state changed concurrently.",
+            }),
+        }
+    }
+}
+
+/// One intervention delivery/outcome revision, its required audit, and the
+/// optional outbox state written by that same logical transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterventionTransitionWrite {
+    pub intervention: Intervention,
+    pub expected_revision: u64,
+    pub audit: AuditRecord,
+    pub delivery: Option<PendingDeliveryTransition>,
+}
+
+impl InterventionTransitionWrite {
+    pub fn validate(&self) -> Result<(), RepositoryError> {
+        if self.expected_revision == u64::MAX
+            || self.intervention.revision != self.expected_revision + 1
+            || self.audit.owner != self.intervention.owner
+            || self.audit.subject_id != self.intervention.id.as_uuid()
+            || !matches!(
+                self.audit.kind,
+                AuditKind::InterventionDelivery | AuditKind::InterventionOutcome
+            )
+            || self.audit.reason_codes.is_empty()
+            || self.audit.expires_at <= self.audit.occurred_at
+            || self
+                .audit
+                .policy_trace
+                .as_ref()
+                .is_some_and(|trace| !trace.is_complete())
+            || (self.audit.kind == AuditKind::InterventionOutcome && self.delivery.is_some())
+        {
+            return Err(RepositoryError {
+                kind: RepositoryErrorKind::Corrupt,
+                summary: "An intervention audit does not match its revision transition.",
+            });
+        }
+        if let Some(delivery) = &self.delivery {
+            let delivery = delivery.delivery();
+            if delivery.owner != self.intervention.owner
+                || delivery.intervention_id != self.intervention.id
+                || delivery.candidate_revision != self.intervention.candidate_revision
+                || delivery.policy_decision_id != self.intervention.policy_decision_id
+                || !delivery_state_matches_intervention(delivery.state, self.intervention.state)
+            {
+                return Err(RepositoryError {
+                    kind: RepositoryErrorKind::Corrupt,
+                    summary: "A pending delivery does not match its intervention transition.",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_against(&self, current: &Intervention) -> Result<(), RepositoryError> {
+        self.validate()?;
+        if current.id != self.intervention.id
+            || current.owner != self.intervention.owner
+            || current.goal_id != self.intervention.goal_id
+            || current.focus_session_id != self.intervention.focus_session_id
+            || current.candidate_id != self.intervention.candidate_id
+            || current.candidate_revision != self.intervention.candidate_revision
+            || current.created_at != self.intervention.created_at
+            || current.expires_at != self.intervention.expires_at
+            || current.revision != self.expected_revision
+        {
+            return Err(RepositoryError {
+                kind: RepositoryErrorKind::Conflict,
+                summary: "The intervention transition is stale or changed its identity.",
+            });
+        }
+        match self.audit.kind {
+            AuditKind::InterventionOutcome => {
+                let mut expected = current.clone();
+                expected.revision = self.intervention.revision;
+                expected.outcome = self.intervention.outcome;
+                expected.outcome_at = self.intervention.outcome_at;
+                expected
+                    .correction_summary
+                    .clone_from(&self.intervention.correction_summary);
+                expected.updated_at = self.intervention.updated_at;
+                if self.intervention.outcome == InterventionOutcome::Unacknowledged
+                    || expected != self.intervention
+                {
+                    return Err(RepositoryError {
+                        kind: RepositoryErrorKind::Conflict,
+                        summary: "The intervention outcome transition is invalid.",
+                    });
+                }
+            }
+            AuditKind::InterventionDelivery => {
+                if !valid_intervention_delivery_transition(current.state, self.intervention.state) {
+                    return Err(RepositoryError {
+                        kind: RepositoryErrorKind::Conflict,
+                        summary: "The intervention delivery transition is invalid.",
+                    });
+                }
+            }
+            _ => unreachable!("validated intervention audit kind"),
+        }
+        Ok(())
+    }
+}
+
+const fn valid_intervention_delivery_transition(
+    current: InterventionState,
+    next: InterventionState,
+) -> bool {
+    matches!(
+        (current, next),
+        (
+            InterventionState::Allowed,
+            InterventionState::Queued
+                | InterventionState::AcceptedByChannel
+                | InterventionState::DeliveryUnknown
+                | InterventionState::DeliveryFailed
+                | InterventionState::Expired
+                | InterventionState::Cancelled
+        ) | (
+            InterventionState::Queued,
+            InterventionState::DeliveryUnknown
+                | InterventionState::Expired
+                | InterventionState::Cancelled
+        ) | (
+            InterventionState::Delivering,
+            InterventionState::AcceptedByChannel
+                | InterventionState::DeliveryUnknown
+                | InterventionState::DeliveryFailed
+                | InterventionState::Expired
+                | InterventionState::Cancelled
+        )
+    )
+}
+
+const fn delivery_state_matches_intervention(
+    delivery: OutboxState,
+    intervention: InterventionState,
+) -> bool {
+    matches!(
+        (delivery, intervention),
+        (OutboxState::Queued, InterventionState::Queued)
+            | (OutboxState::Delivering, InterventionState::Delivering)
+            | (
+                OutboxState::AcceptedByChannel,
+                InterventionState::AcceptedByChannel
+            )
+            | (
+                OutboxState::DeliveryUnknown,
+                InterventionState::DeliveryUnknown
+            )
+            | (
+                OutboxState::DeliveryFailed,
+                InterventionState::DeliveryFailed
+            )
+            | (OutboxState::Expired, InterventionState::Expired)
+            | (OutboxState::Cancelled, InterventionState::Cancelled)
+    )
+}
+
+fn validate_new_pending_delivery(
+    value: &PendingInterventionDelivery,
+) -> Result<(), RepositoryError> {
+    if value.state != OutboxState::Queued
+        || value.attempt_count != 0
+        || value.last_attempt_at.is_some()
+        || value.created_at > value.not_before
+        || value.not_before >= value.expires_at
+    {
+        return Err(RepositoryError {
+            kind: RepositoryErrorKind::Conflict,
+            summary: "The pending delivery does not satisfy the bounded queue contract.",
+        });
+    }
+    Ok(())
+}
+
+fn validate_pending_delivery_update(
+    current: &PendingInterventionDelivery,
+    next: &PendingInterventionDelivery,
+) -> Result<(), RepositoryError> {
+    let transition_allowed = current.state == next.state
+        || matches!(
+            (current.state, next.state),
+            (OutboxState::Queued, OutboxState::Delivering)
+                | (OutboxState::Queued, OutboxState::Expired)
+                | (OutboxState::Queued, OutboxState::Cancelled)
+                | (
+                    OutboxState::Delivering,
+                    OutboxState::AcceptedByChannel
+                        | OutboxState::DeliveryUnknown
+                        | OutboxState::DeliveryFailed
+                        | OutboxState::Cancelled
+                )
+        );
+    let attempt_metadata_valid =
+        if current.state == OutboxState::Queued && next.state == OutboxState::Delivering {
+            next.attempt_count == current.attempt_count.saturating_add(1)
+                && next.last_attempt_at.is_some()
+        } else {
+            next.attempt_count == current.attempt_count
+                && next.last_attempt_at == current.last_attempt_at
+        };
+    let terminal_text_valid = if matches!(next.state, OutboxState::Queued | OutboxState::Delivering)
+    {
+        next.user_visible_text == current.user_visible_text
+    } else {
+        next.user_visible_text.is_empty()
+    };
+    let mut expected = current.clone();
+    expected.state = next.state;
+    expected.attempt_count = next.attempt_count;
+    expected.last_attempt_at = next.last_attempt_at;
+    expected
+        .user_visible_text
+        .clone_from(&next.user_visible_text);
+    if current.state == OutboxState::Queued && next.state != OutboxState::Queued {
+        expected.policy_decision_id = next.policy_decision_id;
+    }
+    if transition_allowed && attempt_metadata_valid && terminal_text_valid && expected == *next {
+        Ok(())
+    } else {
+        Err(RepositoryError {
+            kind: RepositoryErrorKind::Conflict,
+            summary: "The pending delivery state transition is invalid.",
+        })
+    }
+}
+
+impl fmt::Debug for SecretDeletionCleanup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SecretDeletionCleanup")
+            .field("owner", &self.owner)
+            .field("model_route_approval_id", &self.model_route_approval_id)
+            .field("secret_ref", &"[REDACTED]")
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
 /// Durable repositories are typed by owned aggregate. A concrete adapter may
 /// use one physical database, but callers cannot issue SQL or inspect another
 /// owner's tables.
@@ -310,11 +733,34 @@ pub trait DurableRepository: Send + Sync {
     ) -> Result<(), RepositoryError> {
         Ok(())
     }
+    /// Atomically revokes the route and records the credential-deletion
+    /// obligation before any fallible platform secret-store call begins.
+    fn save_revoked_model_route_with_cleanup(
+        &self,
+        value: &ModelRouteApproval,
+        expected_revision: u64,
+        cleanup: &SecretDeletionCleanup,
+        audit: &AuditRecord,
+    ) -> Result<(), RepositoryError>;
+    fn load_secret_deletion_cleanups(
+        &self,
+        owner: ActorId,
+    ) -> Result<Vec<SecretDeletionCleanup>, RepositoryError>;
+    fn complete_secret_deletion_cleanup(
+        &self,
+        owner: ActorId,
+        model_route_approval_id: crate::ModelRouteApprovalId,
+    ) -> Result<(), RepositoryError>;
     fn load_grants(&self, owner: ActorId) -> Result<Vec<PermissionGrant>, RepositoryError>;
     fn save_grant(
         &self,
         value: &PermissionGrant,
         expected_revision: Option<u64>,
+    ) -> Result<(), RepositoryError>;
+    /// Atomically persists one active-to-revoked grant revision and its audit.
+    fn save_permission_grant_revocation(
+        &self,
+        value: &PermissionGrantRevocationWrite,
     ) -> Result<(), RepositoryError>;
     /// Atomically persists the grant, replay receipt, and audit record.
     fn create_grant(
@@ -357,11 +803,23 @@ pub trait DurableRepository: Send + Sync {
         value: &FocusSession,
         expected_revision: Option<u64>,
     ) -> Result<(), RepositoryError>;
+    /// Atomically persists an existing focus-session state/revision transition
+    /// and its required lifecycle audit. Neither record may be visible alone.
+    fn save_focus_session_transition(
+        &self,
+        value: &FocusSessionLifecycleWrite,
+    ) -> Result<(), RepositoryError>;
     fn load_interventions(&self, owner: ActorId) -> Result<Vec<Intervention>, RepositoryError>;
     fn save_intervention(
         &self,
         value: &Intervention,
         expected_revision: Option<u64>,
+    ) -> Result<(), RepositoryError>;
+    /// Atomically persists a delivery/outcome revision, its required audit,
+    /// and an optional matching outbox enqueue/update.
+    fn save_intervention_transition(
+        &self,
+        value: &InterventionTransitionWrite,
     ) -> Result<(), RepositoryError>;
     fn save_policy_decision(&self, value: &PolicyDecision) -> Result<(), RepositoryError>;
     /// Atomically persists one candidate-specific policy decision, its required
@@ -408,6 +866,8 @@ struct MemoryState {
     goal_deletions: HashMap<(ActorId, GoalId), GoalDeletionTombstone>,
     resource_deletions: HashMap<(ActorId, crate::ResourceId), SelectedResourceDeletionTombstone>,
     native_resource_cleanups: HashMap<(ActorId, crate::ResourceId), NativeResourceCleanup>,
+    secret_deletion_cleanups:
+        HashMap<(ActorId, crate::ModelRouteApprovalId), SecretDeletionCleanup>,
     grants: HashMap<crate::PermissionGrantId, PermissionGrant>,
     routes: HashMap<crate::ModelRouteApprovalId, ModelRouteApproval>,
     sessions: HashMap<crate::FocusSessionId, FocusSession>,
@@ -475,6 +935,37 @@ fn validate_operation_receipt(
         });
     }
     Ok(())
+}
+
+fn validate_secret_deletion_cleanup(
+    route: &ModelRouteApproval,
+    cleanup: &SecretDeletionCleanup,
+) -> Result<(), RepositoryError> {
+    validate_model_route_secret_reference(route)?;
+    if route.revoked_at.is_none()
+        || route.owner != cleanup.owner
+        || route.id != cleanup.model_route_approval_id
+        || route.secret_ref != cleanup.secret_ref
+    {
+        return Err(RepositoryError {
+            kind: RepositoryErrorKind::Corrupt,
+            summary: "A secret-deletion cleanup obligation does not match its revoked route.",
+        });
+    }
+    Ok(())
+}
+
+fn validate_model_route_secret_reference(
+    route: &ModelRouteApproval,
+) -> Result<(), RepositoryError> {
+    if route.has_approval_scoped_secret_ref() {
+        Ok(())
+    } else {
+        Err(RepositoryError {
+            kind: RepositoryErrorKind::Corrupt,
+            summary: "A model-route secret reference is not scoped to its approval.",
+        })
+    }
 }
 
 impl DurableRepository for MemoryRepository {
@@ -1066,6 +1557,66 @@ impl DurableRepository for MemoryRepository {
         Ok(())
     }
 
+    fn save_revoked_model_route_with_cleanup(
+        &self,
+        value: &ModelRouteApproval,
+        expected_revision: u64,
+        cleanup: &SecretDeletionCleanup,
+        audit: &AuditRecord,
+    ) -> Result<(), RepositoryError> {
+        validate_secret_deletion_cleanup(value, cleanup)?;
+        if audit.owner != value.owner
+            || audit.kind != AuditKind::ModelRouteRevoked
+            || audit.subject_id != value.id.as_uuid()
+        {
+            return Err(RepositoryError {
+                kind: RepositoryErrorKind::Corrupt,
+                summary: "A model-route revocation audit does not match its aggregate.",
+            });
+        }
+        let mut state = self.state.lock().map_err(|_| revision_error())?;
+        check_revision(
+            state.routes.get(&value.id).map(|current| current.revision),
+            Some(expected_revision),
+        )?;
+        if state.audit.contains_key(&audit.id) {
+            return Err(revision_error());
+        }
+        state.routes.insert(value.id, value.clone());
+        state
+            .secret_deletion_cleanups
+            .entry((cleanup.owner, cleanup.model_route_approval_id))
+            .or_insert_with(|| cleanup.clone());
+        state.audit.insert(audit.id, audit.clone());
+        Ok(())
+    }
+
+    fn load_secret_deletion_cleanups(
+        &self,
+        owner: ActorId,
+    ) -> Result<Vec<SecretDeletionCleanup>, RepositoryError> {
+        let state = self.state.lock().map_err(|_| revision_error())?;
+        Ok(state
+            .secret_deletion_cleanups
+            .values()
+            .filter(|cleanup| cleanup.owner == owner)
+            .cloned()
+            .collect())
+    }
+
+    fn complete_secret_deletion_cleanup(
+        &self,
+        owner: ActorId,
+        model_route_approval_id: crate::ModelRouteApprovalId,
+    ) -> Result<(), RepositoryError> {
+        self.state
+            .lock()
+            .map_err(|_| revision_error())?
+            .secret_deletion_cleanups
+            .remove(&(owner, model_route_approval_id));
+        Ok(())
+    }
+
     fn load_grants(&self, owner: ActorId) -> Result<Vec<PermissionGrant>, RepositoryError> {
         let state = self.state.lock().map_err(|_| revision_error())?;
         Ok(state
@@ -1087,6 +1638,29 @@ impl DurableRepository for MemoryRepository {
             expected_revision,
         )?;
         state.grants.insert(value.id, value.clone());
+        Ok(())
+    }
+
+    fn save_permission_grant_revocation(
+        &self,
+        value: &PermissionGrantRevocationWrite,
+    ) -> Result<(), RepositoryError> {
+        value.validate()?;
+        let mut state = self.state.lock().map_err(|_| revision_error())?;
+        let current = state
+            .grants
+            .get(&value.grant.id)
+            .cloned()
+            .ok_or(RepositoryError {
+                kind: RepositoryErrorKind::NotFound,
+                summary: "The durable permission grant was not found.",
+            })?;
+        value.validate_against(&current)?;
+        if state.audit.contains_key(&value.audit.id) {
+            return Err(revision_error());
+        }
+        state.grants.insert(value.grant.id, value.grant.clone());
+        state.audit.insert(value.audit.id, value.audit.clone());
         Ok(())
     }
 
@@ -1142,6 +1716,7 @@ impl DurableRepository for MemoryRepository {
         value: &ModelRouteApproval,
         expected_revision: Option<u64>,
     ) -> Result<(), RepositoryError> {
+        validate_model_route_secret_reference(value)?;
         let mut state = self.state.lock().map_err(|_| revision_error())?;
         check_revision(
             state.routes.get(&value.id).map(|current| current.revision),
@@ -1157,6 +1732,7 @@ impl DurableRepository for MemoryRepository {
         receipt: &OperationReceipt,
         audit: &AuditRecord,
     ) -> Result<(), RepositoryError> {
+        validate_model_route_secret_reference(value)?;
         validate_operation_receipt(
             receipt,
             OperationKind::ApproveModelRoute,
@@ -1272,6 +1848,30 @@ impl DurableRepository for MemoryRepository {
         Ok(())
     }
 
+    fn save_focus_session_transition(
+        &self,
+        value: &FocusSessionLifecycleWrite,
+    ) -> Result<(), RepositoryError> {
+        value.validate()?;
+        let mut state = self.state.lock().map_err(|_| revision_error())?;
+        let current = state
+            .sessions
+            .get(&value.session.id)
+            .ok_or(RepositoryError {
+                kind: RepositoryErrorKind::NotFound,
+                summary: "The durable focus session was not found.",
+            })?;
+        value.validate_against(current)?;
+        if state.audit.contains_key(&value.audit.id) {
+            return Err(revision_error());
+        }
+        state
+            .sessions
+            .insert(value.session.id, value.session.clone());
+        state.audit.insert(value.audit.id, value.audit.clone());
+        Ok(())
+    }
+
     fn load_interventions(&self, owner: ActorId) -> Result<Vec<Intervention>, RepositoryError> {
         let state = self.state.lock().map_err(|_| revision_error())?;
         Ok(state
@@ -1299,7 +1899,57 @@ impl DurableRepository for MemoryRepository {
         Ok(())
     }
 
+    fn save_intervention_transition(
+        &self,
+        value: &InterventionTransitionWrite,
+    ) -> Result<(), RepositoryError> {
+        value.validate()?;
+        let mut state = self.state.lock().map_err(|_| revision_error())?;
+        let current = state
+            .interventions
+            .get(&value.intervention.id)
+            .cloned()
+            .ok_or(RepositoryError {
+                kind: RepositoryErrorKind::NotFound,
+                summary: "The durable intervention was not found.",
+            })?;
+        value.validate_against(&current)?;
+        if state.audit.contains_key(&value.audit.id) {
+            return Err(revision_error());
+        }
+        if let Some(transition) = &value.delivery {
+            let delivery = transition.delivery();
+            let current_delivery = state.outbox.get(&delivery.id);
+            transition.validate_against(current_delivery)?;
+            if matches!(transition, PendingDeliveryTransition::Enqueue(_))
+                && state
+                    .outbox
+                    .values()
+                    .any(|current| current.deduplication_key == delivery.deduplication_key)
+            {
+                return Err(revision_error());
+            }
+        }
+        state
+            .interventions
+            .insert(value.intervention.id, value.intervention.clone());
+        if let Some(transition) = &value.delivery {
+            let delivery = transition.delivery();
+            state.outbox.insert(delivery.id, delivery.clone());
+        }
+        state.audit.insert(value.audit.id, value.audit.clone());
+        Ok(())
+    }
+
     fn save_policy_decision(&self, value: &PolicyDecision) -> Result<(), RepositoryError> {
+        if !value.policy_trace.is_complete()
+            || value.policy_version != value.policy_trace.policy_profile_id
+        {
+            return Err(RepositoryError {
+                kind: RepositoryErrorKind::Corrupt,
+                summary: "A policy decision has incomplete trace provenance.",
+            });
+        }
         let mut state = self.state.lock().map_err(|_| revision_error())?;
         if state
             .policy_decisions
@@ -1331,6 +1981,9 @@ impl DurableRepository for MemoryRepository {
                 || value.audit.kind != AuditKind::InterventionDecision
                 || value.audit.subject_id != decision.candidate_id.as_uuid()
                 || value.audit.reason_codes != decision.reason_codes
+                || !decision.policy_trace.is_complete()
+                || decision.policy_version != decision.policy_trace.policy_profile_id
+                || value.audit.policy_trace.as_ref() != Some(&decision.policy_trace)
             {
                 return Err(RepositoryError {
                     kind: RepositoryErrorKind::Corrupt,
@@ -1407,6 +2060,19 @@ impl DurableRepository for MemoryRepository {
     }
 
     fn append_audit(&self, value: &AuditRecord) -> Result<(), RepositoryError> {
+        if matches!(
+            value.kind,
+            AuditKind::SignificanceDecision | AuditKind::InterventionDecision
+        ) && !value
+            .policy_trace
+            .as_ref()
+            .is_some_and(crate::PolicyTrace::is_complete)
+        {
+            return Err(RepositoryError {
+                kind: RepositoryErrorKind::Corrupt,
+                summary: "A policy audit has incomplete trace provenance.",
+            });
+        }
         let mut state = self.state.lock().map_err(|_| revision_error())?;
         if state.audit.insert(value.id, value.clone()).is_some() {
             return Err(revision_error());

@@ -130,11 +130,21 @@ The provider-neutral boundary for model capabilities, streaming, budgets, cancel
 A persistent, revocable user approval for a named local or remote model route,
 including placement, permitted data categories, purpose, handling profile,
 fallback constraints, and optional expiry. It avoids repeated unchanged consent
-while preventing hidden provider or data-scope changes.
+while preventing hidden provider or data-scope changes. Its opaque credential
+reference is scoped to the approval ID, so sibling approvals never share a
+deletion target merely because they name the same provider route.
 
 ## Policy decision
 
 A structured allow, deny, or require-confirmation result produced for a specific proposed action in a specific authority context. Policy decisions should be inspectable and auditable.
+
+## Policy trace
+
+Content-free provenance bound to one deterministic policy evaluation: the
+versioned policy profile, exact effective user-preference revision, canonical
+input-schema version, and digest of the exact proposed inputs. The typed input
+projection remains transient; a missing or legacy-empty trace cannot authorize
+delivery.
 
 ## Authority context
 

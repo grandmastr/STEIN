@@ -19,6 +19,18 @@ param(
     [ValidatePattern("^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$")]
     [string] $Version = "0.1.0.0",
 
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern("^[a-p]{32}$")]
+    [string] $EdgeExtensionId,
+
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern("^[0-9]+(?:\.[0-9]+){0,3}$")]
+    [string] $EdgeExtensionVersion,
+
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern("^[0-9a-f]{64}$")]
+    [string] $EdgePublisherSha256,
+
     [string] $OutputPath
 )
 
@@ -40,10 +52,18 @@ $certificate = Get-ExactSigningCertificate `
     -Thumbprint $CertificateThumbprint `
     -Publisher $Publisher
 $normalizedThumbprint = $certificate.Thumbprint.ToUpperInvariant()
+$hostPublisherSha256 = $certificate.GetCertHashString(
+    [Security.Cryptography.HashAlgorithmName]::SHA256).ToLowerInvariant()
+if ($hostPublisherSha256 -notmatch "^[0-9a-f]{64}$" -or
+    $hostPublisherSha256 -eq ("0" * 64) -or
+    $EdgePublisherSha256 -eq ("0" * 64)) {
+    throw "Exact nonzero SHA-256 publisher certificate identities are required."
+}
 $packageFamilyName = Get-ExactPackageFamilyName `
     -PackageName $script:ProductionPackageName `
     -Publisher $Publisher
 $brokerAumid = "$packageFamilyName!$script:BrokerApplicationId"
+$browserProducerAumid = "$packageFamilyName!$script:BrowserProducerApplicationId"
 
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     $OutputPath = Join-Path $PSScriptRoot "out\STEIN-$Version-x64.msix"
@@ -73,6 +93,18 @@ $previousPackageFamilyName = [Environment]::GetEnvironmentVariable(
 $previousBrokerAumid = [Environment]::GetEnvironmentVariable(
     "STEIN_PRODUCTION_BROKER_AUMID",
     [EnvironmentVariableTarget]::Process)
+$previousEdgeExtensionId = [Environment]::GetEnvironmentVariable(
+    "STEIN_EDGE_EXTENSION_ID",
+    [EnvironmentVariableTarget]::Process)
+$previousEdgeExtensionVersion = [Environment]::GetEnvironmentVariable(
+    "STEIN_EDGE_EXTENSION_VERSION",
+    [EnvironmentVariableTarget]::Process)
+$previousEdgePublisher = [Environment]::GetEnvironmentVariable(
+    "STEIN_EDGE_PUBLISHER_SHA256",
+    [EnvironmentVariableTarget]::Process)
+$previousHostPublisher = [Environment]::GetEnvironmentVariable(
+    "STEIN_EDGE_HOST_PUBLISHER_SHA256",
+    [EnvironmentVariableTarget]::Process)
 
 try {
     # These values are derived from the exact selected certificate Publisher
@@ -86,12 +118,20 @@ try {
         "STEIN_PRODUCTION_BROKER_AUMID",
         $brokerAumid,
         [EnvironmentVariableTarget]::Process)
+    [Environment]::SetEnvironmentVariable(
+        "STEIN_EDGE_EXTENSION_ID",
+        $EdgeExtensionId,
+        [EnvironmentVariableTarget]::Process)
+    [Environment]::SetEnvironmentVariable(
+        "STEIN_EDGE_EXTENSION_VERSION",
+        $EdgeExtensionVersion,
+        [EnvironmentVariableTarget]::Process)
 
     & $cargo build `
         --release `
         --manifest-path (Join-Path $repoRoot "Cargo.toml") `
         --package stein-core-daemon `
-        --features stein-core-daemon/production-private-endpoint `
+        --features "stein-core-daemon/production-private-endpoint,stein-core-daemon/production-edge-producer" `
         --package stein-core-cli `
         --package stein-desktop
     Assert-NativeCommandSucceeded -Operation "Rust CORE/desktop release build"
@@ -112,9 +152,9 @@ try {
         /fd SHA256 `
         /tr $TimestampUrl `
         /td SHA256 `
-        $coreExecutable
+        $coreExecutable *> $null
     Assert-NativeCommandSucceeded -Operation "CORE Authenticode signing"
-    & $signTool verify /pa /all /v $coreExecutable
+    & $signTool verify /pa /all /v $coreExecutable *> $null
     Assert-NativeCommandSucceeded -Operation "CORE Authenticode verification"
     $coreSignature = Get-AuthenticodeSignature -LiteralPath $coreExecutable
     if ($coreSignature.Status -ne [Management.Automation.SignatureStatus]::Valid -or
@@ -131,9 +171,9 @@ try {
         /fd SHA256 `
         /tr $TimestampUrl `
         /td SHA256 `
-        $cliExecutable
+        $cliExecutable *> $null
     Assert-NativeCommandSucceeded -Operation "diagnostic CLI Authenticode signing"
-    & $signTool verify /pa /all /v $cliExecutable
+    & $signTool verify /pa /all /v $cliExecutable *> $null
     Assert-NativeCommandSucceeded -Operation "diagnostic CLI Authenticode verification"
     $cliSignature = Get-AuthenticodeSignature -LiteralPath $cliExecutable
     if ($cliSignature.Status -ne [Management.Automation.SignatureStatus]::Valid -or
@@ -149,6 +189,36 @@ try {
         "STEIN_CORE_EXECUTABLE_SHA256",
         $coreDigest,
         [EnvironmentVariableTarget]::Process)
+    [Environment]::SetEnvironmentVariable(
+        "STEIN_EDGE_PUBLISHER_SHA256",
+        $EdgePublisherSha256,
+        [EnvironmentVariableTarget]::Process)
+    [Environment]::SetEnvironmentVariable(
+        "STEIN_EDGE_HOST_PUBLISHER_SHA256",
+        $hostPublisherSha256,
+        [EnvironmentVariableTarget]::Process)
+
+    & $cargo build `
+        --release `
+        --manifest-path (Join-Path $repoRoot "apps\edge-native-host\Cargo.toml") `
+        --features production-edge-host
+    Assert-NativeCommandSucceeded -Operation "Edge native host release build"
+    $hostExecutable = Join-Path $repoRoot "apps\edge-native-host\target\release\stein-edge-native-host.exe"
+    if (-not (Test-Path -LiteralPath $hostExecutable -PathType Leaf)) {
+        throw "The Edge native host release executable was not produced."
+    }
+    & $signTool sign `
+        /sha1 $normalizedThumbprint `
+        /fd SHA256 `
+        /tr $TimestampUrl `
+        /td SHA256 `
+        $hostExecutable *> $null
+    Assert-NativeCommandSucceeded -Operation "Edge native host Authenticode signing"
+    $null = Assert-SteinExactAuthenticodeSignature `
+        -Path $hostExecutable `
+        -CertificateThumbprint $normalizedThumbprint `
+        -Publisher $Publisher
+    $hostDigest = (Get-FileHash -LiteralPath $hostExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
 
     & $cargo build `
         --release `
@@ -165,6 +235,7 @@ try {
     $null = New-Item -ItemType Directory -Path (Join-Path $stagingRoot "Metadata") -Force
     Copy-Item -LiteralPath $desktopExecutable -Destination (Join-Path $stagingRoot "bin\stein-desktop.exe")
     Copy-Item -LiteralPath $brokerExecutable -Destination (Join-Path $stagingRoot "bin\stein-private-broker.exe")
+    Copy-Item -LiteralPath $hostExecutable -Destination (Join-Path $stagingRoot "bin\stein-edge-native-host.exe")
     [ordered]@{
         schema_version = 1
         core_executable_sha256 = $coreDigest
@@ -202,7 +273,7 @@ try {
     if (Test-Path -LiteralPath $outputPath) {
         Remove-Item -LiteralPath $outputPath -Force
     }
-    & $makeAppx pack /d $stagingRoot /p $outputPath /o
+    & $makeAppx pack /d $stagingRoot /p $outputPath /o *> $null
     Assert-NativeCommandSucceeded -Operation "MakeAppx package creation"
 
     & $signTool sign `
@@ -210,7 +281,7 @@ try {
         /fd SHA256 `
         /tr $TimestampUrl `
         /td SHA256 `
-        $outputPath
+        $outputPath *> $null
     Assert-NativeCommandSucceeded -Operation "MSIX signing"
 
     & (Join-Path $PSScriptRoot "Verify-Msix.ps1") `
@@ -218,7 +289,8 @@ try {
         -CertificateThumbprint $normalizedThumbprint `
         -Publisher $Publisher `
         -Version $Version `
-        -ExpectedCoreSha256 $coreDigest
+        -ExpectedCoreSha256 $coreDigest `
+        -ExpectedHostSha256 $hostDigest
     if (-not $?) {
         throw "MSIX verification script failed."
     }
@@ -265,12 +337,14 @@ try {
         package_family_name = $packageFamilyName
         desktop_aumid = "$packageFamilyName!$script:DesktopApplicationId"
         broker_aumid = $brokerAumid
+        browser_producer_aumid = $browserProducerAumid
         version = $Version
         architecture = "x64"
         signing_certificate_thumbprint = $normalizedThumbprint
         core_executable_file = (Split-Path -Leaf $coreCompanionPath)
         core_executable_size = (Get-Item -LiteralPath $coreCompanionPath).Length
         core_executable_sha256 = $coreDigest
+        browser_host_sha256 = $hostDigest
         cli_executable_file = (Split-Path -Leaf $cliCompanionPath)
         cli_executable_size = (Get-Item -LiteralPath $cliCompanionPath).Length
         cli_executable_sha256 = $cliDigest
@@ -279,11 +353,26 @@ try {
     }
     $identityPath = "$outputPath.identity.json"
     $identityRecord | ConvertTo-Json | Set-Content -LiteralPath $identityPath -Encoding UTF8
+    $browserIdentityPath = "$outputPath.browser.json"
+    [ordered] @{
+        identity_schema_version = 1
+        package_family_name = $packageFamilyName
+        package_version = $Version
+        browser_producer_aumid = $browserProducerAumid
+        browser_host_relative_path = "bin\stein-edge-native-host.exe"
+        browser_host_sha256 = $hostDigest
+        browser_host_publisher_sha256 = $hostPublisherSha256
+        edge_extension_id = $EdgeExtensionId
+        edge_extension_version = $EdgeExtensionVersion
+        edge_publisher_sha256 = $EdgePublisherSha256
+        installed_runtime_admission = "not_run_requires_direct_edge_launch_fixture"
+    } | ConvertTo-Json | Set-Content -LiteralPath $browserIdentityPath -Encoding UTF8
 
     Write-Output "Created and verified signed MSIX: $outputPath"
     Write-Output "Published broker-pinned signed CORE: $coreCompanionPath"
     Write-Output "Published signed diagnostic CLI: $cliCompanionPath"
     Write-Output "Recorded exact package identities: $identityPath"
+    Write-Output "Recorded blocked browser producer identity: $browserIdentityPath"
 }
 finally {
     [Environment]::SetEnvironmentVariable(
@@ -297,6 +386,22 @@ finally {
     [Environment]::SetEnvironmentVariable(
         "STEIN_PRODUCTION_BROKER_AUMID",
         $previousBrokerAumid,
+        [EnvironmentVariableTarget]::Process)
+    [Environment]::SetEnvironmentVariable(
+        "STEIN_EDGE_EXTENSION_ID",
+        $previousEdgeExtensionId,
+        [EnvironmentVariableTarget]::Process)
+    [Environment]::SetEnvironmentVariable(
+        "STEIN_EDGE_EXTENSION_VERSION",
+        $previousEdgeExtensionVersion,
+        [EnvironmentVariableTarget]::Process)
+    [Environment]::SetEnvironmentVariable(
+        "STEIN_EDGE_PUBLISHER_SHA256",
+        $previousEdgePublisher,
+        [EnvironmentVariableTarget]::Process)
+    [Environment]::SetEnvironmentVariable(
+        "STEIN_EDGE_HOST_PUBLISHER_SHA256",
+        $previousHostPublisher,
         [EnvironmentVariableTarget]::Process)
     if (Test-Path -LiteralPath $stagingRoot) {
         Remove-Item -LiteralPath $stagingRoot -Recurse -Force

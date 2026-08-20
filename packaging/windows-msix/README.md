@@ -1,19 +1,24 @@
 # Windows MSIX private-client package
 
-This directory packages exactly two applications under one signed production
+This directory packages exactly three applications under one signed production
 identity:
 
 - `STEIN.PersonalIntelligence_<PublisherId>!Desktop` is the Tauri backend as a
   packaged classic, medium-integrity/full-trust desktop process.
 - `STEIN.PersonalIntelligence_<PublisherId>!PrivateBroker` is the narrow relay
   as a packaged classic AppContainer process. It is hidden from the app list.
+- `STEIN.PersonalIntelligence_<PublisherId>!BrowserObservationProducer` is the
+  hidden, medium-integrity Edge native host. Its distinct producer role cannot
+  access the private-client protocol.
 
 `PublisherId` is derived by Windows from the explicitly selected certificate
-subject. The build publishes four inseparable release artifacts: the MSIX, an
+subject. The build publishes the MSIX, an
 adjacent `.msix.core.exe` containing the exact signed CORE bytes pinned into the
 broker, a signed diagnostic `.msix.cli.exe`, and an `.identity.json` record with
-the exact PFN, both AUMIDs, the MSIX and executable-companion filenames/sizes/
-SHA-256 values, package version, and exact signer thumbprint. Changing Publisher
+the exact PFN, all three AUMIDs, the signed browser-host digest, and the MSIX and executable-companion filenames/sizes/
+SHA-256 values, package version, and exact signer thumbprint. A separate
+`.browser.json` binds the blocked browser host AUMID/digest/publisher and exact
+Edge Add-ons ID/version without changing the Phase 2 lifecycle identity schema. Changing Publisher
 deliberately rotates the package family and therefore the admitted AppContainer
 SID.
 
@@ -27,6 +32,16 @@ the desktop application. It declares no network, broad-file-system, device,
 app-service, protocol, alias, or custom capability. The broker remains in an
 AppContainer because its application entry explicitly uses
 `uap10:TrustLevel="appContainer"`.
+
+The desktop application declares exactly two activation extensions: a packaged
+COM local server and `windows.toastNotificationActivation`. Both pin CLSID
+`3DB3B5B0-1BA5-49D1-A8F0-CF2B3EA6D781` to the existing
+`bin\stein-desktop.exe` with the exact `-ToastActivated` server marker. No
+protocol handler, app service, execution alias, or input-capable toast is
+registered. The Rust callback verifies the current production
+desktop AUMID and accepts only `action=open&intervention=<canonical UUID>` before
+reconnecting through the private broker and querying CORE's typed intervention
+explanation API.
 
 ## Trust chain
 
@@ -58,6 +73,16 @@ It is not placed in this MSIX. The same release script signs CORE first and
 pins those exact signed bytes into the broker; the installer must verify the
 identity record and deploy the adjacent CORE companion without modification.
 
+The bounded Windows Graphics Capture implementation also runs inside that
+unpackaged CORE daemon and invokes only the consent-bearing system picker. The
+MSIX desktop does not capture pixels and therefore does not declare a graphics
+capture capability on behalf of another process. In particular the package
+must not request `graphicsCaptureProgrammatic` or
+`graphicsCaptureWithoutBorder`; the implementation cannot create a capture item
+programmatically or hide Windows' capture border. Static verification pins
+those source and manifest invariants, while the real installed `P2-PIXELS`
+picker/capture fixture remains separately required.
+
 ## Build and verify
 
 Run the static contract first from a normal Windows PowerShell session:
@@ -74,7 +99,10 @@ Build with an already provisioned, currently valid code-signing certificate:
   -Publisher '<exact certificate Subject DN>' `
   -PublisherDisplayName '<display name>' `
   -TimestampUrl 'https://<RFC3161 service>' `
-  -Version '0.1.0.0'
+  -Version '0.1.0.0' `
+  -EdgeExtensionId '<exact published 32-character ID>' `
+  -EdgeExtensionVersion '<exact published version>' `
+  -EdgePublisherSha256 '<lowercase SHA-256 certificate thumbprint>'
 ```
 
 The build script searches only `Cert:\CurrentUser\My`, requires the exact thumbprint,
@@ -84,7 +112,11 @@ certificate or package. Missing identity or trust prerequisites fail closed.
 
 `Verify-Msix.ps1` re-runs SignTool trust validation, checks the exact signer,
 unpacks with MakeAppx, validates the closed manifest/file layout, and requires
-the expected broker-pinned CORE SHA-256. It does not
+the expected broker-pinned CORE SHA-256. The closed unpacked layout consists of
+the eight application-owned files plus `AppxBlockMap.xml`; the verifier permits
+only the exact tool/signing metadata names `[Content_Types].xml`,
+`AppxSignature.p7x`, and `AppxMetadata\CodeIntegrity.cat`. Arbitrary content
+under `AppxMetadata` is rejected. It does not
 require access to the signing private key, so an installer/verifier can pin the
 public signer identity independently. The fail-closed current-user install,
 upgrade, status, uninstall, and rollback workflow is documented under
@@ -93,8 +125,11 @@ upgrade, status, uninstall, and rollback workflow is documented under
 Static verification never installs/removes an app package, changes a task,
 stops a process, mutates Credential Manager, or changes a certificate store. A
 real signed installed-package/adversarial run is still required by
-`P2-PRIVATE-CLIENT`; a successful build or parser/static run is not that
-evidence.
+`P2-PRIVATE-CLIENT`, `P2-NOTIFICATION`, and `P2-BROWSER`; a successful build or parser/static
+run is not that evidence. The native notification fixture must prove both
+cold-start and already-running COM activation, focus behavior, private-broker
+reconnection, authoritative explanation lookup, and rejection of malformed or
+wrong-identity callbacks.
 
 ## Development identity
 

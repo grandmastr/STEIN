@@ -139,6 +139,20 @@ The concrete initial browser/package IDs and supported version range are release
 configuration covered by native fixtures; adding a browser does not broaden an
 existing grant.
 
+Browser selection and capture authority is connection-bound. A daemon restart
+closes the native-host connection and invalidates the extension's ephemeral
+browser session/selection identifiers, so a browser-backed grant cannot request
+restart continuity. The user must invoke the extension on the exact tab,
+reselect the browser surface, and grant the scope again.
+
+The owned implementation packages the host as the distinct
+`BrowserObservationProducer` application, admits an owned fixed-pipe connection
+only for the exact PFN/AUMID, and sends the extension only a capture plan freshly
+derived from durable authority. Installation and publisher/parent evidence do
+not make that capability healthy. A clean installed fixture must still prove
+that Edge's direct native-messaging launch actually carries the declared package
+identity; that external result cannot be inferred from the manifest.
+
 ### Selected-window structured text
 
 Use Windows UI Automation on an explicitly selected `HWND`, preferring
@@ -179,6 +193,46 @@ in its `ModelRouteApproval`. If the capture API reports protected content,
 returns an unverifiable/blank restricted surface, loses the selected item, or the
 native indicator/stop path is unhealthy, the pixel source pauses and reports
 unavailable.
+
+The first executable Windows slice uses only Microsoft's documented
+[Graphics Capture picker](https://learn.microsoft.com/windows/apps/develop/media-authoring-processing/screen-capture),
+owner-bound through the documented
+[Win32 `IInitializeWithWindow` interop](https://learn.microsoft.com/windows/apps/develop/ui/display-ui-objects);
+it never creates an item from an `HWND`, monitor, `WindowId`, or `DisplayId`, and
+it never suppresses the operating-system border. The dedicated picker STA owns
+a minimal content-free Win32 window and pumps only that thread's messages while
+the user-controlled asynchronous picker is open.
+The portable `ScreenRegion` resource kind represents this explicitly selected
+visual source. The current system picker selects a complete window or display;
+no sub-region crop is claimed until a separate visible native region-selection
+flow exists.
+
+Windows exposes the picker result as a live `GraphicsCaptureItem`, with no
+documented serializable identity or safe reverse mapping to the originally
+selected native object. The adapter therefore keeps it only in a bounded
+process-local registry behind a random, content-free `winpixel:v1:<UUID>` token.
+Daemon restart invalidates the token and requires explicit reselection; STEIN
+does not reconstruct a broader programmatic capture or claim restart continuity.
+
+One capture worker creates a one-buffer free-threaded frame pool, keeps the OS
+border enabled, excludes cursor pixels, accepts at most 1920 by 1080 BGRA pixels,
+and copies at most 8 MiB into one adapter-owned transient buffer. That buffer is
+zeroized before release, while the WinRT/D3D frame, staging texture, session, and
+pool are closed and dropped. Only coarse dimensions, luminance class, and detail
+class enter `PixelDerivedSummary` with `SingleOperation` retention; no image or
+OCR text enters CORE. A two-second caller deadline plus a process-wide cap on
+disposable native workers bounds cancellation and a hung graphics provider.
+CORE removes a `SingleOperation` observation from session state as soon as one
+reasoning-context assembly takes its bounded copy, so a later model cycle cannot
+replay it. If no reasoning operation consumes it, retention maintenance
+physically removes it no later than the configured maximum model-evidence age
+(two minutes in this slice), rather than the longer ephemeral-session TTL.
+
+CORE starts browser/document/UIA/window-metadata sources before pixels. The
+Windows adapter independently defers capture while any such native or separately
+composed browser source is active, so the structured tier produces no pixel
+frame. This is minimization, not an automatic grant: removing the structured
+source still requires the independent current pixel grant and exact selection.
 
 ### Preference order and normalization
 
@@ -238,6 +292,9 @@ of silently widening capture.
   require fresh health on recovery.
 - When structured and pixel sources can satisfy the same requirement, the trace
   proves the structured source is chosen and no frame is created.
+- Restart tests prove a process-local pixel token is rejected after daemon
+  restart and the UI requires a fresh picker selection; no restart-authorized
+  pixel grant is accepted.
 - Process/repository/log/audit/outbox/protocol inspection finds no frame, UI tree,
   full local path, unapproved URL component, document payload, or unrelated
   application identity.

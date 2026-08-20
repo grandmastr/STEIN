@@ -8,7 +8,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use stein_core::{BrowserLocationGranularity, SensitiveText};
 use url::Url;
@@ -38,6 +38,298 @@ pub enum BrowserCaptureCancellation {
     Locked,
     Revoked,
     SourceLost,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum BrowserSelectionOfferKind {
+    SelectionOffer,
+}
+
+/// First, direct-user native-messaging value emitted by the exact selected
+/// Edge profile and tab. Raw site and origin are transient validation input;
+/// Debug output deliberately omits them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeBrowserSelectionOffer {
+    protocol_version: u16,
+    kind: BrowserSelectionOfferKind,
+    extension_id: String,
+    extension_version: String,
+    profile_binding_sha256: Zeroizing<String>,
+    browser_session_id: Zeroizing<String>,
+    selection_id: Zeroizing<String>,
+    tab_id: u32,
+    window_id: u32,
+    active: bool,
+    incognito: bool,
+    page_kind: BrowserPageKind,
+    site: Zeroizing<String>,
+    origin: Zeroizing<String>,
+    site_sha256: Zeroizing<String>,
+    origin_sha256: Zeroizing<String>,
+}
+
+impl fmt::Debug for EdgeBrowserSelectionOffer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EdgeBrowserSelectionOffer")
+            .field("protocol_version", &self.protocol_version)
+            .field("tab_bound", &(self.tab_id != 0))
+            .field("window_bound", &(self.window_id != 0))
+            .finish_non_exhaustive()
+    }
+}
+
+impl EdgeBrowserSelectionOffer {
+    /// Initial accepted URL bound from ADR 0014/0017: origin and path only;
+    /// query and fragment remain excluded until a future explicit UI contract.
+    pub fn into_initial_location_binding(
+        self,
+        expected_extension_id: &str,
+        expected_extension_version: &str,
+    ) -> Result<WindowsBrowserSurfaceBinding, BrowserIngressError> {
+        self.into_binding(
+            expected_extension_id,
+            expected_extension_version,
+            BrowserLocationGranularity {
+                origin: true,
+                path: true,
+                query: false,
+                fragment: false,
+            },
+        )
+    }
+
+    /// Converts the transient offer to the path/URL-free binding that CORE may
+    /// persist. The exact release identity and version are trusted build
+    /// inputs; extension claims cannot choose them.
+    pub fn into_binding(
+        self,
+        expected_extension_id: &str,
+        expected_extension_version: &str,
+        granularity: BrowserLocationGranularity,
+    ) -> Result<WindowsBrowserSurfaceBinding, BrowserIngressError> {
+        if self.protocol_version != 1
+            || self.kind != BrowserSelectionOfferKind::SelectionOffer
+            || !valid_extension_id(expected_extension_id)
+            || !valid_extension_version(expected_extension_version)
+            || self.extension_id != expected_extension_id
+            || self.extension_version != expected_extension_version
+            || !self.active
+            || self.incognito
+            || self.page_kind != BrowserPageKind::StandardWebPage
+        {
+            return Err(malformed());
+        }
+        let selection = EdgeBrowserSelection::new(
+            decode_fixed(&self.profile_binding_sha256)?,
+            decode_fixed(&self.browser_session_id)?,
+            decode_fixed(&self.selection_id)?,
+            self.tab_id,
+            self.window_id,
+            self.site.as_str(),
+            self.origin.as_str(),
+            granularity,
+        )?;
+        let binding = WindowsBrowserSurfaceBinding::from_selection(&selection);
+        compare_hex(
+            &self.site_sha256,
+            &binding.site_sha256,
+            BrowserIngressErrorKind::WrongSite,
+        )?;
+        compare_hex(
+            &self.origin_sha256,
+            &binding.origin_sha256,
+            BrowserIngressErrorKind::WrongOrigin,
+        )?;
+        Ok(binding)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeBrowserWireScope {
+    Location,
+    VisibleText,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeBrowserWireGranularity {
+    pub origin: bool,
+    pub path: bool,
+    pub query: bool,
+    pub fragment: bool,
+}
+
+/// The sole bounded CORE-to-extension response. It contains no observation,
+/// user content, general protocol capability, or reusable authority material.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeBrowserCapturePlan {
+    pub protocol_version: u16,
+    pub kind: EdgeBrowserControlKind,
+    pub extension_id: String,
+    pub extension_version: String,
+    pub scope: EdgeBrowserWireScope,
+    pub authority_epoch: u64,
+    pub profile_binding_sha256: String,
+    pub browser_session_id: String,
+    pub selection_id: String,
+    pub tab_id: u32,
+    pub window_id: u32,
+    pub site_sha256: String,
+    pub origin_sha256: String,
+    pub granularity: EdgeBrowserWireGranularity,
+    pub maximum_payload_bytes: usize,
+    pub minimum_interval_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeBrowserControlKind {
+    CapturePlan,
+    Cancel,
+}
+
+impl EdgeBrowserCapturePlan {
+    pub fn from_policy(
+        policy: &EdgeBrowserCapturePolicy,
+        expected_extension_id: &str,
+        expected_extension_version: &str,
+    ) -> Result<Self, BrowserIngressError> {
+        policy.validate()?;
+        if !valid_extension_id(expected_extension_id)
+            || !valid_extension_version(expected_extension_version)
+        {
+            return Err(invalid_configuration());
+        }
+        let binding = &policy.binding;
+        Ok(Self {
+            protocol_version: 1,
+            kind: EdgeBrowserControlKind::CapturePlan,
+            extension_id: expected_extension_id.to_owned(),
+            extension_version: expected_extension_version.to_owned(),
+            scope: match policy.scope {
+                BrowserCaptureScope::Location => EdgeBrowserWireScope::Location,
+                BrowserCaptureScope::VisibleText => EdgeBrowserWireScope::VisibleText,
+            },
+            authority_epoch: policy.authority_epoch,
+            profile_binding_sha256: encode_bytes(&binding.profile_binding_sha256),
+            browser_session_id: encode_bytes(&binding.browser_session_id),
+            selection_id: encode_bytes(&binding.selection_id),
+            tab_id: binding.tab_id,
+            window_id: binding.window_id,
+            site_sha256: encode_bytes(&binding.site_sha256),
+            origin_sha256: encode_bytes(&binding.origin_sha256),
+            granularity: EdgeBrowserWireGranularity {
+                origin: binding.granularity.origin,
+                path: binding.granularity.path,
+                query: binding.granularity.query,
+                fragment: binding.granularity.fragment,
+            },
+            maximum_payload_bytes: policy.maximum_payload_bytes,
+            minimum_interval_ms: u64::try_from(policy.minimum_interval.as_millis())
+                .map_err(|_| invalid_configuration())?,
+        })
+    }
+
+    pub fn validate_for_release(
+        &self,
+        expected_extension_id: &str,
+        expected_extension_version: &str,
+    ) -> Result<(), BrowserIngressError> {
+        if self.protocol_version != 1
+            || self.kind != EdgeBrowserControlKind::CapturePlan
+            || self.extension_id != expected_extension_id
+            || self.extension_version != expected_extension_version
+        {
+            return Err(malformed());
+        }
+        let binding = WindowsBrowserSurfaceBinding {
+            profile_binding_sha256: decode_fixed(&self.profile_binding_sha256)?,
+            browser_session_id: decode_fixed(&self.browser_session_id)?,
+            selection_id: decode_fixed(&self.selection_id)?,
+            tab_id: self.tab_id,
+            window_id: self.window_id,
+            site_sha256: decode_fixed(&self.site_sha256)?,
+            origin_sha256: decode_fixed(&self.origin_sha256)?,
+            granularity: BrowserLocationGranularity {
+                origin: self.granularity.origin,
+                path: self.granularity.path,
+                query: self.granularity.query,
+                fragment: self.granularity.fragment,
+            },
+        };
+        let policy = EdgeBrowserCapturePolicy {
+            binding,
+            scope: match self.scope {
+                EdgeBrowserWireScope::Location => BrowserCaptureScope::Location,
+                EdgeBrowserWireScope::VisibleText => BrowserCaptureScope::VisibleText,
+            },
+            authority_epoch: self.authority_epoch,
+            maximum_payload_bytes: self.maximum_payload_bytes,
+            minimum_interval: Duration::from_millis(self.minimum_interval_ms),
+        };
+        policy.validate()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeBrowserSourceState {
+    Paused,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeBrowserSourcePauseReason {
+    PausedBackground,
+    PausedProtected,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeBrowserSourceStatus {
+    pub protocol_version: u16,
+    kind: EdgeBrowserSourceStatusKind,
+    pub authority_epoch: u64,
+    pub selection_id: Zeroizing<String>,
+    pub state: EdgeBrowserSourceState,
+    pub reason: EdgeBrowserSourcePauseReason,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum EdgeBrowserSourceStatusKind {
+    SourceStatus,
+}
+
+impl fmt::Debug for EdgeBrowserSourceStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EdgeBrowserSourceStatus")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EdgeBrowserSourceStatus {
+    pub fn validate(&self, policy: &EdgeBrowserCapturePolicy) -> Result<(), BrowserIngressError> {
+        if self.protocol_version != 1
+            || self.kind != EdgeBrowserSourceStatusKind::SourceStatus
+            || self.authority_epoch != policy.authority_epoch
+            || self.state != EdgeBrowserSourceState::Paused
+        {
+            return Err(malformed());
+        }
+        compare_hex(
+            &self.selection_id,
+            &policy.binding.selection_id,
+            BrowserIngressErrorKind::WrongSelection,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -673,6 +965,22 @@ fn canonical_site(value: &str) -> Result<String, BrowserIngressError> {
     Ok(host.to_owned())
 }
 
+fn valid_extension_id(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| (b'a'..=b'p').contains(&byte))
+}
+
+fn valid_extension_version(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && (1..=4).contains(&value.split('.').count())
+        && value.split('.').all(|component| {
+            !component.is_empty()
+                && component.len() <= 9
+                && component.bytes().all(|byte| byte.is_ascii_digit())
+                && (component == "0" || !component.starts_with('0'))
+        })
+}
+
 fn canonical_origin(value: &str) -> Result<String, BrowserIngressError> {
     if value.is_empty()
         || value.len() > MAXIMUM_LOCATION_COMPONENT_BYTES
@@ -965,6 +1273,131 @@ mod tests {
         assert!(!encoded.contains("atlas"));
         assert!(!encoded.contains("https"));
         assert!(encoded.len() <= MAXIMUM_BINDING_BYTES);
+    }
+
+    fn selection_offer_json() -> serde_json::Value {
+        serde_json::json!({
+            "protocol_version": 1,
+            "kind": "selection_offer",
+            "extension_id": "abcdefghijklmnopabcdefghijklmnop",
+            "extension_version": "0.1.0",
+            "profile_binding_sha256": "11".repeat(32),
+            "browser_session_id": "22".repeat(16),
+            "selection_id": "33".repeat(16),
+            "tab_id": 41,
+            "window_id": 7,
+            "active": true,
+            "incognito": false,
+            "page_kind": "standard_web_page",
+            "site": "atlas.example",
+            "origin": "https://atlas.example",
+            "site_sha256": encode_bytes(&sha256(b"atlas.example")),
+            "origin_sha256": encode_bytes(&sha256(b"https://atlas.example")),
+        })
+    }
+
+    #[test]
+    fn selection_offer_requires_exact_release_profile_tab_site_and_origin() {
+        let offer: EdgeBrowserSelectionOffer =
+            serde_json::from_value(selection_offer_json()).unwrap();
+        assert_eq!(
+            offer
+                .into_binding("abcdefghijklmnopabcdefghijklmnop", "0.1.0", granularity(),)
+                .unwrap(),
+            binding()
+        );
+
+        for (field, replacement, expected_kind) in [
+            (
+                "profile_binding_sha256",
+                serde_json::json!("90".repeat(31)),
+                BrowserIngressErrorKind::Malformed,
+            ),
+            (
+                "tab_id",
+                serde_json::json!(0),
+                BrowserIngressErrorKind::InvalidConfiguration,
+            ),
+            (
+                "site_sha256",
+                serde_json::json!("91".repeat(32)),
+                BrowserIngressErrorKind::WrongSite,
+            ),
+            (
+                "origin_sha256",
+                serde_json::json!("92".repeat(32)),
+                BrowserIngressErrorKind::WrongOrigin,
+            ),
+        ] {
+            let mut value = selection_offer_json();
+            value[field] = replacement;
+            let offer: EdgeBrowserSelectionOffer = serde_json::from_value(value).unwrap();
+            let failure = offer
+                .into_binding("abcdefghijklmnopabcdefghijklmnop", "0.1.0", granularity())
+                .unwrap_err();
+            assert_eq!(failure.kind, expected_kind);
+        }
+
+        let offer: EdgeBrowserSelectionOffer =
+            serde_json::from_value(selection_offer_json()).unwrap();
+        assert_eq!(
+            offer
+                .into_binding("abcdefghijklmnopabcdefghijklmnop", "0.1.1", granularity(),)
+                .unwrap_err()
+                .kind,
+            BrowserIngressErrorKind::Malformed
+        );
+    }
+
+    #[test]
+    fn capture_plan_is_bounded_content_free_and_round_trips_strictly() {
+        let plan = EdgeBrowserCapturePlan::from_policy(
+            &location_policy(),
+            "abcdefghijklmnopabcdefghijklmnop",
+            "0.1.0",
+        )
+        .unwrap();
+        let encoded = serde_json::to_vec(&plan).unwrap();
+        assert!(encoded.len() <= EDGE_BROWSER_MAXIMUM_NATIVE_MESSAGE_BYTES);
+        let text = String::from_utf8(encoded.clone()).unwrap();
+        assert!(!text.contains("atlas.example"));
+        assert!(!text.contains("/research"));
+        let decoded: EdgeBrowserCapturePlan = serde_json::from_slice(&encoded).unwrap();
+        decoded
+            .validate_for_release("abcdefghijklmnopabcdefghijklmnop", "0.1.0")
+            .unwrap();
+
+        let mut unknown = serde_json::to_value(&plan).unwrap();
+        unknown["private_payload"] = serde_json::json!("synthetic-secret");
+        assert!(serde_json::from_value::<EdgeBrowserCapturePlan>(unknown).is_err());
+    }
+
+    #[test]
+    fn source_status_is_content_free_and_bound_to_selection_epoch() {
+        let status: EdgeBrowserSourceStatus = serde_json::from_value(serde_json::json!({
+            "protocol_version": 1,
+            "kind": "source_status",
+            "authority_epoch": 9,
+            "selection_id": "33".repeat(16),
+            "state": "paused",
+            "reason": "paused_background",
+        }))
+        .unwrap();
+        status.validate(&location_policy()).unwrap();
+
+        let wrong: EdgeBrowserSourceStatus = serde_json::from_value(serde_json::json!({
+            "protocol_version": 1,
+            "kind": "source_status",
+            "authority_epoch": 10,
+            "selection_id": "33".repeat(16),
+            "state": "paused",
+            "reason": "paused_protected",
+        }))
+        .unwrap();
+        assert_eq!(
+            wrong.validate(&location_policy()).unwrap_err().kind,
+            BrowserIngressErrorKind::Malformed
+        );
     }
 
     #[test]

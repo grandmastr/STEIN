@@ -15,8 +15,13 @@ production-edge-host = []
 
 [dependencies]
 serde_json = "1.0"
+stein-broker-windows = { path = "../../crates/stein-broker-windows" }
 stein-platform-windows = { path = "../../crates/stein-platform-windows" }
+tokio = { version = "1.47", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 zeroize = "1.9"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
 
 [[bin]]
 name = "stein-edge-native-host"

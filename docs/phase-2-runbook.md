@@ -81,6 +81,56 @@ The evidence directory is host-private and stays out of source control. A dated,
 sanitized summary may be checked in only after its linked artifacts have been
 inspected.
 
+Use `scripts\windows\phase2\Verify-Installed.cmd` as the fail-closed collector
+for the read-only installed baseline. It requires the exact signed MSIX and its
+adjacent identity/CORE/CLI companions plus the operator-pinned Publisher,
+certificate thumbprint, and four-component version. Each run creates a new
+owner-only timestamped evidence directory and records host provenance, the
+verified bundle and installed identity hashes, the existing lifecycle/status
+projection, every command result, and a separately hashed artifact for every
+ledger row. It performs no install, upgrade, uninstall, daemon/task lifecycle,
+secret-store, database, or private-protocol mutation. Temporary MSIX unpacking
+is verification scratch state, not installed-state mutation.
+
+The collector compares the fixed installed AppX manifest, desktop, broker, and
+browser-producer executables, CORE binding, and logo assets byte-for-byte with
+hashes derived from the operator-pinned signed MSIX. Matching PFN, AUMIDs,
+Publisher, and version without those installed-file hashes is insufficient. It
+also requires the exact deployed file layout: AppX block-map/signature metadata,
+the eight hashed application files, and only the optional exact
+`AppxMetadata\CodeIntegrity.cat` catalog. Any other installed file fails the
+baseline rather than being treated as harmless attachment or metadata.
+Native signature/unpack output is suppressed so local source and temporary
+paths do not enter transcripts. `generator.json` binds the harness and every
+loaded/executed PowerShell dependency by repository-relative path, size, and
+SHA-256 and is revalidated before ledger creation. `root-anchor.json` then binds
+the generator, host, and ledger hashes to the run. This is a content-integrity
+root rather than a signature; retain the printed root digest independently when
+post-run tamper evidence is required.
+
+This collector is intentionally narrower than the completion ledger. Passing
+its signed-bundle, installed PFN/AUMID/CoreBinding, daemon/task/process/ACL, and
+durable-persistence readiness checks is supporting evidence only. It does not
+promote a broad ledger row when the required restart, mutation, adversarial,
+interactive, native, provider, or external fixture was not executed. A harness
+exit code of zero means only that those read-only machine checks passed and the
+ledger was written; inspect `complete_acceptance`, which remains false until all
+rows have separately sufficient evidence. The expected `phase2-focus-v1` policy
+profile is recorded as an unverified expectation because the diagnostic status
+contract does not publish owner policy state; policy-dependent rows therefore
+cannot pass from this harness alone.
+
+Operator screenshots and native-fixture results may be attached through the
+closed manifest documented beside the harness. The collector validates a
+reviewed-synthetic declaration, regular-file bounds, and exact SHA-256, then
+retains only content-free metadata: it neither copies the file nor retains its
+source path. A native result must additionally match the generated closed,
+content-free result schema of bounded fixture/command identifiers, gate, result,
+timestamp, and exit code. Screenshots are always supplemental. A declared native
+pass remains `not_run` pending independent semantic review; declared failure or
+blockage may only lower the row to `fail` or `blocked`. Missing attachments never
+become passes.
+
 ## Completion ledger
 
 | Gate | Required proof | Result before execution |
@@ -90,7 +140,7 @@ inspected.
 | `P2-PRIVATE-CLIENT` | Exact signed installed MSIX PFN/AppContainer peer obtains a private session. Unpackaged copy, renamed binary, valid-protocol same-SID adversary, spoofed AUMID/PFN text, replayed capability, prior daemon, and wrong SID cannot access private commands/views. | NOT RUN |
 | `P2-PERSISTENCE` | Goals, identity/preferences, approvals, grants, allowed focus continuity, audit, and outbox survive restart. Observation/context/model content does not. SQLite pragmas, DACL, owner repositories, integrity, and expiry pass. | NOT RUN |
 | `P2-UPGRADE` | A real Phase 1 schema/package upgrades to the Phase 2 release through the checked migration/recovery-copy procedure, leaving one healthy daemon/package and preserving only supported state. Forced migration failure restores safely. | NOT RUN |
-| `P2-SECRETS` | Credential Manager synthetic write/read/replace/delete/restart behavior passes; no client read API or fallback exists; normal uninstall and explicit remove-data semantics are correct. | NOT RUN |
+| `P2-SECRETS` | Credential Manager synthetic write/read/replace/delete/restart behavior passes; forced route-revocation delete failure leaves an opaque durable obligation that startup/maintenance retries without restoring authority; no client read API or fallback exists; normal uninstall and explicit remove-data semantics are correct. | NOT RUN |
 | `P2-IDENTITY` | Versioned STEIN identity and direct-user preferences persist, revision conflicts fail, stricter preferences affect policy, and observations/model/feedback never learn a durable preference implicitly. | NOT RUN |
 | `P2-GOALS` | Public create/update/complete/abandon/delete behavior is idempotent/revisioned/direct-user-only and persists across restart/upgrade with the documented cascade. | NOT RUN |
 | `P2-GRANTS` | Every observation, model, and notification scope is independently grantable/revocable; missing, narrower, wrong-resource, wrong-route, expired, superseded, and restart-disallowed grants fail. | NOT RUN |
@@ -98,20 +148,20 @@ inspected.
 | `P2-PRESENCE` | WTS/session and `GetLastInputInfo` adapter reports bounded active/idle/locked health without input content; lock/switch/logout pauses sensitive work and unlock waits for fresh health. | NOT RUN |
 | `P2-APPLICATION` | Selected Notepad/foreground identity succeeds; unrelated application identity is not inventoried; title/content/pixels remain unavailable under the narrower grant. | NOT RUN |
 | `P2-DOCUMENT` | Exact handle-bound synthetic document/workspace emits only authorized activity/content; reparse, rename, replacement, path escape, unrelated file, and revocation fixtures fail closed. | NOT RUN |
-| `P2-BROWSER` | Exact published Edge Add-ons MV3 version and the OS-admitted one-way native-host producer honor the selected profile, tab, origin/site, and URL granularity; unpacked/spoofed bundles, history, background, unrelated, and protected content are absent. | NOT RUN |
+| `P2-BROWSER` | Exact published Edge Add-ons MV3 version and the OS-admitted one-way native-host producer honor the selected profile, tab, origin/site, and URL granularity; unpacked/spoofed bundles, history, background, unrelated, and protected content are absent; daemon restart requires a fresh extension invocation, selection, and grant. | NOT RUN |
 | `P2-UIA` | Selected Notepad `HWND` yields bounded structured visible text; password, secure/protected, consent, other-window, and unverifiable UIA fixtures pause or report unavailable. | NOT RUN |
 | `P2-PIXELS` | Explicit Windows Graphics Capture picker/region and separate pixel grant work with visible status; one transient bounded frame is destroyed and structured input wins when sufficient. | NOT RUN |
 | `P2-MODEL-CONTRACT` | Golden packets prove least-sensitive grant/route intersection; no unapproved category, tool, provider object, prompt, raw response, or credential crosses the gateway/persistence/diagnostic boundaries. | NOT RUN |
 | `P2-MODEL-LIVE` | One live synthetic OpenAI Responses request uses the approved exact route, `store: false`, strict schema, no tools/state/background features, deadline/cancellation, and truthful handling disclosure. | NOT RUN |
 | `P2-SILENCE` | Healthy relevant-writing/research trace produces no model call or intervention merely because foreground activity changes. | NOT RUN |
 | `P2-INTERVENTION` | Near-deadline missing-success-condition trace produces one validated candidate, deterministic allow decision, acknowledged audit append, and one native notification with uncertainty-qualified text. | NOT RUN |
-| `P2-POLICY-FAILSAFE` | Stale source, invalid/tool-shaped/refusal output, absent/expired authority, lock, mute, cap/cooldown, model failure, policy failure, and audit failure all produce silence/deny. | NOT RUN |
+| `P2-POLICY-FAILSAFE` | Stale source, invalid/tool-shaped/refusal output, absent/expired authority, lock, mute, cap/cooldown, model failure, policy failure, audit failure, legacy/empty policy trace, or policy/profile/preference/grant/route revision mismatch all produce silence/deny; evaluated significance and intervention audits retain only the exact content-free policy trace/digest. | NOT RUN |
 | `P2-NATIVE-CONTROL` | With Tauri closed, native tray/status shows exact capture categories and health, emergency stop takes authority immediately, and Explorer/status-loop loss pauses capture until revalidation. | NOT RUN |
-| `P2-NOTIFICATION` | With Tauri closed and Windows unlocked, daemon-owned native toast is accepted under the registered AUMID; activation uses only opaque arguments; audit distinguishes accepted from displayed/seen. | NOT RUN |
+| `P2-NOTIFICATION` | With Tauri closed and Windows unlocked, daemon-owned native toast is accepted under the registered AUMID; the fixed packaged COM activator accepts only `action=open&intervention=<canonical UUID>`, opens/focuses Tauri, reconnects through the private broker, and resolves the typed authoritative explanation; malformed, input-bearing, wrong-AUMID, unpackaged, and diagnostic activation fixtures fail closed; audit distinguishes accepted from displayed/seen. | NOT RUN |
 | `P2-OUTBOX-RECOVERY` | All channels unavailable queues one minimal item; recovery before expiry revalidates and attempts it once; ambiguous/acknowledged state does not duplicate. | NOT RUN |
 | `P2-OUTBOX-EXPIRY` | Recovery after expiry/relevance loss removes private text and shows only non-interruptive missed history, without a notification burst. | NOT RUN |
 | `P2-FEEDBACK` | Accept, dismiss, correct, mute, and stop work through authoritative commands. Correction changes current context/explanation but not historical decision, identity, preferences, or memory. | NOT RUN |
-| `P2-REVOCATION-RACE` | Deterministic races prove revoke/cancel beats late observation, reasoning, queue, and every delivery not terminally acknowledged; cleanup failure remains visible without restoring authority. | NOT RUN |
+| `P2-REVOCATION-RACE` | Deterministic races prove revoke/cancel beats late observation, reasoning, queue, and every delivery not terminally acknowledged; native-resource and credential cleanup failures remain durably pending and visible through content-free health/counts without restoring authority. | NOT RUN |
 | `P2-DESKTOP-CLOSED` | Active background-authorized focus session continues capture, context, scheduling, reasoning, status, and native delivery while the full desktop is closed; reconnect replaces cache with an authoritative snapshot/cursor. | NOT RUN |
 | `P2-DAEMON-RESTART` | Only unexpired restart-authorized work recovers; unauthorized work stops; all source health/context resets to unknown; no absence reasoning occurs before fresh evidence. | NOT RUN |
 | `P2-RETENTION` | Controllable clock proves raw-immediate, observation-10-minute, context-session, outbox-actionability, and audit-30-day boundaries plus direct deletion across every read/assembly/export path. | NOT RUN |
@@ -126,16 +176,65 @@ cancels and joins the owner task without waiting for the next tick. Passing this
 source fixture does not change the ledger row from `NOT RUN`; the complete
 installed acceptance gate is still required.
 
+The source maintenance fixture also injects controllable native-resource release
+and secret-store deletion failures. It proves startup and periodic sweeps retry
+bounded private obligations across SQLite restart, treat already-absent native
+state as success, and never recreate a selected-resource binding or model-route
+authority. Private identifiers and adapter error text are excluded from
+operational reporting. As above, this source proof does not change an installed
+ledger row from `NOT RUN`.
+
+The source cancellation fixtures separately prove that scheduler shutdown,
+global proactive disable, and session mute signal adapter-visible cancellation;
+mute does not stop observation authority; native-delivery timeout explicitly
+cancels its port token; and queued intervention/outbox text is scrubbed before a
+restrictive command returns. These deterministic fixtures support
+`P2-POLICY-FAILSAFE`, `P2-FEEDBACK`, and `P2-REVOCATION-RACE`, but none replaces
+the installed race evidence required by those ledger rows.
+
+The Windows pixel source fixtures additionally prove canonical content-free
+`winpixel:v1` bindings, picker-only API use, exact `ScreenRegion` authority,
+10-second rate configuration, 1920 by 1080 / 8 MiB transient bounds, one-frame
+normalization, CPU-buffer zeroization, blank/protected rejection, cancellation,
+revocation, and a process-wide disposable-worker cap. Deterministic composition
+tests prove browser/document/UIA/window-metadata sources start first and that an
+active structured source creates no frame. The two native Graphics Capture
+tests remain ignored because one needs an unlocked interactive session and the
+other opens the real system picker. These source tests do **not** change
+`P2-PIXELS` from `NOT RUN`.
+
+To execute the native pixel gate, use the signed installed Phase 2 build in an
+unlocked current-user session. Select a synthetic window or display through the
+Windows Graphics Capture picker, approve only the exact `ScreenRegion` resource
+and `observe.screen.pixels` grant, and retain the visible Windows border plus
+STEIN native-status evidence. First keep a structured browser/document/UIA
+source active and prove the adapter reports pixel deferral with no frame. Then
+stop that structured source, make a fresh explicit pixel selection, run one
+capture, and inspect process/database/log/audit/outbox/protocol artifacts for
+the absence of image bytes. Lock, switch session, revoke the item, cancel, and
+restart the daemon; each must destroy or drop transient state and require fresh
+selection. Only after that installed trace is retained may `P2-PIXELS` change
+from `NOT RUN`.
+
 ## Nominal installed trace
 
 The retained trace must show, in order:
 
 1. Install the signed Phase 2 package non-elevated and prove one supervised CORE
    daemon is healthy before the desktop opens.
-2. Configure the provider secret through the trusted native surface without
-   exposing it to React or the transcript.
-3. Open the capability-bound desktop and approve the exact remote OpenAI route,
-   provider handling profile, and only the data categories used by the fixture.
+2. From the capability-bound desktop, run the single native route-setup
+   transaction for the exact remote OpenAI route, reviewed handling profile, and
+   only the data categories used by the fixture. Prove React and the transcript
+   receive no credential bytes: Rust validates the approval before CredUI,
+   retains the entered value only in zeroizing native memory, approves first,
+   and writes Credential Manager last under the canonical approval UUID returned
+   by CORE, never under the provider route ID shown by the prompt.
+3. Exercise native-prompt cancellation, daemon approval failure, and final
+   credential-write failure for both a new and existing synthetic target. The
+   first two leave the target absent or byte-identical; the last attempts to
+   revoke its newly approved route, deletes only that approval's target on
+   successful compensation, leaves any prior approval target byte-identical,
+   and emits only the bounded setup error.
 4. Create a durable Project Atlas goal with a success statement and deadline.
 5. Select the synthetic Notepad document/workspace, Edge profile/site, and the
    exact independent observation/notification grants; leave pixels off initially.
@@ -152,6 +251,12 @@ The retained trace must show, in order:
     `accepted_by_channel` unless stronger evidence actually exists.
 11. Activate the toast, reconnect through a fresh private session, and inspect the
     authoritative goal/session/intervention explanation.
+    Retain the content-free activation trace proving the fixed desktop AUMID,
+    intervention UUID, private connection, explanation response, and dashboard
+    refresh. Repeat while Tauri is already running, then exercise malformed,
+    extra-key, uppercase/noncanonical UUID, input-bearing, wrong-AUMID,
+    unpackaged-marker, and diagnostic-only fixtures; none may resolve or display
+    private state.
 12. Record a correction, then a new direct goal update. Prove the correction
     changes current context without rewriting history or learning a preference.
 13. Mute and unmute delivery independently from observation, then use the native
@@ -200,6 +305,14 @@ If the required second account, package-signing identity, provider credential, o
 published Microsoft Edge Add-ons extension identity/version, or interactive
 lifecycle fixture is unavailable, record the gate as `BLOCKED` and do not call
 the Windows Phase 2 slice complete.
+
+`P2-BROWSER` currently has source-owned build, package, registration, one-way
+transport, fresh-authority, selection, cancellation, and cleanup contracts. It
+is still **NOT RUN**. The irreducible residual is a real published Edge Add-ons
+ID/version plus a clean installed direct-Edge-launch fixture proving that the
+native host token carries the exact signed package PFN and
+`!BrowserObservationProducer` AUMID. Parent/publisher/origin evidence and a
+successful static build cannot substitute for that runtime admission.
 
 ## Completion claim
 

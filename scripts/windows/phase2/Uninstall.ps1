@@ -75,7 +75,9 @@ else {
             -Version $Version
         if ($removalBundle.PackageFamilyName -cne [string]$record.package_family_name -or
             $removalBundle.DesktopAumid -cne [string]$record.desktop_aumid -or
-            $removalBundle.BrokerAumid -cne [string]$record.broker_aumid) {
+            $removalBundle.BrokerAumid -cne [string]$record.broker_aumid -or
+            $removalBundle.BrowserProducerAumid -cne [string]$record.browser_producer_aumid -or
+            $removalBundle.BrowserHostSha256 -cne [string]$record.browser_host_sha256) {
             throw "The signed removal bundle does not match the uninstalled identity record."
         }
     }

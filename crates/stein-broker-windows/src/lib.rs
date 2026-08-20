@@ -14,6 +14,7 @@ use thiserror::Error;
 pub const PRODUCTION_PACKAGE_NAME: &str = "STEIN.PersonalIntelligence";
 pub const DESKTOP_APPLICATION_ID: &str = "Desktop";
 pub const BROKER_APPLICATION_ID: &str = "PrivateBroker";
+pub const BROWSER_PRODUCER_APPLICATION_ID: &str = "BrowserObservationProducer";
 pub const BROKER_RELAY_PIPE: &str = r"\\.\pipe\LOCAL\stein-private-broker-v1";
 pub const CORE_PRIVATE_PIPE: &str = r"\\.\pipe\LOCAL\stein-core-private-v1";
 
@@ -22,13 +23,28 @@ mod native;
 #[cfg(windows)]
 pub use native::PrivatePipeSecurity;
 
-/// The two package identities accepted by the narrow Windows broker topology.
+/// The package identities accepted by STEIN's narrow Windows broker topology.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PackagePeerClass {
     /// The sandboxed broker admitted by CORE's private endpoint.
     AppContainerBroker,
     /// The packaged full-trust Tauri backend admitted by the broker relay.
     PackagedDesktop,
+    /// The packaged full-trust, write-only Edge observation producer admitted
+    /// by CORE's dedicated browser endpoint.
+    BrowserObservationProducer,
+}
+
+/// Resolves the current process token's owner SID without trusting environment
+/// variables or command-line input.
+#[cfg(windows)]
+pub fn current_process_user_sid() -> Result<String, AdmissionError> {
+    native::current_process_user_sid()
+}
+
+#[cfg(not(windows))]
+pub fn current_process_user_sid() -> Result<String, AdmissionError> {
+    Err(AdmissionError::new(AdmissionErrorKind::Unsupported))
 }
 
 /// Exact, installation-pinned Windows package identity.

@@ -20,6 +20,8 @@ mod native_surface;
 mod notification;
 #[cfg(windows)]
 mod observation;
+#[cfg(windows)]
+mod pixel;
 mod presence;
 #[cfg(windows)]
 mod selected_resource;
@@ -39,17 +41,22 @@ pub use browser::{
     BrowserLocationFields, BrowserObservationEnvelope, BrowserObservationPacket,
     BrowserObservationValidator, BrowserPageKind, BrowserValidationOutcome,
     EDGE_BROWSER_EXTRACTION_VERSION, EDGE_BROWSER_MAXIMUM_NATIVE_MESSAGE_BYTES,
-    EDGE_BROWSER_REDACTION_VERSION, EDGE_NATIVE_HOST_NAME, EdgeBrowserCapturePolicy,
-    EdgeBrowserSelection, WindowsBrowserSurfaceBinding,
+    EDGE_BROWSER_REDACTION_VERSION, EDGE_NATIVE_HOST_NAME, EdgeBrowserCapturePlan,
+    EdgeBrowserCapturePolicy, EdgeBrowserControlKind, EdgeBrowserSelection,
+    EdgeBrowserSelectionOffer, EdgeBrowserSourcePauseReason, EdgeBrowserSourceState,
+    EdgeBrowserSourceStatus, EdgeBrowserWireGranularity, EdgeBrowserWireScope,
+    WindowsBrowserSurfaceBinding,
 };
 pub use browser_ingress::{
     AuthorizedBrowserObservation, BrowserAuthoritySnapshotPort, BrowserObservationProducerIngress,
     BrowserProducerAuthorityReference, BrowserProducerConnectionAuthority,
-    BrowserProducerIngressError, BrowserProducerIngressErrorKind, CurrentBrowserProducerAuthority,
-    EDGE_BROWSER_PRODUCER_APPLICATION_ID, EDGE_BROWSER_PRODUCER_PIPE,
-    EDGE_BROWSER_PRODUCER_SOURCE_ID, EDGE_BROWSER_PRODUCER_UNAVAILABLE_REASON,
-    admit_release_managed_edge_producer,
+    BrowserProducerIngressError, BrowserProducerIngressErrorKind, BrowserProducerIngressEvent,
+    CurrentBrowserProducerAuthority, EDGE_BROWSER_PRODUCER_APPLICATION_ID,
+    EDGE_BROWSER_PRODUCER_PIPE, EDGE_BROWSER_PRODUCER_SOURCE_ID,
+    EDGE_BROWSER_PRODUCER_UNAVAILABLE_REASON,
 };
+#[cfg(windows)]
+pub use browser_ingress::{BrowserProducerListener, admit_release_managed_edge_producer};
 pub use credential::{MODEL_ROUTE_TARGET_PREFIX, WindowsCredentialSecretStore};
 #[cfg(windows)]
 pub use edge_launch::{

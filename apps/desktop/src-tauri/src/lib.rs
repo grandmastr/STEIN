@@ -3,6 +3,8 @@ mod native_credential_prompt;
 #[cfg(windows)]
 mod private_broker;
 mod stein_adapter;
+#[cfg(windows)]
+mod toast_activation;
 mod view;
 
 use bridge::CoreBridge;
@@ -14,9 +16,9 @@ use view::{
     InterventionExplanationView, InterventionFeedbackInput, InterventionHistoryInput,
     InterventionHistoryView, InterventionView, ModelRouteView, PublicErrorView,
     RegisterSelectedResourceInput, RemoveSelectedResourceInput, ResourceView,
-    RevokePermissionInput, SecretMutationView, SelectedResourceDeletionView, SessionGrantView,
-    SetMutedInput, StartFocusSessionInput, SteinIdentityView, StoreModelSecretInput,
-    UpdateGoalInput, UpdateUserPreferencesInput, UserPreferencesUpdateView, UserPreferencesView,
+    RevokePermissionInput, SelectedResourceDeletionView, SessionGrantView, SetMutedInput,
+    StartFocusSessionInput, SteinIdentityView, UpdateGoalInput, UpdateUserPreferencesInput,
+    UserPreferencesUpdateView, UserPreferencesView,
 };
 
 #[tauri::command]
@@ -88,17 +90,20 @@ async fn desktop_delete_goal(
     bridge.inner().delete_goal(&app, input).await
 }
 
-/// The only renderer-callable provider-secret write. There is deliberately no
-/// command that reads secret bytes back into the webview.
+/// The renderer supplies only reviewed route metadata. Rust validates and
+/// builds the approval before opening CredUI, retains the credential only in
+/// zeroizing native memory, approves through the private protocol, and writes
+/// Credential Manager last under the returned approval identity. There is no
+/// standalone renderer secret-write API.
 #[tauri::command]
-async fn desktop_store_model_secret(
+async fn desktop_setup_model_route(
     app: AppHandle,
     bridge: State<'_, CoreBridge>,
-    input: StoreModelSecretInput,
-) -> Result<SecretMutationView, PublicErrorView> {
+    input: ApproveModelRouteInput,
+) -> Result<ModelRouteView, PublicErrorView> {
     bridge
         .inner()
-        .store_model_secret(input, main_window_handle(&app)?)
+        .setup_model_route(&app, input, main_window_handle(&app)?)
         .await
 }
 
@@ -123,15 +128,6 @@ fn main_window_handle(app: &AppHandle) -> Result<isize, PublicErrorView> {
 #[cfg(not(windows))]
 fn main_window_handle(_app: &AppHandle) -> Result<isize, PublicErrorView> {
     Ok(0)
-}
-
-#[tauri::command]
-async fn desktop_approve_model_route(
-    app: AppHandle,
-    bridge: State<'_, CoreBridge>,
-    input: ApproveModelRouteInput,
-) -> Result<ModelRouteView, PublicErrorView> {
-    bridge.inner().approve_model_route(&app, input).await
 }
 
 #[tauri::command]
@@ -261,7 +257,22 @@ async fn desktop_get_intervention_history(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    #[cfg(windows)]
+    let mut toast_activation_registration = match toast_activation::initialize(std::env::args()) {
+        toast_activation::ToastActivationStartup::Registered(registration) => Some(registration),
+        toast_activation::ToastActivationStartup::NotPackaged => None,
+        // A packaged process with the wrong identity, a forged direct
+        // activation marker, or a failed COM registration cannot become a
+        // notification activation surface.
+        toast_activation::ToastActivationStartup::Rejected => return,
+    };
+
+    #[cfg(windows)]
+    let toast_activation_receiver = toast_activation_registration
+        .as_mut()
+        .and_then(toast_activation::ToastActivationRegistration::take_receiver);
+
+    let builder = tauri::Builder::default()
         .manage(CoreBridge::default())
         .invoke_handler(tauri::generate_handler![
             desktop_bootstrap,
@@ -272,8 +283,7 @@ pub fn run() {
             desktop_complete_goal,
             desktop_abandon_goal,
             desktop_delete_goal,
-            desktop_store_model_secret,
-            desktop_approve_model_route,
+            desktop_setup_model_route,
             desktop_grant_permission,
             desktop_revoke_permission,
             desktop_start_focus_session,
@@ -289,7 +299,17 @@ pub fn run() {
             desktop_record_intervention_feedback,
             desktop_explain_intervention,
             desktop_get_intervention_history,
-        ])
+        ]);
+
+    #[cfg(windows)]
+    let builder = builder.setup(move |app| {
+        if let Some(receiver) = toast_activation_receiver {
+            toast_activation::spawn(app.handle().clone(), receiver);
+        }
+        Ok(())
+    });
+
+    builder
         .run(tauri::generate_context!())
         .expect("failed to run STEIN desktop presentation");
 }

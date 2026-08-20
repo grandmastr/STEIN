@@ -68,12 +68,12 @@ about all users or future workflows.
 | Maximum evidence age in a model packet | 2 minutes | Older raw normalized evidence is omitted; a coarse aggregate may remain only with its time range and provenance. |
 | Absence/progress lookback | 10 minutes | An absence claim requires the relevant sources to have stayed healthy and complete for this whole window. |
 | Normalized observation TTL | 10 minutes | Accepted ADR 0005 default; session end or revocation wins sooner. |
-| Retention maintenance cadence | No more than 60 seconds between sweeps | Quiet sessions are swept without requiring new ingestion. The controllable one-shot retains only observations with a non-negative age strictly below their TTL, so exact expiry and later are physically removed; a clock rollback that makes an accepted observation future-dated removes it rather than extending private retention. Audit records with `expires_at <= now` are physically purged in the same sweep. |
+| Retention maintenance cadence | No more than 60 seconds between sweeps | Quiet sessions are swept without requiring new ingestion. The controllable one-shot retains only observations with a non-negative age strictly below their TTL, so exact expiry and later are physically removed; a clock rollback that makes an accepted observation future-dated removes it rather than extending private retention. Audit records with `expires_at <= now` are physically purged in the same sweep. The same owner task retries at most three retained native-resource releases and three revoked-route credential deletions per pass; individual platform failures remain pending rather than terminating the sweep. |
 | Derived working-context TTL | Focus-session end | Revocation removes the affected scope sooner; restart loses all context. |
 | Raw artifact lifetime | One normalization or approved request | Destroy immediately on completion, error, cancellation, lock, stop, or revocation. |
 | Candidate policy-decision validity | 30 seconds | Delivery must re-evaluate after this window or any relevant revision change. |
 | Delivered intervention/permission audit TTL | 30 days | Accepted ADR 0005 default; direct deletion wins sooner. |
-| Focus-session grant maximum | 8 hours | Default expiry is session end or goal deadline, whichever comes first; a shorter user choice wins. |
+| Focus-session grant maximum | 8 hours | Input is rejected when expiry is later than eight hours after effectiveness or later than the goal deadline. Runtime session end, goal deadline, or authority revocation/expiry wins sooner. |
 | Model-route approval UI default | 30 days | The user may choose a shorter expiry or deliberately approve the optional no-expiry form from ADR 0007. |
 
 Restart continuity is off by default for session grants and selected-resource
@@ -113,6 +113,18 @@ widens scope, silently samples another source, or spills content to disk.
 | Audit append deadline | 2 seconds; timeout denies delivery. |
 | Native delivery attempt deadline | 5 seconds; ambiguity becomes `delivery_unknown`. |
 | Adapter stop acknowledgement | 5 seconds; authority is revoked immediately even if cleanup later reports failure. |
+
+Before each scheduled reasoning pass, CORE revalidates the exact goal revision
+and deadline, every required session grant, and the selected model route. This
+reconciliation runs before mute, do-not-disturb, remote-processing, or model
+availability gates, so those quieter modes cannot leave an expired workflow
+durably `Active`. Missing, revoked, or expired authority moves the session
+through audited `Stopping`, cancels ephemeral work, scrubs its outbox, performs
+bounded adapter/native-status cleanup, and records `Ended`. A daemon restart
+resumes any durable `Stopping` cleanup rather than skipping it. Expected
+authority races produce silence/reconciliation instead of terminating the
+reasoning scheduler; repository corruption or unavailability still fails the
+protected operation closed.
 
 A user preference may lengthen cooldown, lower request/intervention caps, shorten
 retention/expiry, disable remote processing, mute proactive behavior, or disable a
@@ -159,6 +171,13 @@ preferences. Observation, model output, silence, intervention acceptance,
 dismissal, correction, timing, and application use are prohibited inputs to an
 automatic durable preference update.
 
+Disabling or muting proactive interventions cancels in-flight model and
+unacknowledged delivery work through a token that is separate from observation
+authority. Queued intervention/outbox text is cancelled and scrubbed before the
+preference command returns. Re-enabling creates fresh proactive cancellation
+authority only after the direct revisioned preference remains current; it does
+not revive cancelled queue entries.
+
 This is explicit configuration, not Phase 3 personal memory. There is no learned
 profile, embedding, cross-session behavioral inference, or hidden self-modifying
 prompt. Deletion follows the owning repository contract.
@@ -166,11 +185,15 @@ prompt. Deletion follows the owning repository contract.
 ### Configuration and time
 
 The effective policy profile and user overrides are queryable in a privacy-safe
-view and referenced by every significance/intervention audit record. Defaults are
-versioned configuration owned by policy, not copied into adapters. Wall-clock UTC
-records deadlines/history; monotonic time measures in-runtime cooldowns,
-heartbeats, elapsed windows, and timeouts. Restart recomputes wall-clock expiry
-and never emits a catch-up burst.
+view and referenced by every evaluated significance decision and every
+intervention policy decision/audit through a content-free policy trace. That
+trace includes the exact effective preference revision, versioned policy profile,
+canonical typed-input schema version, and SHA-256 digest of the exact proposed
+inputs; it never persists the input projection or private source/candidate text.
+Defaults are versioned configuration owned by policy, not copied into adapters.
+Wall-clock UTC records deadlines/history; monotonic time measures in-runtime
+cooldowns, heartbeats, elapsed windows, and timeouts. Restart recomputes
+wall-clock expiry and never emits a catch-up burst.
 
 Changing a value within the accepted semantic boundary requires a versioned
 profile, synthetic before/after replay, and a recorded evaluation reason. Making
@@ -195,6 +218,9 @@ automatic learning, or adding a new intervention class requires a new ADR.
 
 - Controllable-clock boundary tests cover exactly-before/at/after every freshness,
   TTL, decision, cooldown, deadline, grant, audit, and outbox time.
+- Controllable-clock workflow tests prove the exact goal/grant deadline and a
+  model-route expiry end an active session even while interventions are muted,
+  without invoking the model or terminating scheduler supervision.
 - Burst fixtures prove event coalescing, capture-rate ceilings, one-frame/one-model
   concurrency, payload bounds, hourly budget, cooldown, and session cap.
 - Clock rollback/forward and daemon restart recompute safely without stale
@@ -203,6 +229,9 @@ automatic learning, or adding a new intervention class requires a new ADR.
   fixtures fail closed and expose truthful content-free health/outcomes.
 - A direct preference update requires expected revision, survives restart, and
   takes effect on the next policy decision.
+- Any preference revision change invalidates a pending delivery decision; a
+  recovery allow uses a newly digested trace, while legacy/empty traces fail
+  closed.
 - Accept, dismiss, correct, observe, and model-result fixtures leave identity and
   preferences byte-for-byte unchanged unless a separate direct update command is
   present.

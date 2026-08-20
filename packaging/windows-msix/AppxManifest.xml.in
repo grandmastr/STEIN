@@ -3,8 +3,10 @@
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  IgnorableNamespaces="uap uap10 rescap">
+  IgnorableNamespaces="uap uap10 com desktop rescap">
   <Identity
     Name="STEIN.PersonalIntelligence"
     Publisher="{{PUBLISHER}}"
@@ -42,6 +44,24 @@
         BackgroundColor="#111827"
         Square44x44Logo="Assets\Square44x44Logo.png"
         Square150x150Logo="Assets\Square150x150Logo.png" />
+      <Extensions>
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:ExeServer
+              Executable="bin\stein-desktop.exe"
+              Arguments="-ToastActivated"
+              DisplayName="STEIN toast activator">
+              <com:Class
+                Id="3DB3B5B0-1BA5-49D1-A8F0-CF2B3EA6D781"
+                DisplayName="STEIN toast activator" />
+            </com:ExeServer>
+          </com:ComServer>
+        </com:Extension>
+        <desktop:Extension Category="windows.toastNotificationActivation">
+          <desktop:ToastNotificationActivation
+            ToastActivatorCLSID="3DB3B5B0-1BA5-49D1-A8F0-CF2B3EA6D781" />
+        </desktop:Extension>
+      </Extensions>
     </Application>
 
     <Application
@@ -57,6 +77,20 @@
         Square44x44Logo="Assets\Square44x44Logo.png"
         Square150x150Logo="Assets\Square150x150Logo.png" />
     </Application>
+
+    <Application
+      Id="BrowserObservationProducer"
+      Executable="bin\stein-edge-native-host.exe"
+      uap10:RuntimeBehavior="packagedClassicApp"
+      uap10:TrustLevel="mediumIL">
+      <uap:VisualElements
+        AppListEntry="none"
+        DisplayName="STEIN Edge observation producer"
+        Description="STEIN selected-tab observation producer"
+        BackgroundColor="#111827"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        Square150x150Logo="Assets\Square150x150Logo.png" />
+    </Application>
   </Applications>
 
   <Capabilities>
@@ -65,4 +99,3 @@
     <rescap:Capability Name="runFullTrust" />
   </Capabilities>
 </Package>
-

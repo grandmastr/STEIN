@@ -10,9 +10,11 @@ Source checkouts are intentionally inert: `extension-config.js` contains an
 unresolved release-ID token. `packaging/windows-edge/Build-EdgeArtifacts.ps1`
 must generate a release directory with the exact Microsoft Edge Add-ons ID.
 
-The native host currently refuses to read content because CORE has no dedicated
-OS-authenticated browser-producer admission. Edge's caller-origin argument and
-signed parent image are useful evidence, but do not prove that an unpacked
-extension with the same manifest key is the release-managed extension. Do not
-install or claim `P2-BROWSER` until the broker seam documented by the packaging
-README and the packaged native fixtures pass.
+The native host now bridges only this bounded producer protocol to CORE's fixed
+OS-authenticated browser-producer endpoint. It receives one authority-derived
+capture plan and cannot issue general private commands or receive observation
+payloads from CORE. Edge's caller-origin argument and signed parent image remain
+supporting evidence only: they do not prove that an unpacked extension with the
+same manifest key is the release-managed extension. Do not claim `P2-BROWSER`
+until the packaged direct-launch identity fixture documented by the packaging
+README passes.

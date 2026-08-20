@@ -267,6 +267,12 @@ export interface InterventionExplanationView {
   evidence: EvidenceView[];
   policyDecisionId: string;
   policyVersion: string;
+  policyTrace?: {
+    policyProfileId: string;
+    userPreferencesRevision: number;
+    inputSchemaVersion: number;
+    inputDigestSha256: string;
+  };
   decision: string;
   decisionReasonCodes: string[];
   decisionIssuedAt: string;
@@ -275,6 +281,58 @@ export interface InterventionExplanationView {
   outcome: string;
   deliveredText?: string;
   correctionRecorded: boolean;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+/** Defensively validates the trusted-native toast event before it enters React state. */
+export function isInterventionExplanationView(value: unknown): value is InterventionExplanationView {
+  if (!isRecord(value) || !Array.isArray(value.evidence)) return false;
+  const validEvidence = value.evidence.every((entry) =>
+    isRecord(entry) &&
+    typeof entry.category === "string" &&
+    typeof entry.freshness === "string" &&
+    typeof entry.confidence === "string" &&
+    typeof entry.role === "string" &&
+    typeof entry.observedFrom === "string" &&
+    typeof entry.observedUntil === "string",
+  );
+  const validPolicyTrace = value.policyTrace === undefined || (
+    isRecord(value.policyTrace) &&
+    typeof value.policyTrace.policyProfileId === "string" &&
+    value.policyTrace.policyProfileId.trim().length > 0 &&
+    typeof value.policyTrace.userPreferencesRevision === "number" &&
+    Number.isSafeInteger(value.policyTrace.userPreferencesRevision) &&
+    value.policyTrace.userPreferencesRevision > 0 &&
+    typeof value.policyTrace.inputSchemaVersion === "number" &&
+    Number.isSafeInteger(value.policyTrace.inputSchemaVersion) &&
+    value.policyTrace.inputSchemaVersion === 1 &&
+    typeof value.policyTrace.inputDigestSha256 === "string" &&
+    /^[0-9a-f]{64}$/.test(value.policyTrace.inputDigestSha256)
+  );
+  return (
+    validEvidence &&
+    validPolicyTrace &&
+    typeof value.interventionId === "string" &&
+    Number.isSafeInteger(value.candidateRevision) &&
+    typeof value.focusSessionId === "string" &&
+    typeof value.policyDecisionId === "string" &&
+    typeof value.policyVersion === "string" &&
+    typeof value.decision === "string" &&
+    isStringArray(value.decisionReasonCodes) &&
+    typeof value.decisionIssuedAt === "string" &&
+    typeof value.decisionExpiresAt === "string" &&
+    typeof value.deliveryState === "string" &&
+    typeof value.outcome === "string" &&
+    (value.deliveredText === undefined || typeof value.deliveredText === "string") &&
+    typeof value.correctionRecorded === "boolean"
+  );
 }
 
 export interface InterventionHistoryView {
@@ -373,15 +431,6 @@ export interface GoalDeletionView {
 
 export interface AbandonGoalInput extends GoalRevisionInput {
   reason?: string;
-}
-
-export interface StoreModelSecretInput {
-  routeId: string;
-}
-
-export interface SecretMutationView {
-  routeId: string;
-  configured: boolean;
 }
 
 export interface ApproveModelRouteInput {

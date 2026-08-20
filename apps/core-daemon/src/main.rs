@@ -9,6 +9,8 @@ use stein_ipc::{PrivateServerIdentity, ServerConfig, run_private_server, run_ser
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+#[cfg(all(windows, feature = "production-edge-producer"))]
+mod browser_producer;
 #[cfg(all(windows, feature = "production-private-endpoint"))]
 mod production;
 #[cfg(all(windows, feature = "production-private-endpoint"))]
@@ -42,6 +44,8 @@ fn embedded_private_identity() -> Result<Option<PrivateServerIdentity>> {
 struct DaemonComposition {
     core: CoreApplication,
     emergency_owner: Option<ActorId>,
+    #[cfg(all(windows, feature = "production-edge-producer"))]
+    browser_producer: Option<std::sync::Arc<browser_producer::WindowsBrowserProducerPort>>,
 }
 
 fn spawn_supervised_background_task<F>(
@@ -123,6 +127,8 @@ fn build_daemon_composition() -> Result<DaemonComposition> {
     Ok(DaemonComposition {
         core: composition.core,
         emergency_owner: Some(composition.owner),
+        #[cfg(feature = "production-edge-producer")]
+        browser_producer: Some(composition.browser_producer),
     })
 }
 
@@ -138,6 +144,8 @@ fn build_daemon_composition() -> Result<DaemonComposition> {
     Ok(DaemonComposition {
         core,
         emergency_owner: None,
+        #[cfg(all(windows, feature = "production-edge-producer"))]
+        browser_producer: None,
     })
 }
 
@@ -148,6 +156,11 @@ async fn recover_daemon_workflows(core: &CoreApplication, owner: Option<ActorId>
     info!(
         reactivated_sessions = recovery.reactivated_with_fresh_sources,
         ended_sessions = recovery.ended_without_restart_authority,
+        resumed_stopping_cleanup = recovery.resumed_stopping_cleanup,
+        native_cleanups_completed = recovery.native_cleanups_completed,
+        native_cleanups_pending = recovery.native_cleanups_pending,
+        secret_cleanups_completed = recovery.secret_cleanups_completed,
+        secret_cleanups_pending = recovery.secret_cleanups_pending,
         "durable Phase 2 recovery revalidated"
     );
     Ok(())
@@ -171,6 +184,8 @@ async fn main() -> Result<()> {
     let composition = build_daemon_composition()?;
     let core = composition.core;
     let emergency_owner = composition.emergency_owner;
+    #[cfg(all(windows, feature = "production-edge-producer"))]
+    let browser_producer = composition.browser_producer;
 
     let private_identity = embedded_private_identity()
         .context("validate embedded production private broker identity")?;
@@ -195,9 +210,20 @@ async fn main() -> Result<()> {
             async move { runtime.run_emergency_control_loop(owner, shutdown).await },
         )
     });
+    #[cfg(all(windows, feature = "production-edge-producer"))]
+    let browser_producer_task = browser_producer.map(|producer| {
+        let shutdown = core.shutdown_token();
+        spawn_supervised_background_task(core.clone(), "Edge observation producer", async move {
+            producer.run(shutdown).await
+        })
+    });
     if let Err(error) = recover_daemon_workflows(&core, emergency_owner).await {
         core.request_shutdown();
         if let Some(task) = emergency_task {
+            let _ = task.await;
+        }
+        #[cfg(all(windows, feature = "production-edge-producer"))]
+        if let Some(task) = browser_producer_task {
             let _ = task.await;
         }
         return Err(error);
@@ -245,11 +271,11 @@ async fn main() -> Result<()> {
         })
     });
 
-    let retention_maintenance_task = emergency_owner.map(|_| {
+    let retention_maintenance_task = emergency_owner.map(|owner| {
         let runtime = core.second_mind().clone();
         let shutdown = core.shutdown_token();
         spawn_supervised_background_task(core.clone(), "retention maintenance", async move {
-            runtime.run_retention_maintenance(shutdown).await
+            runtime.run_retention_maintenance(owner, shutdown).await
         })
     });
 
@@ -267,6 +293,9 @@ async fn main() -> Result<()> {
     let reasoning = join_background_task(reasoning_task, "reasoning scheduler").await;
     let retention_maintenance =
         join_background_task(retention_maintenance_task, "retention maintenance").await;
+    #[cfg(all(windows, feature = "production-edge-producer"))]
+    let browser_producer =
+        join_background_task(browser_producer_task, "Edge observation producer").await;
     if let Err(error) = transport {
         error!(error = %error, "CORE transport failed");
         return Err(error).context("run CORE local protocol");
@@ -275,6 +304,8 @@ async fn main() -> Result<()> {
     pending_delivery_recovery.context("run pending-delivery recovery")?;
     reasoning.context("run reasoning scheduler")?;
     retention_maintenance.context("run retention maintenance")?;
+    #[cfg(all(windows, feature = "production-edge-producer"))]
+    browser_producer.context("run Edge observation producer")?;
 
     info!("STEIN CORE stopped cleanly");
     Ok(())

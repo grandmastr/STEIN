@@ -35,7 +35,7 @@ use windows_sys::Win32::{
     System::{
         Pipes::{GetNamedPipeServerProcessId, ImpersonateNamedPipeClient},
         Threading::{
-            GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken,
+            GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken,
             PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
         },
     },
@@ -420,10 +420,14 @@ fn verify_token(
         PackagePeerClass::AppContainerBroker if !is_app_container => {
             return Err(AdmissionError::new(AdmissionErrorKind::WrongExecutionClass));
         }
-        PackagePeerClass::PackagedDesktop if is_app_container => {
+        PackagePeerClass::PackagedDesktop | PackagePeerClass::BrowserObservationProducer
+            if is_app_container =>
+        {
             return Err(AdmissionError::new(AdmissionErrorKind::WrongExecutionClass));
         }
-        PackagePeerClass::AppContainerBroker | PackagePeerClass::PackagedDesktop => {}
+        PackagePeerClass::AppContainerBroker
+        | PackagePeerClass::PackagedDesktop
+        | PackagePeerClass::BrowserObservationProducer => {}
     }
 
     if is_app_container {
@@ -461,6 +465,23 @@ fn verify_token(
     }
 
     Ok(())
+}
+
+pub(crate) fn current_process_user_sid() -> Result<String, AdmissionError> {
+    // SAFETY: GetCurrentProcess returns a live pseudo-handle and the token is
+    // immediately wrapped with exclusive ownership on success.
+    let process = unsafe { GetCurrentProcess() };
+    let mut token = null_mut();
+    // SAFETY: `token` is writable and only query access is requested.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+        return Err(boundary_unavailable());
+    }
+    let token = OwnedHandle(token);
+    let user = token_information(token.0, TokenUser)?;
+    let user = user.read::<TOKEN_USER>()?;
+    // SAFETY: the TOKEN_USER and nested SID remain backed by `user` here.
+    let sid = unsafe { (*user).User.Sid };
+    sid_to_text(sid)
 }
 
 type TokenIdentityQuery = unsafe extern "system" fn(HANDLE, *mut u32, *mut u16) -> u32;

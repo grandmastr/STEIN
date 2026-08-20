@@ -110,6 +110,31 @@ multi-owner workflow uses explicit results, idempotency, audit ordering, and
 compensation as required by ADR 0002. SQLite connection and row types do not enter
 domain or client-protocol contracts.
 
+Every existing focus-session lifecycle revision transition commits through one
+typed repository write with its content-free `FocusSessionStateChanged` audit.
+The session row and audit row are therefore visible together or not at all;
+activation, recovery, failure, stop, and end paths do not append their lifecycle
+audit in a later fallible operation. This uses the existing focus and audit
+tables and does not require a schema-version change.
+
+The same rule applies to consequential permission and intervention revisions.
+An active grant becomes revoked in the same repository transaction as its
+`PermissionRevoked` audit, before fallible adapter cleanup begins. An
+intervention delivery or explicit user outcome revision commits with its
+required audit; when that delivery transition enqueues or updates an outbox row,
+the outbox mutation joins the same transaction. Native notification submission
+cannot be part of a SQLite transaction, so the pre-delivery policy/audit
+acknowledgement remains the action boundary and the strongest post-attempt state
+and delivery audit commit together immediately afterward.
+
+A durable `Stopping` session is also the bounded cleanup obligation for that
+workflow. Authority and queued delivery text are revoked before native cleanup.
+If the daemon exits after `Stopping` commits, startup scrubs the session outbox
+again, retries every known adapter stop and the exact native-status clear under
+the accepted deadlines, and then records `Ended` plus its lifecycle audit in one
+transaction. Failed native cleanup is recorded as `ended_cleanup_incomplete`;
+it never restores authority or leaves the session active.
+
 ### Persisted records
 
 The database may contain only the durable state accepted for the slice:
@@ -122,9 +147,17 @@ The database may contain only the durable state accepted for the slice:
   metadata;
 - selected-resource bindings only when restart continuity is explicitly granted;
 - minimal candidate/delivery state allowed by ADRs 0005 and 0008;
+- content-free policy traces containing only profile/preference revisions,
+  canonical input-schema version, and a SHA-256 input digest;
 - the bounded pending-delivery outbox and non-interruptive missed-history state;
 - privacy-aware permission/intervention audit and outcome records; and
 - migration and content-free operational bookkeeping.
+
+Private cleanup bookkeeping includes opaque native selected-resource release
+records and model-route credential-deletion records. These tables are not part
+of owner snapshots or public protocol views. Schema version 6 adds the latter as
+one bounded, idempotent record per revoked route so an OS cleanup failure or
+daemon exit after revocation cannot lose the retry obligation.
 
 It must not contain raw source artifacts, normalized observation payloads,
 derived working context, screenshots, accessibility trees, full browser or file
@@ -144,6 +177,11 @@ Forward migrations run under an exclusive migration lock and transaction. A
 binary never guesses at an unknown schema, silently drops a column, or performs a
 destructive downgrade. An older binary encountering a newer unsupported schema
 stays unavailable with an actionable compatibility status.
+
+Policy/audit payloads written before the content-free policy trace was added
+decode with an explicitly invalid empty trace so upgrades can inspect and delete
+them. They are never upgraded into delivery authority: only a fresh policy
+evaluation can create a complete trace.
 
 The release package must include migration fixtures for:
 
@@ -220,6 +258,12 @@ outbox mutation, or workflow recovery fail the protected operation closed.
   declared boundaries, and deletion removes them from every public read path.
 - Audit-before-delivery and outbox writes fail closed under busy, I/O, full-disk,
   and transaction-rollback injection.
+- A conflicting lifecycle-audit insert rolls back its focus-session revision,
+  while restart fixtures prove a durable `Stopping` session resumes bounded
+  adapter/native-status cleanup and reaches an audited terminal state.
+- Conflicting permission-revocation, intervention-delivery, and explicit-outcome
+  audit inserts roll back their aggregate revisions; a queued-delivery conflict
+  also leaves no orphan outbox row.
 - Linux and macOS fake-adapter suites use the same repository contracts and
   migration fixtures without importing Windows types.
 

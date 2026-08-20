@@ -1,21 +1,40 @@
 //! Closed one-way ingress contract for an authenticated Edge producer.
 //!
-//! This module intentionally has no production authority constructor. Edge
-//! Add-ons provenance and direct-launch package identity are not yet proven by
-//! a native fixture, so caller origin, ancestry, or Authenticode evidence must
-//! not make the host a CORE client. The state machine and current-authority
-//! reload contract can be integrated once that OS admission exists.
+//! Production admission owns the fixed named-pipe server and the exact
+//! PFN/AUMID peer proof for the whole connection. Edge Add-ons provenance and
+//! direct-launch package identity still require an installed fixture, so caller
+//! origin, ancestry, or Authenticode evidence alone never makes the host a CORE
+//! client or turns production capability health on.
 
 use std::fmt;
+#[cfg(windows)]
+use std::{ffi::c_void, os::windows::io::AsHandle, time::Instant};
 
-use stein_core::{DeviceId, FocusSessionId, PermissionGrantId, ResourceId};
-
-use crate::{
-    BrowserCaptureCancellation, BrowserIngressError, BrowserObservationPacket,
-    BrowserObservationValidator, EdgeBrowserCapturePolicy,
+#[cfg(windows)]
+use stein_broker_windows::{
+    ConnectionAuthority, ExpectedPackageIdentity, PackagePeerClass, PrivatePipeSecurity,
+    admit_named_pipe_peer,
 };
-#[cfg(test)]
-use crate::{BrowserObservationEnvelope, BrowserValidationOutcome};
+use stein_core::{
+    BrowserLocationGranularity, DeviceId, FocusSessionId, PermissionGrantId, ResourceId,
+};
+#[cfg(windows)]
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::windows::named_pipe::{NamedPipeServer, ServerOptions},
+};
+#[cfg(windows)]
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+#[cfg(windows)]
+use zeroize::Zeroizing;
+
+use crate::BrowserValidationOutcome;
+use crate::{
+    BrowserCaptureCancellation, BrowserIngressError, BrowserObservationEnvelope,
+    BrowserObservationPacket, BrowserObservationValidator, EdgeBrowserCapturePlan,
+    EdgeBrowserCapturePolicy, EdgeBrowserSelectionOffer, EdgeBrowserSourcePauseReason,
+    EdgeBrowserSourceStatus, WindowsBrowserSurfaceBinding,
+};
 
 pub const EDGE_BROWSER_PRODUCER_APPLICATION_ID: &str = "BrowserObservationProducer";
 pub const EDGE_BROWSER_PRODUCER_PIPE: &str =
@@ -208,7 +227,6 @@ impl CurrentBrowserProducerAuthority {
         })
     }
 
-    #[cfg(test)]
     fn matches(&self, expected: &BrowserProducerAuthorityReference) -> bool {
         self.session_id == expected.session_id
             && self.session_revision == expected.session_revision
@@ -235,14 +253,24 @@ pub trait BrowserAuthoritySnapshotPort: Send + Sync {
     ) -> Result<CurrentBrowserProducerAuthority, BrowserProducerIngressError>;
 }
 
-/// Opaque proof for one exact kernel connection handle.
+/// Opaque owner of one admitted kernel connection.
 ///
-/// No production constructor exists in this slice. A future Windows broker can
-/// construct it only after the peer token proves the dedicated packaged host
-/// AUMID and a clean-VM fixture proves Edge's launch retains that identity.
+/// The pipe object and OS-produced admission proof move together into this
+/// value. No caller can substitute a numeric handle after admission, and drop
+/// closes the exact connection before its authority disappears.
 pub struct BrowserProducerConnectionAuthority {
-    connection_handle: usize,
-    admission_epoch: [u8; 16],
+    inner: BrowserProducerConnectionInner,
+}
+
+enum BrowserProducerConnectionInner {
+    #[cfg(windows)]
+    Owned {
+        pipe: NamedPipeServer,
+        _authority: ConnectionAuthority,
+        _daemon_instance: [u8; 16],
+    },
+    #[cfg(test)]
+    Synthetic,
 }
 
 impl fmt::Debug for BrowserProducerConnectionAuthority {
@@ -251,27 +279,168 @@ impl fmt::Debug for BrowserProducerConnectionAuthority {
     }
 }
 
-impl Drop for BrowserProducerConnectionAuthority {
-    fn drop(&mut self) {
-        self.connection_handle = 0;
-        self.admission_epoch.fill(0);
-    }
-}
-
 impl BrowserProducerConnectionAuthority {
     #[cfg(test)]
-    fn synthetic(connection_handle: usize) -> Self {
+    fn synthetic() -> Self {
         Self {
-            connection_handle,
-            admission_epoch: [0x51; 16],
+            inner: BrowserProducerConnectionInner::Synthetic,
         }
+    }
+
+    #[cfg(windows)]
+    fn pipe_mut(&mut self) -> Result<&mut NamedPipeServer, BrowserProducerIngressError> {
+        match &mut self.inner {
+            BrowserProducerConnectionInner::Owned { pipe, .. } => Ok(pipe),
+            #[cfg(test)]
+            BrowserProducerConnectionInner::Synthetic => {
+                Err(error(BrowserProducerIngressErrorKind::ConnectionChanged))
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub async fn read_selection_offer(
+        &mut self,
+        expected_extension_id: &str,
+        expected_extension_version: &str,
+        granularity: BrowserLocationGranularity,
+    ) -> Result<WindowsBrowserSurfaceBinding, BrowserProducerIngressError> {
+        let payload = read_frame(self.pipe_mut()?).await?;
+        let offer: EdgeBrowserSelectionOffer = serde_json::from_slice(&payload)
+            .map_err(|_| error(BrowserProducerIngressErrorKind::PacketRejected))?;
+        offer
+            .into_binding(
+                expected_extension_id,
+                expected_extension_version,
+                granularity,
+            )
+            .map_err(packet_rejected)
+    }
+
+    #[cfg(windows)]
+    async fn read_message(
+        &mut self,
+    ) -> Result<BrowserProducerMessage, BrowserProducerIngressError> {
+        let payload = read_frame(self.pipe_mut()?).await?;
+        if let Ok(observation) = serde_json::from_slice(&payload) {
+            return Ok(BrowserProducerMessage::Observation(Box::new(observation)));
+        }
+        serde_json::from_slice(&payload)
+            .map(BrowserProducerMessage::SourceStatus)
+            .map_err(|_| error(BrowserProducerIngressErrorKind::PacketRejected))
+    }
+
+    #[cfg(windows)]
+    async fn write_capture_plan(
+        &mut self,
+        plan: &EdgeBrowserCapturePlan,
+    ) -> Result<(), BrowserProducerIngressError> {
+        let payload = Zeroizing::new(
+            serde_json::to_vec(plan)
+                .map_err(|_| error(BrowserProducerIngressErrorKind::PacketRejected))?,
+        );
+        write_frame(self.pipe_mut()?, &payload).await
     }
 }
 
-/// Production remains unavailable rather than accepting weaker launch text.
-pub fn admit_release_managed_edge_producer()
--> Result<BrowserProducerConnectionAuthority, BrowserProducerIngressError> {
-    Err(error(BrowserProducerIngressErrorKind::AdmissionUnavailable))
+#[cfg(windows)]
+pub struct BrowserProducerListener {
+    expected: ExpectedPackageIdentity,
+    daemon_instance: [u8; 16],
+}
+
+#[cfg(windows)]
+impl BrowserProducerListener {
+    pub fn new(
+        expected: ExpectedPackageIdentity,
+        daemon_instance: [u8; 16],
+    ) -> Result<Self, BrowserProducerIngressError> {
+        if daemon_instance.iter().all(|byte| *byte == 0) {
+            return Err(error(BrowserProducerIngressErrorKind::AdmissionUnavailable));
+        }
+        Ok(Self {
+            expected,
+            daemon_instance,
+        })
+    }
+
+    /// Accepts exactly one package-admitted producer. A fresh kernel pipe
+    /// object is created for each connection; the returned owner closes it.
+    pub async fn accept(
+        &self,
+    ) -> Result<BrowserProducerConnectionAuthority, BrowserProducerIngressError> {
+        let pipe = {
+            let security = PrivatePipeSecurity::new(&self.expected)
+                .map_err(|_| error(BrowserProducerIngressErrorKind::AdmissionUnavailable))?;
+            let mut attributes: SECURITY_ATTRIBUTES = security.attributes();
+            let mut options = ServerOptions::new();
+            options
+                .first_pipe_instance(true)
+                .max_instances(1)
+                .reject_remote_clients(true)
+                .in_buffer_size(crate::EDGE_BROWSER_MAXIMUM_NATIVE_MESSAGE_BYTES as u32)
+                .out_buffer_size(crate::EDGE_BROWSER_MAXIMUM_NATIVE_MESSAGE_BYTES as u32);
+            // SAFETY: the descriptor and attributes remain live through this
+            // synchronous CreateNamedPipe call. Windows copies the descriptor.
+            unsafe {
+                options.create_with_security_attributes_raw(
+                    EDGE_BROWSER_PRODUCER_PIPE,
+                    (&mut attributes as *mut SECURITY_ATTRIBUTES).cast::<c_void>(),
+                )
+            }
+            .map_err(|_| error(BrowserProducerIngressErrorKind::AdmissionUnavailable))?
+        };
+        pipe.connect()
+            .await
+            .map_err(|_| error(BrowserProducerIngressErrorKind::AdmissionUnavailable))?;
+        admit_release_managed_edge_producer(
+            pipe,
+            &self.expected,
+            self.daemon_instance,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+    }
+}
+
+/// Admits only the exact packaged browser-producer identity and consumes the
+/// connected server endpoint so pipe ownership cannot be separated from the
+/// opaque authority proof.
+#[cfg(windows)]
+pub fn admit_release_managed_edge_producer(
+    pipe: NamedPipeServer,
+    expected: &ExpectedPackageIdentity,
+    daemon_instance: [u8; 16],
+    expires_at: Instant,
+) -> Result<BrowserProducerConnectionAuthority, BrowserProducerIngressError> {
+    let authority = admit_named_pipe_peer(
+        pipe.as_handle(),
+        expected,
+        PackagePeerClass::BrowserObservationProducer,
+        daemon_instance,
+        expires_at,
+    )
+    .map_err(|_| error(BrowserProducerIngressErrorKind::AdmissionUnavailable))?;
+    if !authority.is_current_for(pipe.as_handle(), &daemon_instance, Instant::now()) {
+        return Err(error(BrowserProducerIngressErrorKind::ConnectionChanged));
+    }
+    Ok(BrowserProducerConnectionAuthority {
+        inner: BrowserProducerConnectionInner::Owned {
+            pipe,
+            _authority: authority,
+            _daemon_instance: daemon_instance,
+        },
+    })
+}
+
+#[cfg(windows)]
+enum BrowserProducerMessage {
+    Observation(Box<crate::BrowserObservationEnvelope>),
+    SourceStatus(EdgeBrowserSourceStatus),
+}
+
+pub enum BrowserProducerIngressEvent {
+    Observation(Option<AuthorizedBrowserObservation>),
+    SourcePaused(EdgeBrowserSourcePauseReason),
 }
 
 pub struct AuthorizedBrowserObservation {
@@ -321,21 +490,11 @@ impl<R: BrowserAuthoritySnapshotPort> BrowserObservationProducerIngress<R> {
         })
     }
 
-    /// Semantic fixture only. Production ingestion is deliberately absent
-    /// until one type owns the admitted pipe for its entire lifetime; comparing
-    /// a borrowed numeric HANDLE would permit handle-value reuse after close.
-    #[cfg(test)]
-    fn ingest_for_handle(
+    fn ingest(
         &mut self,
-        connection_handle: usize,
         envelope: BrowserObservationEnvelope,
         received_at_unix_ms: i64,
     ) -> Result<Option<AuthorizedBrowserObservation>, BrowserProducerIngressError> {
-        if connection_handle == 0 || connection_handle != self.connection.connection_handle {
-            self.validator
-                .cancel(BrowserCaptureCancellation::SourceLost);
-            return Err(error(BrowserProducerIngressErrorKind::ConnectionChanged));
-        }
         let current = self
             .authority
             .reload_current(&self.reference, received_at_unix_ms)
@@ -366,9 +525,79 @@ impl<R: BrowserAuthoritySnapshotPort> BrowserObservationProducerIngress<R> {
         }
     }
 
+    #[cfg(windows)]
+    pub async fn send_capture_plan(
+        &mut self,
+        plan: &EdgeBrowserCapturePlan,
+    ) -> Result<(), BrowserProducerIngressError> {
+        if plan.authority_epoch != self.reference.policy.authority_epoch {
+            return Err(error(BrowserProducerIngressErrorKind::AuthorityChanged));
+        }
+        self.connection.write_capture_plan(plan).await
+    }
+
+    #[cfg(windows)]
+    pub async fn receive(
+        &mut self,
+        received_at_unix_ms: i64,
+    ) -> Result<BrowserProducerIngressEvent, BrowserProducerIngressError> {
+        match self.connection.read_message().await? {
+            BrowserProducerMessage::Observation(envelope) => self
+                .ingest(*envelope, received_at_unix_ms)
+                .map(BrowserProducerIngressEvent::Observation),
+            BrowserProducerMessage::SourceStatus(status) => {
+                status
+                    .validate(&self.reference.policy)
+                    .map_err(packet_rejected)?;
+                Ok(BrowserProducerIngressEvent::SourcePaused(status.reason))
+            }
+        }
+    }
+
     pub fn cancel(&mut self, reason: BrowserCaptureCancellation) {
         self.validator.cancel(reason);
     }
+}
+
+#[cfg(windows)]
+async fn read_frame(
+    pipe: &mut NamedPipeServer,
+) -> Result<Zeroizing<Vec<u8>>, BrowserProducerIngressError> {
+    let mut prefix = [0_u8; 4];
+    pipe.read_exact(&mut prefix)
+        .await
+        .map_err(|_| error(BrowserProducerIngressErrorKind::ConnectionChanged))?;
+    let length = u32::from_le_bytes(prefix) as usize;
+    if length == 0 || length > crate::EDGE_BROWSER_MAXIMUM_NATIVE_MESSAGE_BYTES {
+        return Err(error(BrowserProducerIngressErrorKind::PacketRejected));
+    }
+    let mut payload = Zeroizing::new(vec![0_u8; length]);
+    pipe.read_exact(&mut payload)
+        .await
+        .map_err(|_| error(BrowserProducerIngressErrorKind::ConnectionChanged))?;
+    Ok(payload)
+}
+
+#[cfg(windows)]
+async fn write_frame(
+    pipe: &mut NamedPipeServer,
+    payload: &[u8],
+) -> Result<(), BrowserProducerIngressError> {
+    let length = u32::try_from(payload.len())
+        .ok()
+        .filter(|length| {
+            *length > 0 && *length as usize <= crate::EDGE_BROWSER_MAXIMUM_NATIVE_MESSAGE_BYTES
+        })
+        .ok_or_else(|| error(BrowserProducerIngressErrorKind::PacketRejected))?;
+    pipe.write_all(&length.to_le_bytes())
+        .await
+        .map_err(|_| error(BrowserProducerIngressErrorKind::ConnectionChanged))?;
+    pipe.write_all(payload)
+        .await
+        .map_err(|_| error(BrowserProducerIngressErrorKind::ConnectionChanged))?;
+    pipe.flush()
+        .await
+        .map_err(|_| error(BrowserProducerIngressErrorKind::ConnectionChanged))
 }
 
 fn packet_rejected(error: BrowserIngressError) -> BrowserProducerIngressError {
@@ -408,7 +637,6 @@ mod tests {
     };
 
     const NOW: i64 = 1_800_000_000_000;
-    const HANDLE: usize = 0x5151;
 
     #[derive(Clone)]
     struct FakeAuthority {
@@ -542,7 +770,7 @@ mod tests {
             current: Ok(current(&reference)),
         }));
         let ingress = BrowserObservationProducerIngress::new(
-            BrowserProducerConnectionAuthority::synthetic(HANDLE),
+            BrowserProducerConnectionAuthority::synthetic(),
             reference,
             FakeAuthority {
                 state: Arc::clone(&state),
@@ -553,47 +781,18 @@ mod tests {
     }
 
     #[test]
-    fn production_admission_is_closed_without_published_and_native_provenance() {
-        assert_eq!(
-            admit_release_managed_edge_producer().unwrap_err().kind,
-            BrowserProducerIngressErrorKind::AdmissionUnavailable
-        );
+    fn unavailable_reason_retains_the_external_installed_fixture_gate() {
         assert!(!EDGE_BROWSER_PRODUCER_UNAVAILABLE_REASON.is_empty());
     }
 
     #[test]
-    fn exact_handle_and_fresh_authority_are_required_for_every_packet() {
+    fn fresh_authority_is_required_for_every_packet() {
         let (mut ingress, state) = ingress(reference());
-        let first = ingress.ingest_for_handle(HANDLE, envelope(1), NOW).unwrap();
+        let first = ingress.ingest(envelope(1), NOW).unwrap();
         assert!(first.is_some());
         assert_eq!(state.lock().unwrap().reloads, 1);
-        assert!(
-            ingress
-                .ingest_for_handle(HANDLE, envelope(2), NOW + 5_000)
-                .unwrap()
-                .is_some()
-        );
+        assert!(ingress.ingest(envelope(2), NOW + 5_000).unwrap().is_some());
         assert_eq!(state.lock().unwrap().reloads, 2);
-    }
-
-    #[test]
-    fn wrong_handle_is_rejected_before_authority_or_content_processing() {
-        let (mut ingress, state) = ingress(reference());
-        assert_eq!(
-            ingress
-                .ingest_for_handle(HANDLE + 1, envelope(1), NOW)
-                .unwrap_err()
-                .kind,
-            BrowserProducerIngressErrorKind::ConnectionChanged
-        );
-        assert_eq!(state.lock().unwrap().reloads, 0);
-        assert_eq!(
-            ingress
-                .ingest_for_handle(HANDLE, envelope(2), NOW)
-                .unwrap_err()
-                .kind,
-            BrowserProducerIngressErrorKind::Cancelled
-        );
     }
 
     #[test]
@@ -604,10 +803,7 @@ mod tests {
         changed.grant_revision += 1;
         state.lock().unwrap().current = Ok(changed);
         assert_eq!(
-            active_ingress
-                .ingest_for_handle(HANDLE, envelope(1), NOW)
-                .unwrap_err()
-                .kind,
+            active_ingress.ingest(envelope(1), NOW).unwrap_err().kind,
             BrowserProducerIngressErrorKind::AuthorityChanged
         );
 
@@ -615,17 +811,11 @@ mod tests {
         state.lock().unwrap().current =
             Err(error(BrowserProducerIngressErrorKind::AuthorityUnavailable));
         assert_eq!(
-            revoked
-                .ingest_for_handle(HANDLE, envelope(1), NOW)
-                .unwrap_err()
-                .kind,
+            revoked.ingest(envelope(1), NOW).unwrap_err().kind,
             BrowserProducerIngressErrorKind::AuthorityUnavailable
         );
         assert_eq!(
-            revoked
-                .ingest_for_handle(HANDLE, envelope(2), NOW)
-                .unwrap_err()
-                .kind,
+            revoked.ingest(envelope(2), NOW).unwrap_err().kind,
             BrowserProducerIngressErrorKind::AuthorityUnavailable
         );
         assert_eq!(state.lock().unwrap().reloads, 2);
@@ -636,10 +826,7 @@ mod tests {
         let reference = reference();
         let current = current(&reference);
         let (mut ingress, _) = ingress(reference);
-        let value = ingress
-            .ingest_for_handle(HANDLE, envelope(1), NOW)
-            .unwrap()
-            .unwrap();
+        let value = ingress.ingest(envelope(1), NOW).unwrap().unwrap();
         for debug in [format!("{current:?}"), format!("{value:?}")] {
             assert!(!debug.contains("atlas.example"));
             assert!(!debug.contains("/research"));

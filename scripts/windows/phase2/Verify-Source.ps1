@@ -14,15 +14,55 @@ $edgeExtensionRoot = Join-Path $repoRoot "extensions\edge"
 $edgeHostManifest = Join-Path $repoRoot "apps\edge-native-host\Cargo.toml"
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 
+function Resolve-SteinSourceWindowsPowerShell {
+    $systemRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+    if ([string]::IsNullOrWhiteSpace($systemRoot)) {
+        throw "The exact Windows PowerShell host is unavailable."
+    }
+    $systemRoot = [IO.Path]::GetFullPath($systemRoot).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar)
+    $candidate = [IO.Path]::GetFullPath(
+        (Join-Path $systemRoot "WindowsPowerShell\v1.0\powershell.exe"))
+    $prefix = "$systemRoot$([IO.Path]::DirectorySeparatorChar)"
+    if (-not $candidate.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The exact Windows PowerShell host is unavailable."
+    }
+    $probe = Split-Path -Parent $candidate
+    while ($probe.Length -ge $systemRoot.Length) {
+        $directory = Get-Item -LiteralPath $probe -Force -ErrorAction Stop
+        if (-not $directory.PSIsContainer -or
+            (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            throw "The exact Windows PowerShell host is unavailable."
+        }
+        if ([string]::Equals($probe, $systemRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $parent = Split-Path -Parent $probe
+        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -ceq $probe) {
+            throw "The exact Windows PowerShell host is unavailable."
+        }
+        $probe = $parent
+    }
+    $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        $item.Length -le 0) {
+        throw "The exact Windows PowerShell host is unavailable."
+    }
+    return $item.FullName
+}
+
 if ($env:OS -cne "Windows_NT") {
     throw "Phase 2 source verification must run with native Windows tools."
 }
 
-foreach ($tool in @("cargo.exe", "rustc.exe", "node.exe", "pnpm.cmd", "powershell.exe")) {
+foreach ($tool in @("cargo.exe", "rustc.exe", "node.exe", "pnpm.cmd")) {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
         throw "Required source-verification tool is unavailable: $tool"
     }
 }
+$powershell = Resolve-SteinSourceWindowsPowerShell
 
 if ([string]::IsNullOrWhiteSpace($EvidenceRoot)) {
     $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
@@ -168,6 +208,7 @@ $originalCoreHash = $env:STEIN_CORE_EXECUTABLE_SHA256
 $originalFamily = $env:STEIN_PRODUCTION_PACKAGE_FAMILY_NAME
 $originalBrokerAumid = $env:STEIN_PRODUCTION_BROKER_AUMID
 $originalEdgeExtensionId = $env:STEIN_EDGE_EXTENSION_ID
+$originalEdgeExtensionVersion = $env:STEIN_EDGE_EXTENSION_VERSION
 $originalEdgePublisher = $env:STEIN_EDGE_PUBLISHER_SHA256
 $originalEdgeHostPublisher = $env:STEIN_EDGE_HOST_PUBLISHER_SHA256
 try {
@@ -177,13 +218,18 @@ try {
     $env:STEIN_PRODUCTION_PACKAGE_FAMILY_NAME = "STEIN.PersonalIntelligence_123456789abcd"
     $env:STEIN_PRODUCTION_BROKER_AUMID = "$($env:STEIN_PRODUCTION_PACKAGE_FAMILY_NAME)!PrivateBroker"
     $env:STEIN_EDGE_EXTENSION_ID = "abcdefghijklmnopabcdefghijklmnop"
+    $syntheticEdgeExtensionVersion = "0.1.0"
+    if ($syntheticEdgeExtensionVersion.Length -gt 32 -or
+        $syntheticEdgeExtensionVersion -notmatch `
+            "^(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){0,3}$") {
+        throw "The synthetic Edge extension version is outside the production build contract."
+    }
+    $env:STEIN_EDGE_EXTENSION_VERSION = $syntheticEdgeExtensionVersion
     $env:STEIN_EDGE_PUBLISHER_SHA256 = "2222222222222222222222222222222222222222222222222222222222222222"
     $env:STEIN_EDGE_HOST_PUBLISHER_SHA256 = "3333333333333333333333333333333333333333333333333333333333333333"
 
     $cargo = (Get-Command "cargo.exe" -ErrorAction Stop).Source
     $pnpm = (Get-Command "pnpm.cmd" -ErrorAction Stop).Source
-    $powershell = (Get-Command "powershell.exe" -ErrorAction Stop).Source
-
     Invoke-SteinSourceCheck -Id "rust-format" -Executable $cargo `
         -Arguments @("fmt", "--all", "--", "--check") -WorkingDirectory $repoRoot
     Invoke-SteinSourceCheck -Id "rust-check" -Executable $cargo `
@@ -233,6 +279,13 @@ try {
             "-File", (Join-Path $repoRoot "scripts\windows\check-boundaries.ps1"),
             "-Json"
         ) -WorkingDirectory $repoRoot
+    Invoke-SteinSourceCheck -Id "installed-evidence-harness-static" -Executable $powershell `
+        -Arguments @(
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", (Join-Path $repoRoot "scripts\windows\phase2\Test-VerifyInstalled.ps1")
+        ) -WorkingDirectory $repoRoot
     Invoke-SteinSourceCheck -Id "msix-static-contract" -Executable $powershell `
         -Arguments @(
             "-NoProfile",
@@ -245,7 +298,7 @@ try {
     Invoke-SteinSourceCheck -Id "release-production-core" -Executable $cargo `
         -Arguments @(
             "build", "--release", "-p", "stein-core-daemon",
-            "--features", "production-private-endpoint"
+            "--features", "production-private-endpoint,production-edge-producer"
         ) -WorkingDirectory $repoRoot
     Invoke-SteinSourceCheck -Id "release-edge-host" -Executable $cargo `
         -Arguments @(
@@ -273,6 +326,7 @@ finally {
     $env:STEIN_PRODUCTION_PACKAGE_FAMILY_NAME = $originalFamily
     $env:STEIN_PRODUCTION_BROKER_AUMID = $originalBrokerAumid
     $env:STEIN_EDGE_EXTENSION_ID = $originalEdgeExtensionId
+    $env:STEIN_EDGE_EXTENSION_VERSION = $originalEdgeExtensionVersion
     $env:STEIN_EDGE_PUBLISHER_SHA256 = $originalEdgePublisher
     $env:STEIN_EDGE_HOST_PUBLISHER_SHA256 = $originalEdgeHostPublisher
 }

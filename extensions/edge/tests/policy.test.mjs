@@ -18,6 +18,12 @@ import {
 } from "../policy.js";
 
 const extensionId = "abcdefghijklmnopabcdefghijklmnop";
+const extensionVersion = "0.1.0";
+const selectionIdentity = Object.freeze({
+  profile_binding_sha256: "11".repeat(32),
+  browser_session_id: "22".repeat(16),
+  selection_id: "33".repeat(16),
+});
 
 function tab(overrides = {}) {
   return {
@@ -30,14 +36,21 @@ function tab(overrides = {}) {
   };
 }
 
-async function fixture() {
-  const offer = await buildSelectionOffer(tab(), extensionId, extensionId);
+async function fixture(scope = "location") {
+  const offer = await buildSelectionOffer(
+    tab(),
+    extensionId,
+    extensionId,
+    extensionVersion,
+    selectionIdentity,
+  );
   const plan = validateCapturePlan(
     {
       protocol_version: 1,
       kind: "capture_plan",
       extension_id: extensionId,
-      scope: "location",
+      extension_version: extensionVersion,
+      scope,
       authority_epoch: 9,
       profile_binding_sha256: "11".repeat(32),
       browser_session_id: "22".repeat(16),
@@ -46,19 +59,30 @@ async function fixture() {
       window_id: 7,
       site_sha256: offer.site_sha256,
       origin_sha256: offer.origin_sha256,
-      granularity: { origin: true, path: true, query: false, fragment: false },
+      granularity: scope === "location"
+        ? { origin: true, path: true, query: false, fragment: false }
+        : { origin: false, path: false, query: false, fragment: false },
       maximum_payload_bytes: 2048,
       minimum_interval_ms: 5000,
     },
     offer,
     extensionId,
     extensionId,
+    extensionVersion,
   );
   return { offer, plan };
 }
 
 test("only an explicit standard active non-private tab can be offered", async () => {
-  assert.ok(await buildSelectionOffer(tab(), extensionId, extensionId));
+  assert.ok(
+    await buildSelectionOffer(
+      tab(),
+      extensionId,
+      extensionId,
+      extensionVersion,
+      selectionIdentity,
+    ),
+  );
   for (const candidate of [
     tab({ active: false }),
     tab({ incognito: true }),
@@ -68,9 +92,34 @@ test("only an explicit standard active non-private tab can be offered", async ()
     tab({ url: "https://user:secret@atlas.example/research" }),
     tab({ id: 0 }),
   ]) {
-    assert.equal(await buildSelectionOffer(candidate, extensionId, extensionId), null);
+    assert.equal(
+      await buildSelectionOffer(
+        candidate,
+        extensionId,
+        extensionId,
+        extensionVersion,
+        selectionIdentity,
+      ),
+      null,
+    );
   }
-  assert.equal(await buildSelectionOffer(tab(), "b".repeat(32), extensionId), null);
+  assert.equal(
+    await buildSelectionOffer(
+      tab(),
+      "b".repeat(32),
+      extensionId,
+      extensionVersion,
+      selectionIdentity,
+    ),
+    null,
+  );
+  assert.equal(
+    await buildSelectionOffer(tab(), extensionId, extensionId, extensionVersion, {
+      ...selectionIdentity,
+      profile_binding_sha256: "00",
+    }),
+    null,
+  );
   assert.equal(standardWebLocation("not a URL"), null);
 });
 
@@ -86,7 +135,13 @@ test("capture plan binds exact extension connection tab site and origin", async 
     { maximum_payload_bytes: 64 * 1024 },
   ]) {
     assert.equal(
-      validateCapturePlan({ ...plan, kind: "capture_plan", ...mutation }, offer, extensionId, extensionId),
+      validateCapturePlan(
+        { ...plan, kind: "capture_plan", ...mutation },
+        offer,
+        extensionId,
+        extensionId,
+        extensionVersion,
+      ),
       null,
     );
   }
@@ -97,6 +152,7 @@ test("capture plan binds exact extension connection tab site and origin", async 
       { ...offer, active: false },
       extensionId,
       extensionId,
+      extensionVersion,
     ),
     null,
   );
@@ -125,6 +181,56 @@ test("visible text redaction and UTF-8 bounds remove synthetic private fixtures"
   assert.doesNotMatch(redacted, /synthetic-secret|analyst@example\.test/u);
   const bounded = boundUtf8(redacted, 64);
   assert.ok(new TextEncoder().encode(bounded).byteLength <= 64);
+});
+
+test("visible text is bound to the exact injected document across navigation races", async () => {
+  const { plan } = await fixture("visible_text");
+  const allowedDocument = {
+    text: "Synthetic visible research text",
+    origin: "https://atlas.example",
+    site: "atlas.example",
+  };
+  const value = await buildObservation(
+    plan,
+    tab(),
+    true,
+    allowedDocument,
+    1,
+    1_800_000_000_000,
+  );
+  assert.equal(value.visible_text, allowedDocument.text);
+  assert.equal(value.location, null);
+  assert.equal(JSON.stringify(value).includes(allowedDocument.origin), false);
+
+  // `tab.url` is the old allowed snapshot while executeScript ran in the
+  // newly committed cross-origin top document. The exact document evidence,
+  // rather than a second tab snapshot, must decide admission.
+  assert.equal(
+    await buildObservation(
+      plan,
+      tab(),
+      true,
+      {
+        text: "Cross-origin synthetic text",
+        origin: "https://other.example",
+        site: "other.example",
+      },
+      2,
+      1_800_000_000_100,
+    ),
+    null,
+  );
+  assert.equal(
+    await buildObservation(
+      plan,
+      tab(),
+      true,
+      { ...allowedDocument, unexpected: "private" },
+      2,
+      1_800_000_000_100,
+    ),
+    null,
+  );
 });
 
 test("manifest and worker statically exclude broad or durable browser collection", async () => {

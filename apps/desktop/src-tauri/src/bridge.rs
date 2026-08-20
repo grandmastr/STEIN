@@ -21,10 +21,10 @@ use crate::{
         GoalRevisionInput, GoalView, GrantPermissionInput, InterventionExplanationView,
         InterventionFeedbackInput, InterventionHistoryInput, InterventionHistoryView,
         InterventionView, ModelRouteView, PublicErrorView, RegisterSelectedResourceInput,
-        RemoveSelectedResourceInput, ResourceView, RevokePermissionInput, SecretMutationView,
+        RemoveSelectedResourceInput, ResourceView, RevokePermissionInput,
         SelectedResourceDeletionView, SessionGrantView, SetMutedInput, StartFocusSessionInput,
-        SteinIdentityView, StoreModelSecretInput, UpdateGoalInput, UpdateUserPreferencesInput,
-        UserPreferencesUpdateView, UserPreferencesView,
+        SteinIdentityView, UpdateGoalInput, UpdateUserPreferencesInput, UserPreferencesUpdateView,
+        UserPreferencesView,
     },
 };
 
@@ -152,26 +152,18 @@ impl CoreBridge {
         Ok(result)
     }
 
-    pub async fn store_model_secret(
-        &self,
-        input: StoreModelSecretInput,
-        parent_window: isize,
-    ) -> Result<SecretMutationView, PublicErrorView> {
-        self.connected_client()
-            .await?
-            .store_model_secret(input, parent_window)
-            .await
-    }
-
-    pub async fn approve_model_route(
+    pub async fn setup_model_route(
         &self,
         app: &AppHandle,
         input: ApproveModelRouteInput,
+        parent_window: isize,
     ) -> Result<ModelRouteView, PublicErrorView> {
         let client = self.connected_client().await?;
-        let result = client.approve_model_route(input).await?;
+        let result = client.setup_model_route(input, parent_window).await;
+        // Approval may have committed before a secret-store failure. Always
+        // refresh so a successful rollback, or a cleanup failure, is visible.
         self.publish_after_mutation(app, &client).await;
-        Ok(result)
+        result
     }
 
     pub async fn grant_permission(
@@ -300,6 +292,37 @@ impl CoreBridge {
             .await?
             .explain_intervention(input)
             .await
+    }
+
+    /// Resolve a notification activation only through the authenticated private
+    /// protocol, then refresh the dashboard from CORE's authoritative state.
+    /// The opaque identifier supplies no authority and no toast content is
+    /// trusted as application state.
+    #[cfg(windows)]
+    pub async fn resolve_toast_activation(
+        &self,
+        app: &AppHandle,
+        intervention_id: uuid::Uuid,
+    ) -> Result<InterventionExplanationView, PublicErrorView> {
+        if self.current_dashboard().await.is_none() {
+            self.connect(app).await?;
+        }
+        let explanation = match self
+            .explain_intervention(ExplainInterventionInput {
+                intervention_id: intervention_id.to_string(),
+            })
+            .await
+        {
+            Ok(explanation) => explanation,
+            Err(error) => {
+                if error.retryable {
+                    self.mark_disconnected(app, error.clone()).await;
+                }
+                return Err(error);
+            }
+        };
+        self.refresh(app).await?;
+        Ok(explanation)
     }
 
     pub async fn get_intervention_history(

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -22,14 +22,21 @@ use crate::foreground::{
     ForegroundIdentityProbe, ForegroundMatch, ForegroundProbeError, ForegroundProbeErrorKind,
     NativeForegroundIdentityProbe,
 };
+#[cfg(test)]
+use crate::pixel::UnavailablePixelCaptureFactory;
+use crate::pixel::{
+    NativePixelCaptureFactory, PIXEL_CAPTURE_DEADLINE, PixelCaptureFactory, PixelCaptureSource,
+    PixelError, PixelErrorKind, WindowsPixelBinding,
+};
 use crate::selected_resource::{
     MAXIMUM_DOCUMENT_BYTES, NativeSelectedResourceFactory, SelectedDocumentRead,
     SelectedResourceError, SelectedResourceErrorKind, SelectedResourceEventSource,
     SelectedResourceFactory, SelectedResourceReceive,
 };
 use crate::uia::{
-    MAXIMUM_UIA_TEXT_BYTES, NativeUiaTextSourceFactory, UiaError, UiaErrorKind, UiaInvocationError,
-    UiaTextSource, UiaTextSourceFactory, VisibleTextSample, bounded_uia_read,
+    MAXIMUM_UIA_TEXT_BYTES, MAXIMUM_WINDOW_METADATA_BYTES, NativeUiaTextSourceFactory, UiaError,
+    UiaErrorKind, UiaInvocationError, UiaTextSource, UiaTextSourceFactory, VisibleTextSample,
+    WindowMetadataSample, bounded_uia_read, bounded_uia_read_window_metadata,
     bounded_uia_revalidate,
 };
 use crate::uia_binding::WindowsUiaWindowBinding;
@@ -40,9 +47,11 @@ use crate::{
 
 const PRESENCE_SOURCE_ID: &str = "windows:presence:wts-last-input:v1";
 const FOREGROUND_SOURCE_ID: &str = "windows:foreground:exact-app-identity:v1";
+const WINDOW_METADATA_SOURCE_ID: &str = "windows:selected-window:caption-metadata:v1";
 const DOCUMENT_SOURCE_ID: &str = "windows:selected-document:file-id-128:v1";
 const WORKSPACE_SOURCE_ID: &str = "windows:selected-workspace:directory-changes:v1";
 const UIA_SOURCE_ID: &str = "windows:selected-window:uia-text-pattern-visible:v1";
+const PIXEL_SOURCE_ID: &str = "windows:graphics-capture:picker-one-frame:v1";
 const EVENT_BUFFER_CAPACITY: usize = 16;
 const URGENT_EVENT_RESERVE: usize = 2;
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -52,7 +61,8 @@ const MINIMUM_SELECTED_RESOURCE_INTERVAL: Duration = Duration::from_secs(5);
 const SELECTED_RESOURCE_COALESCE_INTERVAL: Duration = Duration::from_secs(2);
 const UIA_COALESCE_INTERVAL: Duration = Duration::from_secs(2);
 const MINIMUM_UIA_INTERVAL: Duration = Duration::from_secs(5);
-const MAXIMUM_PENDING_NATIVE_SELECTIONS: usize = 16;
+const MINIMUM_PIXEL_INTERVAL: Duration = Duration::from_secs(10);
+const PIXEL_STRUCTURED_GRACE_INTERVAL: Duration = Duration::from_millis(250);
 const NATIVE_PICKER_CLEANUP_DEADLINE: Duration = Duration::from_secs(2);
 const MAXIMUM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const MAXIMUM_STALE_AFTER: Duration = Duration::from_secs(30);
@@ -120,7 +130,7 @@ impl PresenceEventSource for NativePresenceSource {
 struct ActiveSource {
     cancellation: CancellationToken,
     thread: Option<JoinHandle<()>>,
-    native_selection_token: Option<String>,
+    scope: PermissionScope,
 }
 
 struct ObservationInner {
@@ -129,9 +139,10 @@ struct ObservationInner {
     foreground_probe: Arc<dyn ForegroundIdentityProbe>,
     selected_factory: Arc<dyn SelectedResourceFactory>,
     uia_factory: Arc<dyn UiaTextSourceFactory>,
-    uia_selections: Mutex<HashMap<String, WindowsUiaWindowBinding>>,
+    pixel_factory: Arc<dyn PixelCaptureFactory>,
     idle_threshold: Duration,
     active: Mutex<HashMap<SourceKey, ActiveSource>>,
+    external_structured: Mutex<HashMap<SourceKey, PermissionScope>>,
 }
 
 impl Drop for ObservationInner {
@@ -170,9 +181,10 @@ impl WindowsObservationPort {
                 foreground_probe: Arc::new(NativeForegroundIdentityProbe),
                 selected_factory: Arc::new(NativeSelectedResourceFactory),
                 uia_factory: Arc::new(NativeUiaTextSourceFactory),
-                uia_selections: Mutex::new(HashMap::new()),
+                pixel_factory: Arc::new(NativePixelCaptureFactory::new()),
                 idle_threshold,
                 active: Mutex::new(HashMap::new()),
+                external_structured: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -190,9 +202,10 @@ impl WindowsObservationPort {
                 foreground_probe: Arc::new(NativeForegroundIdentityProbe),
                 selected_factory: Arc::new(NativeSelectedResourceFactory),
                 uia_factory: Arc::new(NativeUiaTextSourceFactory),
-                uia_selections: Mutex::new(HashMap::new()),
+                pixel_factory: Arc::new(UnavailablePixelCaptureFactory),
                 idle_threshold,
                 active: Mutex::new(HashMap::new()),
+                external_structured: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -211,9 +224,10 @@ impl WindowsObservationPort {
                 foreground_probe,
                 selected_factory: Arc::new(NativeSelectedResourceFactory),
                 uia_factory: Arc::new(NativeUiaTextSourceFactory),
-                uia_selections: Mutex::new(HashMap::new()),
+                pixel_factory: Arc::new(UnavailablePixelCaptureFactory),
                 idle_threshold,
                 active: Mutex::new(HashMap::new()),
+                external_structured: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -231,11 +245,90 @@ impl WindowsObservationPort {
                 foreground_probe: Arc::new(NativeForegroundIdentityProbe),
                 selected_factory,
                 uia_factory: Arc::new(NativeUiaTextSourceFactory),
-                uia_selections: Mutex::new(HashMap::new()),
+                pixel_factory: Arc::new(UnavailablePixelCaptureFactory),
                 idle_threshold,
                 active: Mutex::new(HashMap::new()),
+                external_structured: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    #[cfg(test)]
+    fn with_uia_components(
+        idle_threshold: Duration,
+        clock: Arc<dyn Clock>,
+        uia_factory: Arc<dyn UiaTextSourceFactory>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ObservationInner {
+                clock,
+                presence_factory: Arc::new(NativePresenceFactory),
+                foreground_probe: Arc::new(NativeForegroundIdentityProbe),
+                selected_factory: Arc::new(NativeSelectedResourceFactory),
+                uia_factory,
+                pixel_factory: Arc::new(UnavailablePixelCaptureFactory),
+                idle_threshold,
+                active: Mutex::new(HashMap::new()),
+                external_structured: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_pixel_components(
+        idle_threshold: Duration,
+        clock: Arc<dyn Clock>,
+        pixel_factory: Arc<dyn PixelCaptureFactory>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ObservationInner {
+                clock,
+                presence_factory: Arc::new(NativePresenceFactory),
+                foreground_probe: Arc::new(NativeForegroundIdentityProbe),
+                selected_factory: Arc::new(NativeSelectedResourceFactory),
+                uia_factory: Arc::new(NativeUiaTextSourceFactory),
+                pixel_factory,
+                idle_threshold,
+                active: Mutex::new(HashMap::new()),
+                external_structured: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    /// Registers an independently composed structured Windows source (for
+    /// example the package-admitted Edge producer) as active for pixel
+    /// minimization. This content-free marker carries no observation value and
+    /// cannot grant authority or start a source.
+    pub fn mark_external_structured_source_active(
+        &self,
+        session_id: FocusSessionId,
+        grant_id: PermissionGrantId,
+        scope: PermissionScope,
+    ) -> Result<(), ObservationPortError> {
+        if !structured_scope_precedes_pixels(scope) {
+            return Err(permission_denied());
+        }
+        self.inner
+            .external_structured
+            .lock()
+            .map_err(|_| internal_error())?
+            .insert((session_id, grant_id), scope);
+        Ok(())
+    }
+
+    /// Removes the content-free minimization marker for a separately composed
+    /// structured source. Missing markers are already clear and are harmless.
+    pub fn clear_external_structured_source(
+        &self,
+        session_id: FocusSessionId,
+        grant_id: PermissionGrantId,
+    ) -> Result<(), ObservationPortError> {
+        self.inner
+            .external_structured
+            .lock()
+            .map_err(|_| internal_error())?
+            .remove(&(session_id, grant_id));
+        Ok(())
     }
 
     /// Resolves the current foreground application into the canonical Windows
@@ -287,12 +380,86 @@ impl WindowsObservationPort {
             return Ok(None);
         }
         match kind {
+            ResourceKind::Application => self.select_native_application(cancellation).await,
             ResourceKind::Window => self.select_native_window(cancellation).await,
             ResourceKind::Document | ResourceKind::Workspace => {
                 self.select_native_file_resource(kind, cancellation).await
             }
+            ResourceKind::ScreenRegion => self.select_native_pixel_source(cancellation).await,
             _ => Err(resource_selection_unavailable()),
         }
+    }
+
+    async fn select_native_pixel_source(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<Option<NativeSelectedResource>, ResourceSelectionError> {
+        if !self.inner.pixel_factory.is_available() {
+            return Err(resource_selection_unavailable());
+        }
+        let factory = Arc::clone(&self.inner.pixel_factory);
+        let picker_cancellation = cancellation.clone();
+        let mut picker = tokio::task::spawn_blocking(move || factory.select(&picker_cancellation));
+        let result = tokio::select! {
+            result = &mut picker => result.map_err(|_| resource_selection_internal())?,
+            _ = cancellation.cancelled() => {
+                match tokio::time::timeout(NATIVE_PICKER_CLEANUP_DEADLINE, &mut picker).await {
+                    Ok(result) => result.map_err(|_| resource_selection_internal())?,
+                    Err(_) => {
+                        picker.abort();
+                        return Err(resource_selection_internal());
+                    }
+                }
+            }
+        };
+        let binding = match result {
+            Ok(Some(binding)) => binding,
+            Ok(None) => return Ok(None),
+            Err(error) if error.kind == PixelErrorKind::Cancelled => return Ok(None),
+            Err(error) => return Err(map_pixel_selection_error(error)),
+        };
+        if cancellation.is_cancelled() {
+            let _ = self.inner.pixel_factory.release(&binding);
+            return Ok(None);
+        }
+        let opaque_reference = binding.to_string();
+        if !WindowsPixelBinding::parse(&opaque_reference)
+            .is_ok_and(|parsed| parsed.to_string() == opaque_reference)
+        {
+            let _ = self.inner.pixel_factory.release(&binding);
+            return Err(resource_selection_internal());
+        }
+        Ok(Some(NativeSelectedResource {
+            kind: ResourceKind::ScreenRegion,
+            binding: NativeResourceBinding::new(opaque_reference),
+            safe_display_label: "Selected visual source".to_owned(),
+        }))
+    }
+
+    async fn select_native_application(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<Option<NativeSelectedResource>, ResourceSelectionError> {
+        let factory = Arc::clone(&self.inner.uia_factory);
+        let picker_cancellation = cancellation.clone();
+        let mut picker =
+            tokio::task::spawn_blocking(move || factory.select_window(&picker_cancellation));
+        let binding = tokio::select! {
+            _ = cancellation.cancelled() => {
+                if tokio::time::timeout(NATIVE_PICKER_CLEANUP_DEADLINE, &mut picker).await.is_err() {
+                    picker.abort();
+                    return Err(resource_selection_internal());
+                }
+                return Ok(None);
+            }
+            result = &mut picker => result
+                .map_err(|_| resource_selection_internal())?
+                .map_err(map_uia_selection_error)?,
+        };
+        let Some(binding) = binding else {
+            return Ok(None);
+        };
+        selected_application_from_window(&binding).map(Some)
     }
 
     async fn select_native_window(
@@ -318,19 +485,15 @@ impl WindowsObservationPort {
         let Some(binding) = binding else {
             return Ok(None);
         };
-        let token = format!("winnative:v1:uia:{}", Uuid::now_v7());
-        let mut selections = self
-            .inner
-            .uia_selections
-            .lock()
+        let opaque_reference = binding.to_string();
+        let canonical = WindowsUiaWindowBinding::parse(&opaque_reference)
             .map_err(|_| resource_selection_internal())?;
-        if selections.len() >= MAXIMUM_PENDING_NATIVE_SELECTIONS {
-            return Err(resource_selection_unavailable());
+        if canonical.to_string() != opaque_reference {
+            return Err(resource_selection_internal());
         }
-        selections.insert(token.clone(), binding);
         Ok(Some(NativeSelectedResource {
             kind: ResourceKind::Window,
-            binding: NativeResourceBinding::new(token),
+            binding: NativeResourceBinding::new(opaque_reference),
             safe_display_label: "Selected window".to_owned(),
         }))
     }
@@ -382,18 +545,35 @@ impl WindowsObservationPort {
     }
 
     /// Releases a native selection that CORE did not register or no longer
-    /// needs. The exact HWND/process binding remains adapter-local and is
-    /// discarded on restart in all cases.
+    /// needs. The picker retains no live HWND or process handle; an explicitly
+    /// restart-authorized canonical binding is reopened and fully revalidated.
     fn release_native_selection(
         &self,
         opaque_reference: &str,
     ) -> Result<(), ResourceSelectionError> {
-        if canonical_uia_selection_token(opaque_reference) {
-            self.inner
-                .uia_selections
-                .lock()
-                .map_err(|_| resource_selection_internal())?
-                .remove(opaque_reference);
+        if let Ok(binding) = WindowsPixelBinding::parse(opaque_reference) {
+            if binding.to_string() != opaque_reference {
+                return Err(resource_selection_unavailable());
+            }
+            return self
+                .inner
+                .pixel_factory
+                .release(&binding)
+                .map_err(map_pixel_selection_error);
+        }
+        if WindowsUiaWindowBinding::parse(opaque_reference)
+            .is_ok_and(|binding| binding.to_string() == opaque_reference)
+        {
+            // Selected-window bindings contain only path- and content-free
+            // identity. No live handle is retained by the picker.
+            return Ok(());
+        }
+        if let Ok(binding) = WindowsApplicationBinding::parse(opaque_reference) {
+            if binding.to_string() != opaque_reference {
+                return Err(resource_selection_unavailable());
+            }
+            // Application bindings are stable, path-free identities. The
+            // picker retains no live HWND, process handle, or private text.
             return Ok(());
         }
         let binding = WindowsSelectedResourceBinding::parse(opaque_reference)
@@ -492,7 +672,7 @@ impl WindowsObservationPort {
             ActiveSource {
                 cancellation: stop_cancellation,
                 thread: Some(thread),
-                native_selection_token: None,
+                scope: request.grant.scope,
             },
         );
 
@@ -586,7 +766,7 @@ impl WindowsObservationPort {
             ActiveSource {
                 cancellation: stop_cancellation,
                 thread: Some(thread),
-                native_selection_token: None,
+                scope: request.grant.scope,
             },
         );
 
@@ -690,7 +870,7 @@ impl WindowsObservationPort {
             ActiveSource {
                 cancellation: stop_cancellation,
                 thread: Some(thread),
-                native_selection_token: None,
+                scope: request.grant.scope,
             },
         );
 
@@ -705,15 +885,7 @@ impl WindowsObservationPort {
         request: &ObservationStartRequest,
         external_cancellation: CancellationToken,
     ) -> Result<ObservationSubscription, ObservationPortError> {
-        let selection_token = validate_uia_request(request, self.inner.clock.now_utc())?;
-        let binding = self
-            .inner
-            .uia_selections
-            .lock()
-            .map_err(|_| internal_error())?
-            .get(&selection_token)
-            .cloned()
-            .ok_or_else(unavailable)?;
+        let binding = validate_uia_request(request, self.inner.clock.now_utc())?;
         if external_cancellation.is_cancelled() {
             return Err(cancelled());
         }
@@ -752,8 +924,6 @@ impl WindowsObservationPort {
         let grant = request.grant.clone();
         let limits = request.limits.clone();
         let resource_id = resource.id;
-        let selection_cleanup = Arc::downgrade(&self.inner);
-        let worker_selection_token = selection_token.clone();
         let thread = thread::Builder::new()
             .name("stein-observation-uia-visible-text".to_owned())
             .spawn(move || {
@@ -767,11 +937,6 @@ impl WindowsObservationPort {
                     worker_stop,
                     events,
                 );
-                if let Some(inner) = selection_cleanup.upgrade()
-                    && let Ok(mut selections) = inner.uia_selections.lock()
-                {
-                    selections.remove(&worker_selection_token);
-                }
             })
             .map_err(|_| internal_error())?;
 
@@ -797,7 +962,7 @@ impl WindowsObservationPort {
             ActiveSource {
                 cancellation: stop_cancellation,
                 thread: Some(thread),
-                native_selection_token: Some(selection_token),
+                scope: request.grant.scope,
             },
         );
 
@@ -806,6 +971,226 @@ impl WindowsObservationPort {
             events: receiver,
         })
     }
+
+    fn start_window_metadata(
+        &self,
+        request: &ObservationStartRequest,
+        external_cancellation: CancellationToken,
+    ) -> Result<ObservationSubscription, ObservationPortError> {
+        let binding = validate_window_metadata_request(request, self.inner.clock.now_utc())?;
+        if external_cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
+        let session_id = request
+            .grant
+            .focus_session_id
+            .ok_or_else(permission_denied)?;
+        let resource = request.resource.as_ref().ok_or_else(permission_denied)?;
+        let key = (session_id, request.grant.id);
+        {
+            let active = self.inner.active.lock().map_err(|_| internal_error())?;
+            if active.contains_key(&key) {
+                return Err(ObservationPortError {
+                    kind: ObservationPortErrorKind::BoundaryLost,
+                    summary: "The Windows observation source is already active for this grant.",
+                });
+            }
+        }
+
+        let source = self
+            .inner
+            .uia_factory
+            .open(&binding)
+            .map_err(map_uia_error)?;
+        let initial_status = window_metadata_status(
+            &request.grant,
+            resource.id,
+            SourceHealth::Unknown,
+            "The exact selected-window metadata source is initializing.",
+            self.inner.clock.now_utc(),
+        );
+        let (events, receiver) = mpsc::channel(EVENT_BUFFER_CAPACITY);
+        let stop_cancellation = CancellationToken::new();
+        let worker_stop = stop_cancellation.clone();
+        let worker_clock = Arc::clone(&self.inner.clock);
+        let grant = request.grant.clone();
+        let limits = request.limits.clone();
+        let resource_id = resource.id;
+        let thread = thread::Builder::new()
+            .name("stein-observation-window-metadata".to_owned())
+            .spawn(move || {
+                run_window_metadata_source(
+                    source,
+                    grant,
+                    resource_id,
+                    limits,
+                    worker_clock,
+                    external_cancellation,
+                    worker_stop,
+                    events,
+                );
+            })
+            .map_err(|_| internal_error())?;
+
+        let mut active = match self.inner.active.lock() {
+            Ok(active) => active,
+            Err(_) => {
+                stop_cancellation.cancel();
+                let _ = thread.join();
+                return Err(internal_error());
+            }
+        };
+        if active.contains_key(&key) {
+            stop_cancellation.cancel();
+            drop(active);
+            let _ = thread.join();
+            return Err(ObservationPortError {
+                kind: ObservationPortErrorKind::BoundaryLost,
+                summary: "The Windows observation source is already active for this grant.",
+            });
+        }
+        active.insert(
+            key,
+            ActiveSource {
+                cancellation: stop_cancellation,
+                thread: Some(thread),
+                scope: request.grant.scope,
+            },
+        );
+
+        Ok(ObservationSubscription {
+            initial_status,
+            events: receiver,
+        })
+    }
+
+    fn start_pixels(
+        &self,
+        request: &ObservationStartRequest,
+        external_cancellation: CancellationToken,
+    ) -> Result<ObservationSubscription, ObservationPortError> {
+        let binding = validate_pixel_request(request, self.inner.clock.now_utc())?;
+        if external_cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
+        let session_id = request
+            .grant
+            .focus_session_id
+            .ok_or_else(permission_denied)?;
+        let resource = request.resource.as_ref().ok_or_else(permission_denied)?;
+        let key = (session_id, request.grant.id);
+        {
+            let active = self.inner.active.lock().map_err(|_| internal_error())?;
+            if active.contains_key(&key) {
+                return Err(ObservationPortError {
+                    kind: ObservationPortErrorKind::BoundaryLost,
+                    summary: "The Windows observation source is already active for this grant.",
+                });
+            }
+        }
+        if !self.inner.pixel_factory.is_available() {
+            return Err(unavailable());
+        }
+        let source = self
+            .inner
+            .pixel_factory
+            .open(&binding)
+            .map_err(map_pixel_error)?;
+        if source.is_revoked() {
+            return Err(ObservationPortError {
+                kind: ObservationPortErrorKind::BoundaryLost,
+                summary: "The explicitly selected visual source is no longer available.",
+            });
+        }
+
+        let inner = Arc::downgrade(&self.inner);
+        let structured_active = structured_source_is_active(&inner, session_id, request.grant.id);
+        let initial_status = pixel_status(
+            &request.grant,
+            resource.id,
+            if structured_active {
+                SourceHealth::Healthy
+            } else {
+                SourceHealth::Unknown
+            },
+            if structured_active {
+                "A structured selected source has priority; no pixel frame was created."
+            } else {
+                "The exact picker-authorized visual source is initializing."
+            },
+            self.inner.clock.now_utc(),
+        );
+        let (events, receiver) = mpsc::channel(EVENT_BUFFER_CAPACITY);
+        let stop_cancellation = CancellationToken::new();
+        let worker_stop = stop_cancellation.clone();
+        let worker_clock = Arc::clone(&self.inner.clock);
+        let grant = request.grant.clone();
+        let limits = request.limits.clone();
+        let resource_id = resource.id;
+        let thread = thread::Builder::new()
+            .name("stein-observation-picker-pixels".to_owned())
+            .spawn(move || {
+                run_pixel_source(
+                    source,
+                    grant,
+                    resource_id,
+                    limits,
+                    worker_clock,
+                    inner,
+                    external_cancellation,
+                    worker_stop,
+                    events,
+                );
+            })
+            .map_err(|_| internal_error())?;
+
+        let mut active = match self.inner.active.lock() {
+            Ok(active) => active,
+            Err(_) => {
+                stop_cancellation.cancel();
+                let _ = thread.join();
+                return Err(internal_error());
+            }
+        };
+        if active.contains_key(&key) {
+            stop_cancellation.cancel();
+            drop(active);
+            let _ = thread.join();
+            return Err(ObservationPortError {
+                kind: ObservationPortErrorKind::BoundaryLost,
+                summary: "The Windows observation source is already active for this grant.",
+            });
+        }
+        active.insert(
+            key,
+            ActiveSource {
+                cancellation: stop_cancellation,
+                thread: Some(thread),
+                scope: request.grant.scope,
+            },
+        );
+
+        Ok(ObservationSubscription {
+            initial_status,
+            events: receiver,
+        })
+    }
+}
+
+fn selected_application_from_window(
+    binding: &WindowsUiaWindowBinding,
+) -> Result<NativeSelectedResource, ResourceSelectionError> {
+    let opaque_reference = binding.application().to_string();
+    let canonical = WindowsApplicationBinding::parse(&opaque_reference)
+        .map_err(|_| resource_selection_internal())?;
+    if canonical.to_string() != opaque_reference {
+        return Err(resource_selection_internal());
+    }
+    Ok(NativeSelectedResource {
+        kind: ResourceKind::Application,
+        binding: NativeResourceBinding::new(opaque_reference),
+        safe_display_label: "Selected application".to_owned(),
+    })
 }
 
 impl fmt::Debug for WindowsObservationPort {
@@ -821,9 +1206,16 @@ impl ObservationPort for WindowsObservationPort {
         match scope {
             PermissionScope::ObserveDesktopPresence
             | PermissionScope::ObserveDesktopForegroundApplication
+            | PermissionScope::ObserveDesktopWindowMetadata
             | PermissionScope::ObserveContentVisibleText
             | PermissionScope::ObserveContentSelectedDocument
             | PermissionScope::ObserveWorkspaceActivity => PlatformPortAvailability::Available,
+            PermissionScope::ObserveScreenPixels if self.inner.pixel_factory.is_available() => {
+                PlatformPortAvailability::Available
+            }
+            PermissionScope::ObserveScreenPixels => PlatformPortAvailability::Unavailable {
+                reason: "Windows Graphics Capture picker support is unavailable in this session.",
+            },
             _ => PlatformPortAvailability::Unavailable {
                 reason: "This Windows observation source is not implemented.",
             },
@@ -843,6 +1235,9 @@ impl ObservationPort for WindowsObservationPort {
                 PermissionScope::ObserveDesktopForegroundApplication => {
                     self.start_foreground(request, cancellation)
                 }
+                PermissionScope::ObserveDesktopWindowMetadata => {
+                    self.start_window_metadata(request, cancellation)
+                }
                 PermissionScope::ObserveContentVisibleText => {
                     self.start_uia_text(request, cancellation)
                 }
@@ -850,6 +1245,7 @@ impl ObservationPort for WindowsObservationPort {
                 | PermissionScope::ObserveWorkspaceActivity => {
                     self.start_selected_resource(request, cancellation)
                 }
+                PermissionScope::ObserveScreenPixels => self.start_pixels(request, cancellation),
                 _ => Err(unavailable()),
             }
         })
@@ -871,6 +1267,28 @@ impl ObservationPort for WindowsObservationPort {
                         summary: "The observation grant belongs to another focus session.",
                     });
                 }
+                if active
+                    .get(&(session_id, grant_id))
+                    .is_some_and(|source| structured_scope_precedes_pixels(source.scope))
+                {
+                    // Keep the structured source visible to pixel minimization
+                    // until its worker has actually ended. Removing the entry
+                    // before join would let a pixel worker race late structured
+                    // evidence during cancellation.
+                    let source = active
+                        .get_mut(&(session_id, grant_id))
+                        .expect("checked active structured source");
+                    source.cancellation.cancel();
+                    let join_failed = source
+                        .thread
+                        .take()
+                        .is_some_and(|thread| thread.join().is_err());
+                    active.remove(&(session_id, grant_id));
+                    if join_failed {
+                        return Err(internal_error());
+                    }
+                    return Ok(());
+                }
                 active.remove(&(session_id, grant_id))
             };
             if let Some(mut source) = source {
@@ -879,13 +1297,6 @@ impl ObservationPort for WindowsObservationPort {
                     .thread
                     .take()
                     .is_some_and(|thread| thread.join().is_err());
-                if let Some(token) = source.native_selection_token.take() {
-                    self.inner
-                        .uia_selections
-                        .lock()
-                        .map_err(|_| internal_error())?
-                        .remove(&token);
-                }
                 if join_failed {
                     return Err(internal_error());
                 }
@@ -1783,6 +2194,271 @@ impl UiaPublisher {
     }
 }
 
+struct WindowMetadataPublisher {
+    grant: PermissionGrant,
+    resource_id: ResourceId,
+    limits: stein_core::ObservationLimits,
+    clock: Arc<dyn Clock>,
+    events: mpsc::Sender<ObservationAdapterEvent>,
+    last_observation_elapsed: Option<Duration>,
+    last_fingerprint: Option<u64>,
+    last_heartbeat: Instant,
+}
+
+impl WindowMetadataPublisher {
+    fn grant_is_current(&self) -> bool {
+        self.grant.is_current_at(self.clock.now_utc())
+    }
+
+    fn ready_for_observation(&self) -> bool {
+        self.last_observation_elapsed.is_none_or(|last| {
+            self.clock.monotonic_elapsed().saturating_sub(last) >= self.limits.minimum_interval
+        })
+    }
+
+    fn metadata(&mut self, mut sample: WindowMetadataSample) -> bool {
+        if !self.grant_is_current()
+            || sample.text.len() > self.limits.maximum_payload_bytes
+            || sample.text.len() > MAXIMUM_WINDOW_METADATA_BYTES
+        {
+            return false;
+        }
+        if sample.text.is_empty() {
+            self.last_fingerprint = Some(sample.fingerprint);
+            return true;
+        }
+        if self.events.capacity() <= 1 {
+            return true;
+        }
+        let Some(session_id) = self.grant.focus_session_id else {
+            return false;
+        };
+        let fingerprint = sample.fingerprint;
+        let complete = sample.complete;
+        let bounded_text = SensitiveText::new(std::mem::take(&mut sample.text));
+        let now = self.clock.now_utc();
+        let observation = NormalizedObservation {
+            observation_id: Uuid::now_v7(),
+            session_id,
+            grant_id: self.grant.id,
+            grant_revision: self.grant.revision,
+            device_id: self.grant.device_id,
+            value: NormalizedObservationValue::WindowMetadata { bounded_text },
+            provenance: ObservationProvenance {
+                source_id: WINDOW_METADATA_SOURCE_ID.to_owned(),
+                source_event_id: Uuid::now_v7(),
+                selected_resource_id: Some(self.resource_id),
+                observed_at: now,
+                received_at: now,
+                extraction_version: "windows-user32-selected-caption-v1".to_owned(),
+                redaction_version: "windows-title-path-and-sensitive-lines-v1".to_owned(),
+                normalization_schema_version: "stein-window-metadata-v1".to_owned(),
+                confidence_basis_points: 9_800,
+                complete,
+                sensitivity: ObservationSensitivity::Restricted,
+                retention: ObservationRetention::EphemeralSession,
+                browser_granularity: None,
+            },
+        };
+        if self
+            .events
+            .try_send(ObservationAdapterEvent::Observation(Box::new(observation)))
+            .is_err()
+        {
+            return false;
+        }
+        self.last_fingerprint = Some(fingerprint);
+        self.last_observation_elapsed = Some(self.clock.monotonic_elapsed());
+        true
+    }
+
+    fn status(&mut self, health: SourceHealth, detail: &'static str) -> bool {
+        if self
+            .events
+            .try_send(ObservationAdapterEvent::SourceStatus(
+                window_metadata_status(
+                    &self.grant,
+                    self.resource_id,
+                    health,
+                    detail,
+                    self.clock.now_utc(),
+                ),
+            ))
+            .is_err()
+        {
+            return false;
+        }
+        self.last_heartbeat = Instant::now();
+        true
+    }
+
+    fn heartbeat(&mut self) -> bool {
+        self.status(
+            SourceHealth::Healthy,
+            "The selected-window metadata source remains exactly bound.",
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_window_metadata_source(
+    source: Arc<dyn UiaTextSource>,
+    grant: PermissionGrant,
+    resource_id: ResourceId,
+    limits: stein_core::ObservationLimits,
+    clock: Arc<dyn Clock>,
+    external_cancellation: CancellationToken,
+    stop_cancellation: CancellationToken,
+    events: mpsc::Sender<ObservationAdapterEvent>,
+) {
+    let mut publisher = WindowMetadataPublisher {
+        grant,
+        resource_id,
+        limits,
+        clock,
+        events,
+        last_observation_elapsed: None,
+        last_fingerprint: None,
+        last_heartbeat: Instant::now(),
+    };
+    if let Err(error) = bounded_uia_revalidate(
+        Arc::clone(&source),
+        &external_cancellation,
+        &stop_cancellation,
+    ) {
+        let _ = window_metadata_invocation_failure_status(&mut publisher, error);
+        return;
+    }
+    if !publisher.grant_is_current() {
+        let _ = publisher.status(
+            SourceHealth::Paused,
+            "The selected-window metadata grant is no longer current.",
+        );
+        return;
+    }
+    if !publisher.status(
+        SourceHealth::Healthy,
+        "The exact selected-window metadata source is initialized.",
+    ) {
+        return;
+    }
+
+    match bounded_uia_read_window_metadata(
+        Arc::clone(&source),
+        publisher.limits.maximum_payload_bytes,
+        &external_cancellation,
+        &stop_cancellation,
+    ) {
+        Ok(sample) => {
+            if external_cancellation.is_cancelled() || stop_cancellation.is_cancelled() {
+                drop(sample);
+                let _ = publisher.status(
+                    SourceHealth::Paused,
+                    "The selected-window metadata source was cancelled.",
+                );
+                return;
+            }
+            if !publisher.grant_is_current() {
+                drop(sample);
+                let _ = publisher.status(
+                    SourceHealth::Paused,
+                    "The selected-window metadata grant is no longer current.",
+                );
+                return;
+            }
+            if !publisher.metadata(sample) {
+                return;
+            }
+        }
+        Err(error) => {
+            let _ = window_metadata_invocation_failure_status(&mut publisher, error);
+            return;
+        }
+    }
+    let mut last_extraction = publisher.clock.monotonic_elapsed();
+
+    loop {
+        if external_cancellation.is_cancelled() || stop_cancellation.is_cancelled() {
+            let _ = publisher.status(
+                SourceHealth::Paused,
+                "The selected-window metadata source was cancelled.",
+            );
+            return;
+        }
+        if publisher.clock.now_utc() >= publisher.grant.expires_at
+            || publisher.grant.state != GrantState::Active
+        {
+            let _ = publisher.status(
+                SourceHealth::Paused,
+                "The selected-window metadata grant is no longer current.",
+            );
+            return;
+        }
+
+        let elapsed = publisher.clock.monotonic_elapsed();
+        if elapsed.saturating_sub(last_extraction) >= UIA_COALESCE_INTERVAL {
+            match bounded_uia_read_window_metadata(
+                Arc::clone(&source),
+                publisher.limits.maximum_payload_bytes,
+                &external_cancellation,
+                &stop_cancellation,
+            ) {
+                Ok(sample) => {
+                    last_extraction = elapsed;
+                    if external_cancellation.is_cancelled() || stop_cancellation.is_cancelled() {
+                        drop(sample);
+                        let _ = publisher.status(
+                            SourceHealth::Paused,
+                            "The selected-window metadata source was cancelled.",
+                        );
+                        return;
+                    }
+                    if !publisher.grant_is_current() {
+                        drop(sample);
+                        let _ = publisher.status(
+                            SourceHealth::Paused,
+                            "The selected-window metadata grant is no longer current.",
+                        );
+                        return;
+                    }
+                    if publisher.last_fingerprint != Some(sample.fingerprint)
+                        && publisher.ready_for_observation()
+                        && !publisher.metadata(sample)
+                    {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = window_metadata_invocation_failure_status(&mut publisher, error);
+                    return;
+                }
+            }
+        }
+
+        if publisher.last_heartbeat.elapsed() >= publisher.limits.heartbeat_interval {
+            if let Err(error) = bounded_uia_revalidate(
+                Arc::clone(&source),
+                &external_cancellation,
+                &stop_cancellation,
+            ) {
+                let _ = window_metadata_invocation_failure_status(&mut publisher, error);
+                return;
+            }
+            if !publisher.grant_is_current() {
+                let _ = publisher.status(
+                    SourceHealth::Paused,
+                    "The selected-window metadata grant is no longer current.",
+                );
+                return;
+            }
+            if !publisher.heartbeat() {
+                return;
+            }
+        }
+        thread::sleep(CANCELLATION_POLL_INTERVAL);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_uia_source(
     source: Arc<dyn UiaTextSource>,
@@ -1911,6 +2587,313 @@ fn run_uia_source(
     }
 }
 
+struct PixelPublisher {
+    grant: PermissionGrant,
+    resource_id: ResourceId,
+    limits: stein_core::ObservationLimits,
+    clock: Arc<dyn Clock>,
+    events: mpsc::Sender<ObservationAdapterEvent>,
+    last_heartbeat: Instant,
+}
+
+impl PixelPublisher {
+    fn grant_is_current(&self) -> bool {
+        self.grant.is_current_at(self.clock.now_utc())
+    }
+
+    fn observation(&mut self, mut summary: crate::pixel::PixelFrameSummary) -> bool {
+        if !self.grant_is_current()
+            || summary.bounded_text.is_empty()
+            || summary.bounded_text.len() > self.limits.maximum_payload_bytes
+        {
+            return false;
+        }
+        if self.events.capacity() <= 1 {
+            return false;
+        }
+        let Some(session_id) = self.grant.focus_session_id else {
+            return false;
+        };
+        let bounded_text = SensitiveText::new(std::mem::take(&mut summary.bounded_text));
+        let now = self.clock.now_utc();
+        let observation = NormalizedObservation {
+            observation_id: Uuid::now_v7(),
+            session_id,
+            grant_id: self.grant.id,
+            grant_revision: self.grant.revision,
+            device_id: self.grant.device_id,
+            value: NormalizedObservationValue::PixelDerivedSummary { bounded_text },
+            provenance: ObservationProvenance {
+                source_id: PIXEL_SOURCE_ID.to_owned(),
+                source_event_id: Uuid::now_v7(),
+                selected_resource_id: Some(self.resource_id),
+                observed_at: now,
+                received_at: now,
+                extraction_version: "windows-graphics-capture-one-frame-bgra8-v1".to_owned(),
+                redaction_version: "windows-pixel-coarse-luminance-detail-v1".to_owned(),
+                normalization_schema_version: "stein-pixel-derived-summary-v1".to_owned(),
+                confidence_basis_points: 6_500,
+                complete: true,
+                sensitivity: ObservationSensitivity::Restricted,
+                retention: ObservationRetention::SingleOperation,
+                browser_granularity: None,
+            },
+        };
+        self.events
+            .try_send(ObservationAdapterEvent::Observation(Box::new(observation)))
+            .is_ok()
+    }
+
+    fn status(&mut self, health: SourceHealth, detail: &'static str) -> bool {
+        if self
+            .events
+            .try_send(ObservationAdapterEvent::SourceStatus(pixel_status(
+                &self.grant,
+                self.resource_id,
+                health,
+                detail,
+                self.clock.now_utc(),
+            )))
+            .is_err()
+        {
+            return false;
+        }
+        self.last_heartbeat = Instant::now();
+        true
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_pixel_source(
+    source: Arc<dyn PixelCaptureSource>,
+    grant: PermissionGrant,
+    resource_id: ResourceId,
+    limits: stein_core::ObservationLimits,
+    clock: Arc<dyn Clock>,
+    inner: Weak<ObservationInner>,
+    external_cancellation: CancellationToken,
+    stop_cancellation: CancellationToken,
+    events: mpsc::Sender<ObservationAdapterEvent>,
+) {
+    let session_id = match grant.focus_session_id {
+        Some(value) => value,
+        None => return,
+    };
+    let pixel_grant_id = grant.id;
+    let mut publisher = PixelPublisher {
+        grant,
+        resource_id,
+        limits,
+        clock,
+        events,
+        last_heartbeat: Instant::now(),
+    };
+    let grace_deadline = Instant::now() + PIXEL_STRUCTURED_GRACE_INTERVAL;
+    let mut reported_structured_preference = false;
+
+    loop {
+        if external_cancellation.is_cancelled() || stop_cancellation.is_cancelled() {
+            let _ = publisher.status(
+                SourceHealth::Paused,
+                "The picker-authorized pixel source was cancelled before capture.",
+            );
+            return;
+        }
+        if !publisher.grant_is_current() {
+            let _ = publisher.status(
+                SourceHealth::Paused,
+                "The picker-authorized pixel grant is no longer current.",
+            );
+            return;
+        }
+        if source.is_revoked() {
+            let _ = publisher.status(
+                SourceHealth::Unavailable,
+                "The user or operating system revoked the selected visual source.",
+            );
+            return;
+        }
+        if !source.boundary_is_open() {
+            let _ = publisher.status(
+                SourceHealth::Paused,
+                "The session is locked, switched, protected, or otherwise unverifiable.",
+            );
+            return;
+        }
+
+        let structured_active = structured_source_is_active(&inner, session_id, pixel_grant_id);
+        if structured_active {
+            if !reported_structured_preference
+                && !publisher.status(
+                    SourceHealth::Healthy,
+                    "A structured selected source has priority; no pixel frame was created.",
+                )
+            {
+                return;
+            }
+            reported_structured_preference = true;
+            if publisher.last_heartbeat.elapsed() >= publisher.limits.heartbeat_interval
+                && !publisher.status(
+                    SourceHealth::Healthy,
+                    "Structured evidence remains active; the pixel source remains unused.",
+                )
+            {
+                return;
+            }
+            thread::sleep(CANCELLATION_POLL_INTERVAL);
+            continue;
+        }
+        if Instant::now() < grace_deadline {
+            thread::sleep(
+                CANCELLATION_POLL_INTERVAL
+                    .min(grace_deadline.saturating_duration_since(Instant::now())),
+            );
+            continue;
+        }
+        break;
+    }
+
+    if !publisher.status(
+        SourceHealth::Healthy,
+        "The exact picker-authorized source is capturing one bounded transient frame.",
+    ) {
+        return;
+    }
+    let summary = match source.capture_one(
+        Instant::now() + PIXEL_CAPTURE_DEADLINE,
+        &external_cancellation,
+        &stop_cancellation,
+    ) {
+        Ok(summary) => summary,
+        Err(error) => {
+            let _ = pixel_failure_status(&mut publisher, error);
+            return;
+        }
+    };
+    if external_cancellation.is_cancelled()
+        || stop_cancellation.is_cancelled()
+        || !publisher.grant_is_current()
+        || source.is_revoked()
+        || !source.boundary_is_open()
+        || structured_source_is_active(&inner, session_id, pixel_grant_id)
+    {
+        drop(summary);
+        let _ = publisher.status(
+            SourceHealth::Paused,
+            "The pixel boundary changed; the transient frame was destroyed without use.",
+        );
+        return;
+    }
+    if !publisher.observation(summary) {
+        let _ = publisher.status(
+            SourceHealth::Unavailable,
+            "The bounded pixel summary could not enter the normalized observation channel.",
+        );
+        return;
+    }
+    if !publisher.status(
+        SourceHealth::Healthy,
+        "One bounded frame was normalized and destroyed; no image bytes left the adapter.",
+    ) {
+        return;
+    }
+
+    loop {
+        if external_cancellation.is_cancelled() || stop_cancellation.is_cancelled() {
+            let _ = publisher.status(
+                SourceHealth::Paused,
+                "The picker-authorized pixel source was cancelled.",
+            );
+            return;
+        }
+        if !publisher.grant_is_current() {
+            let _ = publisher.status(
+                SourceHealth::Paused,
+                "The picker-authorized pixel grant is no longer current.",
+            );
+            return;
+        }
+        if source.is_revoked() || !source.boundary_is_open() {
+            let _ = publisher.status(
+                SourceHealth::Unavailable,
+                "The selected visual source or session boundary was lost.",
+            );
+            return;
+        }
+        if publisher.last_heartbeat.elapsed() >= publisher.limits.heartbeat_interval
+            && !publisher.status(
+                SourceHealth::Healthy,
+                "The exact visual selection remains bound; no additional frame was created.",
+            )
+        {
+            return;
+        }
+        thread::sleep(CANCELLATION_POLL_INTERVAL);
+    }
+}
+
+fn structured_source_is_active(
+    inner: &Weak<ObservationInner>,
+    session_id: FocusSessionId,
+    pixel_grant_id: PermissionGrantId,
+) -> bool {
+    let Some(inner) = inner.upgrade() else {
+        return true;
+    };
+    let local_structured = inner.active.lock().map_or(true, |active| {
+        active
+            .iter()
+            .any(|((active_session, active_grant), source)| {
+                *active_session == session_id
+                    && *active_grant != pixel_grant_id
+                    && structured_scope_precedes_pixels(source.scope)
+            })
+    });
+    if local_structured {
+        return true;
+    }
+    inner.external_structured.lock().map_or(true, |active| {
+        active
+            .iter()
+            .any(|((active_session, active_grant), scope)| {
+                *active_session == session_id
+                    && *active_grant != pixel_grant_id
+                    && structured_scope_precedes_pixels(*scope)
+            })
+    })
+}
+
+pub(crate) const fn structured_scope_precedes_pixels(scope: PermissionScope) -> bool {
+    matches!(
+        scope,
+        PermissionScope::ObserveBrowserLocation
+            | PermissionScope::ObserveContentSelectedDocument
+            | PermissionScope::ObserveContentVisibleText
+            | PermissionScope::ObserveDesktopWindowMetadata
+    )
+}
+
+fn pixel_failure_status(publisher: &mut PixelPublisher, error: PixelError) -> bool {
+    match error.kind {
+        PixelErrorKind::Cancelled => publisher.status(
+            SourceHealth::Paused,
+            "The one-frame pixel operation was cancelled and its transient storage destroyed.",
+        ),
+        PixelErrorKind::BoundaryLost => publisher.status(
+            SourceHealth::Unavailable,
+            "The exact picker-authorized visual source boundary was lost.",
+        ),
+        PixelErrorKind::ProtectedSurface => publisher.status(
+            SourceHealth::Paused,
+            "The selected source is protected, blank, locked, switched, or unverifiable.",
+        ),
+        PixelErrorKind::Unavailable | PixelErrorKind::Internal => publisher.status(
+            SourceHealth::Unavailable,
+            "The bounded Windows Graphics Capture operation is unavailable.",
+        ),
+    }
+}
+
 fn uia_invocation_failure_status(publisher: &mut UiaPublisher, error: UiaInvocationError) -> bool {
     match error {
         UiaInvocationError::Cancelled => publisher.status(
@@ -1926,6 +2909,30 @@ fn uia_invocation_failure_status(publisher: &mut UiaPublisher, error: UiaInvocat
             "The isolated selected-window UI Automation worker was lost.",
         ),
         UiaInvocationError::Source(error) => uia_failure_status(publisher, error),
+    }
+}
+
+fn window_metadata_invocation_failure_status(
+    publisher: &mut WindowMetadataPublisher,
+    error: UiaInvocationError,
+) -> bool {
+    match error {
+        UiaInvocationError::Cancelled => publisher.status(
+            SourceHealth::Paused,
+            "The selected-window metadata source was cancelled.",
+        ),
+        UiaInvocationError::TimedOut => publisher.status(
+            SourceHealth::Unavailable,
+            "The selected-window metadata provider exceeded its bounded deadline.",
+        ),
+        UiaInvocationError::WorkerLost => publisher.status(
+            SourceHealth::Unavailable,
+            "The isolated selected-window metadata worker was lost.",
+        ),
+        UiaInvocationError::Source(error) => publisher.status(
+            uia_error_health(error.kind),
+            window_metadata_error_detail(error.kind),
+        ),
     }
 }
 
@@ -1951,6 +2958,24 @@ fn uia_status(
     }
 }
 
+fn pixel_status(
+    grant: &PermissionGrant,
+    resource_id: ResourceId,
+    health: SourceHealth,
+    detail: &'static str,
+    observed_at: time::OffsetDateTime,
+) -> ObservationSourceStatus {
+    ObservationSourceStatus {
+        source_id: PIXEL_SOURCE_ID.to_owned(),
+        grant_id: grant.id,
+        scope: PermissionScope::ObserveScreenPixels,
+        resource_id: Some(resource_id),
+        health,
+        detail,
+        observed_at,
+    }
+}
+
 fn uia_error_health(kind: UiaErrorKind) -> SourceHealth {
     match kind {
         UiaErrorKind::ProtectedSurface => SourceHealth::Paused,
@@ -1969,6 +2994,34 @@ fn uia_error_detail(kind: UiaErrorKind) -> &'static str {
         UiaErrorKind::Unavailable => {
             "Windows UI Automation visible-text extraction is unavailable."
         }
+    }
+}
+
+fn window_metadata_error_detail(kind: UiaErrorKind) -> &'static str {
+    match kind {
+        UiaErrorKind::BoundaryLost => {
+            "The exact selected-window metadata identity could not be revalidated."
+        }
+        UiaErrorKind::ProtectedSurface => "The selected window is a protected metadata surface.",
+        UiaErrorKind::Unavailable => "Windows selected-window metadata is unavailable.",
+    }
+}
+
+fn window_metadata_status(
+    grant: &PermissionGrant,
+    resource_id: ResourceId,
+    health: SourceHealth,
+    detail: &'static str,
+    observed_at: time::OffsetDateTime,
+) -> ObservationSourceStatus {
+    ObservationSourceStatus {
+        source_id: WINDOW_METADATA_SOURCE_ID.to_owned(),
+        grant_id: grant.id,
+        scope: PermissionScope::ObserveDesktopWindowMetadata,
+        resource_id: Some(resource_id),
+        health,
+        detail,
+        observed_at,
     }
 }
 
@@ -2177,7 +3230,7 @@ fn validate_selected_resource_request(
 fn validate_uia_request(
     request: &ObservationStartRequest,
     now: time::OffsetDateTime,
-) -> Result<String, ObservationPortError> {
+) -> Result<WindowsUiaWindowBinding, ObservationPortError> {
     let grant = &request.grant;
     let selected_resource = grant.selected_resource_id.ok_or_else(permission_denied)?;
     let resource = request.resource.as_ref().ok_or_else(permission_denied)?;
@@ -2187,7 +3240,6 @@ fn validate_uia_request(
         || resource.id != selected_resource
         || resource.owner != grant.owner
         || resource.kind != ResourceKind::Window
-        || !canonical_uia_selection_token(&resource.opaque_reference)
         || request.limits.maximum_payload_bytes == 0
         || request.limits.maximum_payload_bytes > MAXIMUM_UIA_TEXT_BYTES
         || request.limits.minimum_interval < MINIMUM_UIA_INTERVAL
@@ -2198,14 +3250,77 @@ fn validate_uia_request(
     {
         return Err(permission_denied());
     }
-    Ok(resource.opaque_reference.clone())
+    let binding = WindowsUiaWindowBinding::parse(&resource.opaque_reference)
+        .map_err(|_| permission_denied())?;
+    if binding.to_string() != resource.opaque_reference {
+        return Err(permission_denied());
+    }
+    Ok(binding)
 }
 
-fn canonical_uia_selection_token(value: &str) -> bool {
-    let Some(uuid) = value.strip_prefix("winnative:v1:uia:") else {
-        return false;
-    };
-    Uuid::parse_str(uuid).is_ok_and(|parsed| parsed.to_string() == uuid)
+fn validate_window_metadata_request(
+    request: &ObservationStartRequest,
+    now: time::OffsetDateTime,
+) -> Result<WindowsUiaWindowBinding, ObservationPortError> {
+    let grant = &request.grant;
+    let selected_resource = grant.selected_resource_id.ok_or_else(permission_denied)?;
+    let resource = request.resource.as_ref().ok_or_else(permission_denied)?;
+    if grant.scope != PermissionScope::ObserveDesktopWindowMetadata
+        || grant.focus_session_id.is_none()
+        || !grant.is_current_at(now)
+        || resource.id != selected_resource
+        || resource.owner != grant.owner
+        || resource.kind != ResourceKind::Window
+        || request.limits.maximum_payload_bytes == 0
+        || request.limits.maximum_payload_bytes > MAXIMUM_WINDOW_METADATA_BYTES
+        || request.limits.minimum_interval < MINIMUM_UIA_INTERVAL
+        || request.limits.heartbeat_interval.is_zero()
+        || request.limits.heartbeat_interval > MAXIMUM_HEARTBEAT_INTERVAL
+        || request.limits.stale_after < request.limits.heartbeat_interval
+        || request.limits.stale_after > MAXIMUM_STALE_AFTER
+    {
+        return Err(permission_denied());
+    }
+    let binding = WindowsUiaWindowBinding::parse(&resource.opaque_reference)
+        .map_err(|_| permission_denied())?;
+    if binding.to_string() != resource.opaque_reference {
+        return Err(permission_denied());
+    }
+    Ok(binding)
+}
+
+fn validate_pixel_request(
+    request: &ObservationStartRequest,
+    now: time::OffsetDateTime,
+) -> Result<WindowsPixelBinding, ObservationPortError> {
+    let grant = &request.grant;
+    let selected_resource = grant.selected_resource_id.ok_or_else(permission_denied)?;
+    let resource = request.resource.as_ref().ok_or_else(permission_denied)?;
+    if grant.scope != PermissionScope::ObserveScreenPixels
+        || grant.focus_session_id.is_none()
+        || !grant.is_current_at(now)
+        || grant.daemon_restart_allowed
+        || resource.id != selected_resource
+        || resource.owner != grant.owner
+        || resource.kind != ResourceKind::ScreenRegion
+    {
+        return Err(permission_denied());
+    }
+    let binding =
+        WindowsPixelBinding::parse(&resource.opaque_reference).map_err(|_| permission_denied())?;
+    if binding.to_string() != resource.opaque_reference {
+        return Err(permission_denied());
+    }
+    if request.limits.maximum_payload_bytes == 0
+        || request.limits.minimum_interval < MINIMUM_PIXEL_INTERVAL
+        || request.limits.heartbeat_interval.is_zero()
+        || request.limits.heartbeat_interval > MAXIMUM_HEARTBEAT_INTERVAL
+        || request.limits.stale_after < request.limits.heartbeat_interval
+        || request.limits.stale_after > MAXIMUM_STALE_AFTER
+    {
+        return Err(invalid_configuration());
+    }
+    Ok(binding)
 }
 
 fn validate_presence_request(
@@ -2323,6 +3438,57 @@ fn map_uia_selection_error(error: UiaError) -> ResourceSelectionError {
     }
 }
 
+fn map_pixel_error(error: PixelError) -> ObservationPortError {
+    match error.kind {
+        PixelErrorKind::Cancelled => cancelled(),
+        PixelErrorKind::BoundaryLost => ObservationPortError {
+            kind: ObservationPortErrorKind::BoundaryLost,
+            summary: "The exact picker-authorized visual source could not be reopened.",
+        },
+        PixelErrorKind::ProtectedSurface => ObservationPortError {
+            kind: ObservationPortErrorKind::ProtectedSurface,
+            summary: "The selected visual source is protected, locked, or unverifiable.",
+        },
+        PixelErrorKind::Unavailable => unavailable(),
+        PixelErrorKind::Internal => internal_error(),
+    }
+}
+
+fn map_pixel_selection_error(error: PixelError) -> ResourceSelectionError {
+    let (kind, summary, retryable) = match error.kind {
+        PixelErrorKind::Cancelled => (
+            ResourceSelectionErrorKind::Cancelled,
+            "The Windows Graphics Capture picker was cancelled.",
+            true,
+        ),
+        PixelErrorKind::BoundaryLost => (
+            ResourceSelectionErrorKind::Unavailable,
+            "The picker-authorized visual source was revoked or belongs to a prior daemon run.",
+            true,
+        ),
+        PixelErrorKind::ProtectedSurface => (
+            ResourceSelectionErrorKind::Unavailable,
+            "The selected visual source is protected, locked, or outside the active session.",
+            true,
+        ),
+        PixelErrorKind::Unavailable => (
+            ResourceSelectionErrorKind::Unavailable,
+            "The Windows Graphics Capture picker is unavailable.",
+            true,
+        ),
+        PixelErrorKind::Internal => (
+            ResourceSelectionErrorKind::Internal,
+            "The native visual-source selection registry is unavailable.",
+            true,
+        ),
+    };
+    ResourceSelectionError {
+        kind,
+        summary,
+        retryable,
+    }
+}
+
 fn map_selected_resource_selection_error(error: SelectedResourceError) -> ResourceSelectionError {
     let (kind, summary, retryable) = match error.kind {
         SelectedResourceErrorKind::Cancelled => (
@@ -2398,7 +3564,7 @@ fn internal_error() -> ObservationPortError {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc as std_mpsc;
 
     use stein_core::{
@@ -2428,6 +3594,198 @@ mod tests {
 
     struct ScriptedSelectedSource {
         state: Arc<ScriptedSelectedState>,
+    }
+
+    type ScriptedMetadataResult = Result<(String, bool, u64), UiaError>;
+
+    struct ScriptedUiaState {
+        binding: WindowsUiaWindowBinding,
+        metadata: Mutex<VecDeque<ScriptedMetadataResult>>,
+        revalidations: Mutex<VecDeque<Result<(), UiaError>>>,
+        clock: Arc<ManualClock>,
+        advance_clock_on_metadata_read: Mutex<Option<Duration>>,
+        opens: AtomicUsize,
+    }
+
+    struct ScriptedUiaSource {
+        state: Arc<ScriptedUiaState>,
+    }
+
+    struct ScriptedPixelState {
+        binding: WindowsPixelBinding,
+        captures: AtomicUsize,
+        opens: AtomicUsize,
+        selections: AtomicUsize,
+        releases: AtomicUsize,
+        cancel_during_selection: AtomicBool,
+        revoked: AtomicBool,
+        boundary_open: AtomicBool,
+        capture_result: Mutex<Result<String, PixelError>>,
+    }
+
+    struct ScriptedPixelSource {
+        state: Arc<ScriptedPixelState>,
+    }
+
+    impl PixelCaptureSource for ScriptedPixelSource {
+        fn is_revoked(&self) -> bool {
+            self.state.revoked.load(Ordering::SeqCst)
+        }
+
+        fn boundary_is_open(&self) -> bool {
+            self.state.boundary_open.load(Ordering::SeqCst) && !self.is_revoked()
+        }
+
+        fn capture_one(
+            &self,
+            _deadline: Instant,
+            external_cancellation: &CancellationToken,
+            stop_cancellation: &CancellationToken,
+        ) -> Result<crate::pixel::PixelFrameSummary, PixelError> {
+            self.state.captures.fetch_add(1, Ordering::SeqCst);
+            if external_cancellation.is_cancelled() || stop_cancellation.is_cancelled() {
+                return Err(PixelError {
+                    kind: PixelErrorKind::Cancelled,
+                });
+            }
+            self.state
+                .capture_result
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|bounded_text| crate::pixel::PixelFrameSummary { bounded_text })
+        }
+    }
+
+    struct ScriptedPixelFactory {
+        state: Arc<ScriptedPixelState>,
+        available: bool,
+    }
+
+    impl PixelCaptureFactory for ScriptedPixelFactory {
+        fn is_available(&self) -> bool {
+            self.available
+        }
+
+        fn select(
+            &self,
+            cancellation: &CancellationToken,
+        ) -> Result<Option<WindowsPixelBinding>, PixelError> {
+            self.state.selections.fetch_add(1, Ordering::SeqCst);
+            if self.state.cancel_during_selection.load(Ordering::SeqCst) {
+                cancellation.cancel();
+            }
+            if cancellation.is_cancelled() {
+                // The native picker can still complete at the same time as
+                // cancellation. Return the binding so the adapter's final
+                // cancellation check must release it rather than publish it.
+                return Ok(Some(self.state.binding));
+            }
+            Ok(Some(self.state.binding))
+        }
+
+        fn release(&self, binding: &WindowsPixelBinding) -> Result<(), PixelError> {
+            if binding != &self.state.binding {
+                return Err(PixelError {
+                    kind: PixelErrorKind::BoundaryLost,
+                });
+            }
+            self.state.releases.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn open(
+            &self,
+            binding: &WindowsPixelBinding,
+        ) -> Result<Arc<dyn PixelCaptureSource>, PixelError> {
+            if !self.available || binding != &self.state.binding {
+                return Err(PixelError {
+                    kind: PixelErrorKind::BoundaryLost,
+                });
+            }
+            self.state.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(ScriptedPixelSource {
+                state: Arc::clone(&self.state),
+            }))
+        }
+    }
+
+    impl UiaTextSource for ScriptedUiaSource {
+        fn revalidate(&self) -> Result<(), UiaError> {
+            self.state
+                .revalidations
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(()))
+        }
+
+        fn read_visible_text(&self, _maximum_bytes: usize) -> Result<VisibleTextSample, UiaError> {
+            Ok(VisibleTextSample {
+                text: "Synthetic visible text".to_owned(),
+                complete: true,
+                fingerprint: 11,
+            })
+        }
+
+        fn read_window_metadata(
+            &self,
+            _maximum_bytes: usize,
+        ) -> Result<WindowMetadataSample, UiaError> {
+            if let Some(duration) = self
+                .state
+                .advance_clock_on_metadata_read
+                .lock()
+                .unwrap()
+                .take()
+            {
+                self.state.clock.advance(duration);
+            }
+            let (text, complete, fingerprint) = self
+                .state
+                .metadata
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(("Synthetic title".to_owned(), true, 12)))?;
+            Ok(WindowMetadataSample {
+                text,
+                complete,
+                fingerprint,
+            })
+        }
+    }
+
+    struct ScriptedUiaFactory {
+        state: Arc<ScriptedUiaState>,
+    }
+
+    impl UiaTextSourceFactory for ScriptedUiaFactory {
+        fn select_window(
+            &self,
+            cancellation: &CancellationToken,
+        ) -> Result<Option<WindowsUiaWindowBinding>, UiaError> {
+            if cancellation.is_cancelled() {
+                Ok(None)
+            } else {
+                Ok(Some(self.state.binding.clone()))
+            }
+        }
+
+        fn open(
+            &self,
+            binding: &WindowsUiaWindowBinding,
+        ) -> Result<Arc<dyn UiaTextSource>, UiaError> {
+            if binding != &self.state.binding {
+                return Err(UiaError {
+                    kind: UiaErrorKind::BoundaryLost,
+                });
+            }
+            self.state.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(ScriptedUiaSource {
+                state: Arc::clone(&self.state),
+            }))
+        }
     }
 
     impl SelectedResourceEventSource for ScriptedSelectedSource {
@@ -2623,6 +3981,21 @@ mod tests {
         binding: WindowsSelectedResourceBinding,
     }
 
+    struct WindowMetadataFixture {
+        port: WindowsObservationPort,
+        clock: Arc<ManualClock>,
+        state: Arc<ScriptedUiaState>,
+        request: ObservationStartRequest,
+        binding: WindowsUiaWindowBinding,
+    }
+
+    struct PixelFixture {
+        port: WindowsObservationPort,
+        state: Arc<ScriptedPixelState>,
+        request: ObservationStartRequest,
+        binding: WindowsPixelBinding,
+    }
+
     fn fixture(initial: PresenceState) -> Fixture {
         let now = datetime!(2026-08-19 12:00 UTC);
         let clock = Arc::new(ManualClock::new(now));
@@ -2675,6 +4048,59 @@ mod tests {
             clock,
             sender,
             request,
+        }
+    }
+
+    fn pixel_fixture() -> PixelFixture {
+        let base = fixture(PresenceState::Active);
+        let binding =
+            WindowsPixelBinding::parse("winpixel:v1:0198c8a3-8720-7000-8000-000000000001").unwrap();
+        let state = Arc::new(ScriptedPixelState {
+            binding,
+            captures: AtomicUsize::new(0),
+            opens: AtomicUsize::new(0),
+            selections: AtomicUsize::new(0),
+            releases: AtomicUsize::new(0),
+            cancel_during_selection: AtomicBool::new(false),
+            revoked: AtomicBool::new(false),
+            boundary_open: AtomicBool::new(true),
+            capture_result: Mutex::new(Ok(
+                "selected visual source 640x480; luminance=balanced; detail=moderate".to_owned(),
+            )),
+        });
+        let resource_id = ResourceId::new_v7();
+        let mut request = base.request;
+        request.grant.scope = PermissionScope::ObserveScreenPixels;
+        request.grant.selected_resource_id = Some(resource_id);
+        request.limits = ObservationLimits {
+            maximum_payload_bytes: 256,
+            minimum_interval: MINIMUM_PIXEL_INTERVAL,
+            heartbeat_interval: Duration::from_secs(10),
+            stale_after: Duration::from_secs(30),
+        };
+        request.resource = Some(ResourceBinding {
+            id: resource_id,
+            owner: request.grant.owner,
+            kind: ResourceKind::ScreenRegion,
+            opaque_reference: binding.to_string(),
+            display_label: "Selected visual source".to_owned(),
+            revision: 1,
+            created_at: base.clock.now_utc(),
+        });
+        let factory = Arc::new(ScriptedPixelFactory {
+            state: Arc::clone(&state),
+            available: true,
+        });
+        let port = WindowsObservationPort::with_pixel_components(
+            Duration::from_secs(60),
+            base.clock,
+            factory,
+        );
+        PixelFixture {
+            port,
+            state,
+            request,
+            binding,
         }
     }
 
@@ -2809,6 +4235,61 @@ mod tests {
         }
     }
 
+    fn window_metadata_fixture() -> WindowMetadataFixture {
+        let base = fixture(PresenceState::Active);
+        let application = WindowsApplicationBinding::packaged(
+            "Synthetic.App_1234567890abc",
+            "Synthetic.App_1234567890abc!Main",
+        )
+        .unwrap();
+        let binding = WindowsUiaWindowBinding::new(0x1234, 42, 99, application).unwrap();
+        let resource_id = ResourceId::new_v7();
+        let mut request = base.request;
+        request.grant.scope = PermissionScope::ObserveDesktopWindowMetadata;
+        request.grant.selected_resource_id = Some(resource_id);
+        request.limits = ObservationLimits {
+            maximum_payload_bytes: MAXIMUM_WINDOW_METADATA_BYTES,
+            minimum_interval: Duration::from_secs(5),
+            heartbeat_interval: Duration::from_secs(10),
+            stale_after: Duration::from_secs(30),
+        };
+        request.resource = Some(ResourceBinding {
+            id: resource_id,
+            owner: request.grant.owner,
+            kind: ResourceKind::Window,
+            opaque_reference: binding.to_string(),
+            display_label: "Synthetic selected window".to_owned(),
+            revision: 1,
+            created_at: base.clock.now_utc(),
+        });
+        let state = Arc::new(ScriptedUiaState {
+            binding: binding.clone(),
+            metadata: Mutex::new(VecDeque::from([Ok((
+                "Synthetic brief — Notepad".to_owned(),
+                true,
+                41,
+            ))])),
+            revalidations: Mutex::new(VecDeque::new()),
+            clock: Arc::clone(&base.clock),
+            advance_clock_on_metadata_read: Mutex::new(None),
+            opens: AtomicUsize::new(0),
+        });
+        let port = WindowsObservationPort::with_uia_components(
+            Duration::from_secs(60),
+            base.clock.clone(),
+            Arc::new(ScriptedUiaFactory {
+                state: Arc::clone(&state),
+            }),
+        );
+        WindowMetadataFixture {
+            port,
+            clock: base.clock,
+            state,
+            request,
+            binding,
+        }
+    }
+
     async fn next_event(subscription: &mut ObservationSubscription) -> ObservationAdapterEvent {
         tokio::time::timeout(Duration::from_secs(2), subscription.events.recv())
             .await
@@ -2822,6 +4303,193 @@ mod tests {
             ObservationAdapterEvent::Observation(observation)
                 if observation.value == NormalizedObservationValue::Presence(expected)
         )
+    }
+
+    #[test]
+    fn selected_application_keeps_only_the_canonical_path_free_identity() {
+        let application = WindowsApplicationBinding::packaged(
+            "Synthetic.App_1234567890abc",
+            "Synthetic.App_1234567890abc!Main",
+        )
+        .unwrap();
+        let window = WindowsUiaWindowBinding::new(0x1234, 42, 99, application.clone()).unwrap();
+
+        let selected = selected_application_from_window(&window).unwrap();
+
+        assert_eq!(selected.kind, ResourceKind::Application);
+        assert_eq!(selected.safe_display_label, "Selected application");
+        assert_eq!(
+            WindowsApplicationBinding::parse(selected.binding.as_str()).unwrap(),
+            application
+        );
+        assert!(selected.binding.as_str().starts_with("winapp:v1:"));
+        assert!(!selected.binding.as_str().contains("winuia"));
+
+        let port = fixture(PresenceState::Active).port;
+        port.release_native_selection(selected.binding.as_str())
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_window_uses_a_canonical_restart_revalidatable_binding() {
+        let fixture = window_metadata_fixture();
+        let selected = fixture
+            .port
+            .select_native_resource(ResourceKind::Window, CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected.kind, ResourceKind::Window);
+        assert_eq!(selected.safe_display_label, "Selected window");
+        assert_eq!(
+            WindowsUiaWindowBinding::parse(selected.binding.as_str()).unwrap(),
+            fixture.binding
+        );
+        assert_eq!(selected.binding.as_str(), fixture.binding.to_string());
+        assert!(!selected.binding.as_str().contains('\\'));
+        assert!(!selected.binding.as_str().contains('/'));
+        fixture
+            .port
+            .release_native_selection(selected.binding.as_str())
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn window_metadata_is_bounded_exact_and_independently_granted() {
+        let fixture = window_metadata_fixture();
+        assert_eq!(
+            ObservationPort::availability(
+                &fixture.port,
+                PermissionScope::ObserveDesktopWindowMetadata,
+            ),
+            PlatformPortAvailability::Available
+        );
+        let cancellation = CancellationToken::new();
+        let mut subscription = fixture
+            .port
+            .start(&fixture.request, cancellation.clone())
+            .await
+            .unwrap();
+        assert_eq!(subscription.initial_status.health, SourceHealth::Unknown);
+        assert_eq!(
+            subscription.initial_status.scope,
+            PermissionScope::ObserveDesktopWindowMetadata
+        );
+        assert!(matches!(
+            next_event(&mut subscription).await,
+            ObservationAdapterEvent::SourceStatus(ObservationSourceStatus {
+                health: SourceHealth::Healthy,
+                ..
+            })
+        ));
+        let ObservationAdapterEvent::Observation(observation) = next_event(&mut subscription).await
+        else {
+            panic!("expected window-metadata observation");
+        };
+        let NormalizedObservationValue::WindowMetadata { bounded_text } = &observation.value else {
+            panic!("expected window-metadata value");
+        };
+        assert_eq!(bounded_text.expose(), "Synthetic brief — Notepad");
+        assert_eq!(observation.provenance.source_id, WINDOW_METADATA_SOURCE_ID);
+        assert_eq!(
+            observation.provenance.selected_resource_id,
+            fixture.request.grant.selected_resource_id
+        );
+        assert_eq!(
+            observation.provenance.sensitivity,
+            ObservationSensitivity::Restricted
+        );
+        assert!(observation.provenance.complete);
+        assert!(!format!("{observation:?}").contains("Synthetic brief"));
+        assert_eq!(fixture.state.opens.load(Ordering::SeqCst), 1);
+
+        cancellation.cancel();
+        assert!(matches!(
+            next_event(&mut subscription).await,
+            ObservationAdapterEvent::SourceStatus(ObservationSourceStatus {
+                health: SourceHealth::Paused,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn window_metadata_rejects_wrong_authority_before_opening_native_source() {
+        let fixture = window_metadata_fixture();
+        let mut wrong_scope = fixture.request.clone();
+        wrong_scope.grant.scope = PermissionScope::ObserveContentVisibleText;
+        let error = match fixture
+            .port
+            .start_window_metadata(&wrong_scope, CancellationToken::new())
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a visible-text grant must not authorize window metadata"),
+        };
+        assert_eq!(error.kind, ObservationPortErrorKind::PermissionDenied);
+
+        let mut wrong_resource = fixture.request.clone();
+        wrong_resource.resource.as_mut().unwrap().id = ResourceId::new_v7();
+        let error = match fixture
+            .port
+            .start(&wrong_resource, CancellationToken::new())
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a mismatched selected window must fail"),
+        };
+        assert_eq!(error.kind, ObservationPortErrorKind::PermissionDenied);
+
+        let mut unsafe_payload = fixture.request.clone();
+        unsafe_payload.limits.maximum_payload_bytes = MAXIMUM_WINDOW_METADATA_BYTES + 1;
+        let error = match fixture
+            .port
+            .start(&unsafe_payload, CancellationToken::new())
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("an oversized window-metadata payload must fail"),
+        };
+        assert_eq!(error.kind, ObservationPortErrorKind::PermissionDenied);
+        assert_eq!(fixture.state.opens.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.clock.now_utc(), datetime!(2026-08-19 12:00 UTC));
+    }
+
+    #[tokio::test]
+    async fn window_metadata_drops_a_read_that_crosses_grant_expiry() {
+        let mut fixture = window_metadata_fixture();
+        fixture.request.grant.expires_at = fixture.clock.now_utc() + time::Duration::seconds(1);
+        *fixture.state.advance_clock_on_metadata_read.lock().unwrap() =
+            Some(Duration::from_secs(1));
+
+        let session_id = fixture.request.grant.focus_session_id.unwrap();
+        let grant_id = fixture.request.grant.id;
+        let mut subscription = fixture
+            .port
+            .start(&fixture.request, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            next_event(&mut subscription).await,
+            ObservationAdapterEvent::SourceStatus(ObservationSourceStatus {
+                health: SourceHealth::Healthy,
+                ..
+            })
+        ));
+        let ObservationAdapterEvent::SourceStatus(paused) = next_event(&mut subscription).await
+        else {
+            panic!("an expired grant must not publish the completed metadata read");
+        };
+        assert_eq!(paused.health, SourceHealth::Paused);
+        assert!(paused.detail.contains("grant is no longer current"));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), subscription.events.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        fixture.port.stop(session_id, grant_id).await.unwrap();
     }
 
     #[tokio::test]
@@ -3606,6 +5274,315 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn pixel_picker_selection_is_opaque_exact_and_releasable() {
+        let fixture = pixel_fixture();
+        assert_eq!(
+            ObservationPort::availability(&fixture.port, PermissionScope::ObserveScreenPixels,),
+            PlatformPortAvailability::Available
+        );
+        let selected = ResourceSelectionPort::select(
+            &fixture.port,
+            ResourceKind::ScreenRegion,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.kind, ResourceKind::ScreenRegion);
+        assert_eq!(selected.binding.as_str(), fixture.binding.to_string());
+        assert_eq!(selected.safe_display_label, "Selected visual source");
+        assert_eq!(fixture.state.selections.load(Ordering::SeqCst), 1);
+        ResourceSelectionPort::release(&fixture.port, selected.binding, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(fixture.state.releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pixel_picker_cancellation_releases_a_racing_selection() {
+        let fixture = pixel_fixture();
+        fixture
+            .state
+            .cancel_during_selection
+            .store(true, Ordering::SeqCst);
+        let cancellation = CancellationToken::new();
+        let selected =
+            ResourceSelectionPort::select(&fixture.port, ResourceKind::ScreenRegion, cancellation)
+                .await
+                .unwrap();
+        assert!(selected.is_none());
+        assert_eq!(fixture.state.selections.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.state.releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pixel_source_emits_one_coarse_single_operation_observation() {
+        let fixture = pixel_fixture();
+        let session_id = fixture.request.grant.focus_session_id.unwrap();
+        let mut subscription = fixture
+            .port
+            .start(&fixture.request, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            subscription.initial_status.scope,
+            PermissionScope::ObserveScreenPixels
+        );
+        assert_eq!(subscription.initial_status.health, SourceHealth::Unknown);
+
+        let mut captured = None;
+        for _ in 0..4 {
+            match next_event(&mut subscription).await {
+                ObservationAdapterEvent::Observation(observation) => {
+                    captured = Some(observation);
+                    break;
+                }
+                ObservationAdapterEvent::SourceStatus(_) => {}
+            }
+        }
+        let observation = captured.expect("one normalized pixel-derived observation");
+        let NormalizedObservationValue::PixelDerivedSummary { bounded_text } = &observation.value
+        else {
+            panic!("expected a pixel-derived summary");
+        };
+        assert_eq!(
+            bounded_text.expose(),
+            "selected visual source 640x480; luminance=balanced; detail=moderate"
+        );
+        assert_eq!(observation.provenance.source_id, PIXEL_SOURCE_ID);
+        assert_eq!(
+            observation.provenance.retention,
+            ObservationRetention::SingleOperation
+        );
+        assert_eq!(
+            observation.provenance.selected_resource_id,
+            fixture.request.grant.selected_resource_id
+        );
+        assert_eq!(fixture.state.captures.load(Ordering::SeqCst), 1);
+        assert!(!format!("{observation:?}").contains("luminance=balanced"));
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(fixture.state.captures.load(Ordering::SeqCst), 1);
+        fixture
+            .port
+            .stop(session_id, fixture.request.grant.id)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_structured_source_prevents_pixel_capture_and_use() {
+        let fixture = pixel_fixture();
+        let session_id = fixture.request.grant.focus_session_id.unwrap();
+        let structured_grant = PermissionGrantId::new_v7();
+        fixture.port.inner.active.lock().unwrap().insert(
+            (session_id, structured_grant),
+            ActiveSource {
+                cancellation: CancellationToken::new(),
+                thread: None,
+                scope: PermissionScope::ObserveContentVisibleText,
+            },
+        );
+        let subscription = fixture
+            .port
+            .start(&fixture.request, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(subscription.initial_status.health, SourceHealth::Healthy);
+        assert!(
+            subscription
+                .initial_status
+                .detail
+                .contains("no pixel frame")
+        );
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(fixture.state.captures.load(Ordering::SeqCst), 0);
+        fixture
+            .port
+            .stop(session_id, fixture.request.grant.id)
+            .await
+            .unwrap();
+        fixture
+            .port
+            .inner
+            .active
+            .lock()
+            .unwrap()
+            .remove(&(session_id, structured_grant));
+    }
+
+    #[test]
+    fn structured_stop_remains_visible_until_its_worker_has_ended() {
+        let fixture = pixel_fixture();
+        let session_id = fixture.request.grant.focus_session_id.unwrap();
+        let structured_grant = PermissionGrantId::new_v7();
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let (cancelled_sender, cancelled_receiver) = std_mpsc::sync_channel(1);
+        let (finish_sender, finish_receiver) = std_mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            while !worker_cancellation.is_cancelled() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            cancelled_sender.send(()).unwrap();
+            finish_receiver.recv().unwrap();
+        });
+        fixture.port.inner.active.lock().unwrap().insert(
+            (session_id, structured_grant),
+            ActiveSource {
+                cancellation,
+                thread: Some(worker),
+                scope: PermissionScope::ObserveContentVisibleText,
+            },
+        );
+
+        let stopping_port = fixture.port.clone();
+        let stopper = thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(stopping_port.stop(session_id, structured_grant))
+        });
+        cancelled_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(fixture.port.inner.active.try_lock().is_err());
+        finish_sender.send(()).unwrap();
+        stopper.join().unwrap().unwrap();
+        assert!(
+            !fixture
+                .port
+                .inner
+                .active
+                .lock()
+                .unwrap()
+                .contains_key(&(session_id, structured_grant))
+        );
+    }
+
+    #[tokio::test]
+    async fn externally_composed_browser_source_prevents_pixel_capture() {
+        let fixture = pixel_fixture();
+        let session_id = fixture.request.grant.focus_session_id.unwrap();
+        let browser_grant = PermissionGrantId::new_v7();
+        fixture
+            .port
+            .mark_external_structured_source_active(
+                session_id,
+                browser_grant,
+                PermissionScope::ObserveBrowserLocation,
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .port
+                .mark_external_structured_source_active(
+                    session_id,
+                    PermissionGrantId::new_v7(),
+                    PermissionScope::ObserveScreenPixels,
+                )
+                .is_err()
+        );
+        let subscription = fixture
+            .port
+            .start(&fixture.request, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(subscription.initial_status.health, SourceHealth::Healthy);
+        assert!(
+            subscription
+                .initial_status
+                .detail
+                .contains("no pixel frame")
+        );
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(fixture.state.captures.load(Ordering::SeqCst), 0);
+        fixture
+            .port
+            .stop(session_id, fixture.request.grant.id)
+            .await
+            .unwrap();
+        fixture
+            .port
+            .clear_external_structured_source(session_id, browser_grant)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pixel_request_rejects_wrong_scope_binding_and_rate_before_open() {
+        let fixture = pixel_fixture();
+
+        let mut wrong_kind = fixture.request.clone();
+        wrong_kind.resource.as_mut().unwrap().kind = ResourceKind::Window;
+        let error = match fixture
+            .port
+            .start(&wrong_kind, CancellationToken::new())
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a non-pixel selected resource must fail"),
+        };
+        assert_eq!(error.kind, ObservationPortErrorKind::PermissionDenied);
+
+        let mut malformed = fixture.request.clone();
+        malformed.resource.as_mut().unwrap().opaque_reference = "winpixel:v1:not-a-uuid".to_owned();
+        let error = match fixture
+            .port
+            .start(&malformed, CancellationToken::new())
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a malformed opaque binding must fail"),
+        };
+        assert_eq!(error.kind, ObservationPortErrorKind::PermissionDenied);
+
+        let mut unsafe_rate = fixture.request.clone();
+        unsafe_rate.limits.minimum_interval = Duration::from_millis(9_999);
+        let error = match fixture
+            .port
+            .start(&unsafe_rate, CancellationToken::new())
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a faster-than-contract pixel rate must fail"),
+        };
+        assert_eq!(error.kind, ObservationPortErrorKind::Internal);
+
+        let mut restart_claim = fixture.request.clone();
+        restart_claim.grant.daemon_restart_allowed = true;
+        let error = match fixture
+            .port
+            .start(&restart_claim, CancellationToken::new())
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a restart-continuous pixel grant must fail"),
+        };
+        assert_eq!(error.kind, ObservationPortErrorKind::PermissionDenied);
+        assert_eq!(fixture.state.opens.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.state.captures.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn browser_document_uia_and_window_metadata_precede_pixels() {
+        for scope in [
+            PermissionScope::ObserveBrowserLocation,
+            PermissionScope::ObserveContentSelectedDocument,
+            PermissionScope::ObserveContentVisibleText,
+            PermissionScope::ObserveDesktopWindowMetadata,
+        ] {
+            assert!(structured_scope_precedes_pixels(scope));
+        }
+        for scope in [
+            PermissionScope::ObserveDesktopPresence,
+            PermissionScope::ObserveDesktopForegroundApplication,
+            PermissionScope::ObserveScreenPixels,
+            PermissionScope::ObserveWorkspaceActivity,
+        ] {
+            assert!(!structured_scope_precedes_pixels(scope));
+        }
     }
 
     #[tokio::test]

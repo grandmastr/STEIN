@@ -69,6 +69,28 @@ It opens or focuses the registered desktop client, which authenticates normally
 and queries authoritative state. Activation arguments contain no goal,
 notification text, grant, capability, credential, file path, or authority.
 
+The production MSIX registers fixed CLSID
+`3DB3B5B0-1BA5-49D1-A8F0-CF2B3EA6D781` as a local COM server implemented by the
+existing `stein-desktop.exe`; it does not add another executable or background
+process. Windows starts that executable with the exact `-ToastActivated` marker
+when needed, after which the `INotificationActivationCallback` supplies the
+opaque launch value. The desktop registers the class only after its process
+token proves the exact production package family and `Desktop` AUMID.
+
+The callback accepts only the exact lowercase canonical form
+`action=open&intervention=<UUID>`, the exact current desktop AUMID, and zero
+notification input fields. It rejects extra keys, differently encoded UUIDs,
+wrong identities, malformed arguments, and closed receivers. Command-line text
+is never accepted as an intervention identifier; an unpackaged or malformed
+direct `-ToastActivated` launch exits before Tauri starts.
+
+After a valid callback, Tauri shows, restores, and focuses its main window. The
+activation worker waits through the existing bounded private-broker connection,
+uses the typed `explain_intervention` request for that UUID, and refreshes the
+authoritative dashboard snapshot. The UUID remains a selector, not authority:
+missing, expired, deleted, foreign-owner, or diagnostic-only lookups fail through
+the normal private protocol boundary.
+
 ### Status and emergency stop
 
 The daemon creates a notification-area icon using the native Windows shell API
@@ -130,6 +152,14 @@ grant references, sensitivity/permitted channel class, timing, deduplication
 identity, and attempt state. It never contains observation payloads, paths,
 prompts/responses, chain of thought, credentials, or broker capability.
 
+Queue creation and every audited terminal delivery update commit the matching
+intervention revision, outbox mutation, and content-free delivery audit in one
+repository transaction. A failed or conflicting audit insert therefore cannot
+leave an orphan queued item or an unaudited delivery outcome. The native call is
+still outside SQLite: its candidate-specific policy decision and audit must be
+durably acknowledged before submission, and the strongest known result is
+persisted atomically with its post-attempt audit immediately afterward.
+
 Channel recovery schedules bounded revalidation; it does not drain the table.
 Current policy rechecks goal/session relevance, grants, expiry, novelty, cooldown,
 load, presence/unlock, channel suitability, prior acknowledgements, and
@@ -155,6 +185,8 @@ recovery before those platform capabilities are called supported.
 
 - The Windows CORE daemon hosts a small native UI/message loop in its adapter
   layer but remains one modular-monolith deployment.
+- Packaged toast activation reuses the desktop executable as its COM local
+  server; there is no additional activator binary or durable activation payload.
 - A failure in that loop cannot become invisible capture; it deliberately pauses
   affected sources.
 - Installation and upgrade must register and validate Start Menu/AUMID/toast

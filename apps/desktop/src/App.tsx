@@ -1,18 +1,21 @@
 import { ConnectionBanner } from "./components/ConnectionBanner";
 import { CreateGoalForm } from "./components/CreateGoalForm";
 import { FocusPanel } from "./components/FocusPanel";
+import { GoalPanel } from "./components/GoalPanel";
+import { IdentityPolicyPanel } from "./components/IdentityPolicyPanel";
 import { InterventionPanel } from "./components/InterventionPanel";
 import { ActivityIcon, GoalIcon, LinkIcon, PulseIcon, RefreshIcon } from "./components/Icons";
 import { ModelRouteConsent } from "./components/ModelRouteConsent";
 import { PermissionPanel } from "./components/PermissionPanel";
+import { SelectedResourcePanel } from "./components/SelectedResourcePanel";
 import { StatusPill } from "./components/StatusPill";
+import { UserPreferencesPanel } from "./components/UserPreferencesPanel";
 import { compactId, displayMessageType, formatMoment, formatRelative } from "./lib/format";
 import { useCoreDashboard } from "./lib/useCoreDashboard";
 import type {
   CapabilityView,
   CoreEventView,
   DeliveryChannelView,
-  GoalView,
 } from "./protocol";
 
 function Header({ connected, refreshing, observedAt, onRefresh, onReconnect }: {
@@ -84,20 +87,6 @@ function CapabilityList({ capabilities }: { capabilities: CapabilityView[] }) {
   );
 }
 
-function GoalList({ goals, disabled, onComplete, onAbandon }: {
-  goals: GoalView[];
-  disabled: boolean;
-  onComplete: (goal: GoalView) => void;
-  onAbandon: (goal: GoalView) => void;
-}) {
-  return (
-    <section className="panel" aria-labelledby="goals-title">
-      <div className="panel__header"><div><p className="eyebrow">Durable direct-user state</p><h2 id="goals-title">Goals</h2></div><span className="panel__count">{goals.length}</span></div>
-      {goals.length === 0 ? <p className="empty-inline">No private goal view is available.</p> : <ul className="goal-list">{goals.map((goal) => <li key={goal.id}><span className="goal-list__line" /><div className="goal-list__body"><div className="goal-list__heading"><strong>{goal.title}</strong><StatusPill status={goal.state} /></div><p>{goal.successStatement}</p><span className="goal-list__meta"><span>{goal.deadline ? `Due ${formatMoment(goal.deadline)}` : "No deadline"}</span><span>Revision {goal.revision}</span><code title={goal.id}>{compactId(goal.id, 5)}</code></span>{goal.state === "active" ? <div className="button-row"><button className="button button--ghost button--small" disabled={disabled} onClick={() => onComplete(goal)}>Complete</button><button className="button button--danger button--small" disabled={disabled} onClick={() => onAbandon(goal)}>Abandon</button></div> : null}</div></li>)}</ul>}
-    </section>
-  );
-}
-
 function ChannelStatus({ channels }: { channels: DeliveryChannelView[] }) {
   return (
     <section className="panel" aria-labelledby="channels-title">
@@ -141,14 +130,17 @@ export default function App() {
           {!privateAvailable ? <AdmissionBanner reason={snapshot.access.unavailableReason} /> : null}
           <div key={snapshot.access.assurance} className={!privateAvailable ? "private-workspace private-workspace--locked" : "private-workspace"} aria-disabled={!privateAvailable}>
             <div className="dashboard-grid dashboard-grid--phase2">
+              <IdentityPolicyPanel identity={snapshot.steinIdentity} policy={snapshot.effectivePolicy} />
+              <UserPreferencesPanel disabled={controlsDisabled} preferences={snapshot.userPreferences} onUpdate={dashboard.updateUserPreferences} onRefresh={dashboard.refresh} />
               <CreateGoalForm disabled={controlsDisabled} onCreate={dashboard.createGoal} />
-              <GoalList goals={snapshot.goals} disabled={controlsDisabled} onComplete={(goal) => void dashboard.completeGoal({ goalId: goal.id, expectedRevision: goal.revision })} onAbandon={(goal) => void dashboard.abandonGoal({ goalId: goal.id, expectedRevision: goal.revision, reason: "user_requested" })} />
-              <ModelRouteConsent disabled={controlsDisabled} routes={snapshot.modelRoutes} onStoreSecret={dashboard.storeModelSecret} onApprove={dashboard.approveModelRoute} onRevoke={dashboard.revokePermission} />
+              <GoalPanel goals={snapshot.goals} disabled={controlsDisabled} onUpdate={dashboard.updateGoal} onDelete={dashboard.deleteGoal} onComplete={dashboard.completeGoal} onAbandon={dashboard.abandonGoal} onRefresh={dashboard.refresh} />
+              <ModelRouteConsent disabled={controlsDisabled} routes={snapshot.modelRoutes} onSetup={dashboard.setupModelRoute} onRevoke={dashboard.revokePermission} />
+              <SelectedResourcePanel disabled={controlsDisabled} resources={snapshot.selectedResources} onRegister={dashboard.registerSelectedResource} onRemove={dashboard.removeSelectedResource} onRefresh={dashboard.refresh} onClearError={dashboard.clearError} />
               <PermissionPanel currentDeviceId={snapshot.currentDeviceId} disabled={controlsDisabled} goals={snapshot.goals} resources={snapshot.selectedResources} grants={snapshot.sessionGrants} onGrant={dashboard.grantPermission} onRevoke={dashboard.revokePermission} />
               <FocusPanel disabled={controlsDisabled} goals={snapshot.goals} routes={snapshot.modelRoutes} grants={snapshot.sessionGrants} resources={snapshot.selectedResources} sessions={snapshot.focusSessions} captures={snapshot.captureStates} onStart={dashboard.startFocusSession} onSetMuted={dashboard.setInterventionsMuted} onEnd={dashboard.endFocusSession} />
               <ChannelStatus channels={snapshot.deliveryChannels} />
               <CapabilityList capabilities={snapshot.capabilities} />
-              <InterventionPanel disabled={controlsDisabled} interventions={snapshot.interventionHistory} resources={snapshot.selectedResources} onExplain={dashboard.explainIntervention} onFeedback={dashboard.recordInterventionFeedback} onHistory={dashboard.getInterventionHistory} />
+              <InterventionPanel disabled={controlsDisabled} interventions={snapshot.interventionHistory} resources={snapshot.selectedResources} activatedExplanation={dashboard.latestToastActivation} onExplain={dashboard.explainIntervention} onFeedback={dashboard.recordInterventionFeedback} onHistory={dashboard.getInterventionHistory} />
               <EventTimeline events={snapshot.recentEvents} />
             </div>
           </div>

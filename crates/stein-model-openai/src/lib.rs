@@ -802,6 +802,17 @@ mod tests {
     }
 
     #[test]
+    fn desktop_consent_uses_the_production_handling_profile() {
+        let consent_source =
+            include_str!("../../../apps/desktop/src/components/ModelRouteConsent.tsx");
+        let expected = format!("handlingProfileVersion: \"{EXPECTED_HANDLING_PROFILE_ID}\"");
+        assert!(
+            consent_source.contains(&expected),
+            "desktop consent must submit the exact handling profile accepted by the gateway"
+        );
+    }
+
+    #[test]
     fn handling_profile_and_structured_response_semantics_are_exact() {
         let mut wrong_profile = request();
         wrong_profile.route.handling.profile_id = "openai-responses-default-future".to_owned();

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   InterventionExplanationView,
   InterventionFeedbackInput,
@@ -13,20 +13,38 @@ interface Props {
   disabled: boolean;
   interventions: InterventionView[];
   resources: ResourceView[];
+  activatedExplanation?: InterventionExplanationView | null;
   onExplain: (input: { interventionId: string }) => Promise<InterventionExplanationView>;
   onFeedback: (input: InterventionFeedbackInput) => Promise<InterventionView>;
   onHistory: (input: InterventionHistoryInput) => Promise<InterventionHistoryView>;
 }
 
-export function InterventionPanel({ disabled, interventions, resources, onExplain, onFeedback, onHistory }: Props) {
+export function InterventionPanel({ disabled, interventions, resources, activatedExplanation, onExplain, onFeedback, onHistory }: Props) {
   const [explanation, setExplanation] = useState<InterventionExplanationView | null>(null);
+  const [selectedInterventionId, setSelectedInterventionId] = useState<string | null>(null);
   const [queriedHistory, setQueriedHistory] = useState<InterventionHistoryView | null>(null);
   const [correctionFor, setCorrectionFor] = useState<string | null>(null);
   const [correction, setCorrection] = useState("");
   const [resourceId, setResourceId] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [historyPending, setHistoryPending] = useState(false);
+  const panelRef = useRef<HTMLElement>(null);
+  const explanationRef = useRef<HTMLElement>(null);
   const visibleInterventions = queriedHistory?.entries ?? interventions;
+
+  useEffect(() => {
+    if (!activatedExplanation) return;
+    setExplanation(activatedExplanation);
+    setSelectedInterventionId(activatedExplanation.interventionId);
+    setQueriedHistory(null);
+    setCorrectionFor(null);
+    setMessage(null);
+    const focusTimer = window.setTimeout(() => {
+      panelRef.current?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+      explanationRef.current?.focus({ preventScroll: true });
+    }, 0);
+    return () => window.clearTimeout(focusTimer);
+  }, [activatedExplanation]);
 
   async function loadHistory(before?: string) {
     setMessage(null);
@@ -52,6 +70,7 @@ export function InterventionPanel({ disabled, interventions, resources, onExplai
     setMessage(null);
     try {
       setExplanation(await onExplain({ interventionId }));
+      setSelectedInterventionId(interventionId);
     } catch (caught) {
       setMessage((caught as PublicErrorView).summary ?? "CORE could not explain this intervention.");
     }
@@ -94,7 +113,7 @@ export function InterventionPanel({ disabled, interventions, resources, onExplai
   }
 
   return (
-    <section className="panel span-2" aria-labelledby="interventions-title">
+    <section className="panel span-2" aria-labelledby="interventions-title" ref={panelRef}>
       <div className="panel__header">
         <div><p className="eyebrow">Inspectable intervention decisions</p><h2 id="interventions-title">Intervention history</h2></div>
         <div className="button-row">
@@ -107,7 +126,7 @@ export function InterventionPanel({ disabled, interventions, resources, onExplai
       <div className="history-layout">
         <div className="record-stack">
           {visibleInterventions.length === 0 ? <p className="empty-inline">No intervention or missed-delivery history exists.</p> : visibleInterventions.map((intervention) => (
-            <article className="record-card" key={intervention.id}>
+            <article className={selectedInterventionId === intervention.id ? "record-card record-card--selected" : "record-card"} aria-current={selectedInterventionId === intervention.id ? "true" : undefined} key={intervention.id}>
               <div className="record-card__heading"><strong>{intervention.userVisibleText ?? "Private text expired or unavailable"}</strong><span className={`status-chip status-chip--${intervention.state}`}>{intervention.state}</span></div>
               <p>{intervention.reasonCodes.join(" · ") || "No public reason code"}</p>
               <small>
@@ -131,11 +150,20 @@ export function InterventionPanel({ disabled, interventions, resources, onExplai
           ))}
         </div>
 
-        <aside className="explanation" aria-live="polite">
+        <aside className="explanation" aria-label="Selected intervention explanation" aria-live="polite" ref={explanationRef} tabIndex={-1}>
           {explanation ? (
             <>
               <div className="record-card__heading"><strong>Why this occurred</strong><span className={`status-chip status-chip--${explanation.decision}`}>{explanation.decision}</span></div>
               <p>Policy {explanation.policyVersion} evaluated candidate revision {explanation.candidateRevision}.</p>
+              {explanation.policyTrace ? (
+                <div className="evidence-row" aria-label="Policy decision trace">
+                  <strong>Policy trace</strong>
+                  <span>
+                    Profile {explanation.policyTrace.policyProfileId} · preferences revision {explanation.policyTrace.userPreferencesRevision} · input schema {explanation.policyTrace.inputSchemaVersion}
+                  </span>
+                  <small><code>{explanation.policyTrace.inputDigestSha256}</code></small>
+                </div>
+              ) : <p className="blocker-note">This legacy decision has no content-free policy trace.</p>}
               <div className="token-row">{explanation.decisionReasonCodes.map((reason) => <code key={reason}>{reason}</code>)}</div>
               <h3>Content-free evidence</h3>
               {explanation.evidence.length === 0 ? <p>No evidence summary is available.</p> : explanation.evidence.map((evidence, index) => (

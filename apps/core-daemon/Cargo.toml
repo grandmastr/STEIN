@@ -21,6 +21,11 @@ production-private-endpoint = [
     "dep:windows",
     "dep:windows-sys",
 ]
+production-edge-producer = [
+    "production-private-endpoint",
+    "dep:stein-broker-windows",
+    "dep:tokio-util",
+]
 
 [dependencies]
 anyhow.workspace = true
@@ -28,12 +33,15 @@ clap.workspace = true
 stein-core = { path = "../../crates/stein-core" }
 stein-ipc = { path = "../../crates/stein-ipc" }
 tokio.workspace = true
+tokio-util = { workspace = true, optional = true }
+time.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 stein-model-openai = { path = "../../crates/stein-model-openai", optional = true }
+stein-broker-windows = { path = "../../crates/stein-broker-windows", optional = true }
 stein-platform-windows = { path = "../../crates/stein-platform-windows", optional = true }
 stein-store-sqlite = { path = "../../crates/stein-store-sqlite", optional = true }
 windows = { version = "0.61", optional = true, features = [

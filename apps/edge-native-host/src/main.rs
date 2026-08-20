@@ -1,6 +1,9 @@
 #[cfg(all(windows, feature = "production-edge-host"))]
-fn main() -> std::process::ExitCode {
-    use stein_edge_native_host::connect_os_authenticated_core_ingress;
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    use std::io;
+
+    use stein_edge_native_host::{connect_os_authenticated_core_ingress, run_producer_bridge};
     use stein_platform_windows::{
         EdgeNativeHostLaunchPolicy, verify_current_edge_native_host_launch,
     };
@@ -23,13 +26,28 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     };
 
-    // Launch evidence is not release-managed extension provenance and does not
-    // confer CORE authority. Until the dedicated OS broker lands, do not read
-    // stdin, write content, or fall back to same-user IPC.
-    if connect_os_authenticated_core_ingress().is_err() {
+    let Some(core_executable) = decode_sha256(env!("STEIN_EMBEDDED_CORE_EXECUTABLE_SHA256")) else {
         return std::process::ExitCode::FAILURE;
+    };
+    // Launch evidence is supporting provenance only. The fixed producer pipe
+    // additionally verifies the exact signed CORE server before stdin is read.
+    let Ok(mut connection) = connect_os_authenticated_core_ingress(core_executable).await else {
+        return std::process::ExitCode::FAILURE;
+    };
+    let mut input = io::stdin().lock();
+    let mut output = io::stdout().lock();
+    match run_producer_bridge(
+        &mut connection,
+        &mut input,
+        &mut output,
+        env!("STEIN_EMBEDDED_EDGE_EXTENSION_ID"),
+        env!("STEIN_EMBEDDED_EDGE_EXTENSION_VERSION"),
+    )
+    .await
+    {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(_) => std::process::ExitCode::FAILURE,
     }
-    std::process::ExitCode::FAILURE
 }
 
 #[cfg(not(all(windows, feature = "production-edge-host")))]

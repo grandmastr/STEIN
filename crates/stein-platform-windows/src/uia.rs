@@ -6,6 +6,7 @@
 //! membership before and after reading visible TextPattern ranges.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,12 +24,43 @@ use crate::selected_resource::redact_selected_text;
 use crate::uia_binding::WindowsUiaWindowBinding;
 
 pub(crate) const MAXIMUM_UIA_TEXT_BYTES: usize = 16 * 1024;
+pub(crate) const MAXIMUM_WINDOW_METADATA_BYTES: usize = 2 * 1024;
 const MAXIMUM_UIA_ELEMENTS: i32 = 1_024;
 const MAXIMUM_VISIBLE_RANGES: i32 = 256;
 const MAXIMUM_RAW_UTF16_UNITS: usize = MAXIMUM_UIA_TEXT_BYTES / 4;
 pub(crate) const UIA_OPERATION_DEADLINE: Duration = Duration::from_secs(2);
 const UIA_SELECTION_DEADLINE: Duration = Duration::from_secs(30);
 const UIA_CANCELLATION_POLL: Duration = Duration::from_millis(50);
+const MAXIMUM_DISPOSABLE_UIA_WORKERS: usize = 16;
+static DISPOSABLE_UIA_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+struct DisposableUiaWorkerLease {
+    workers: &'static AtomicUsize,
+}
+
+impl DisposableUiaWorkerLease {
+    fn reserve() -> Result<Self, UiaInvocationError> {
+        Self::reserve_from(&DISPOSABLE_UIA_WORKERS, MAXIMUM_DISPOSABLE_UIA_WORKERS)
+    }
+
+    fn reserve_from(
+        workers: &'static AtomicUsize,
+        maximum: usize,
+    ) -> Result<Self, UiaInvocationError> {
+        workers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |workers| {
+                (workers < maximum).then_some(workers + 1)
+            })
+            .map(|_| Self { workers })
+            .map_err(|_| UiaInvocationError::WorkerLost)
+    }
+}
+
+impl Drop for DisposableUiaWorkerLease {
+    fn drop(&mut self) {
+        self.workers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WindowPickerAction {
@@ -106,9 +138,32 @@ impl std::fmt::Debug for VisibleTextSample {
     }
 }
 
+pub(crate) struct WindowMetadataSample {
+    pub(crate) text: String,
+    pub(crate) complete: bool,
+    pub(crate) fingerprint: u64,
+}
+
+impl Drop for WindowMetadataSample {
+    fn drop(&mut self) {
+        self.text.zeroize();
+    }
+}
+
+impl std::fmt::Debug for WindowMetadataSample {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WindowMetadataSample")
+            .field("bytes", &self.text.len())
+            .field("complete", &self.complete)
+            .finish_non_exhaustive()
+    }
+}
+
 pub(crate) trait UiaTextSource: Send + Sync {
     fn revalidate(&self) -> Result<(), UiaError>;
     fn read_visible_text(&self, maximum_bytes: usize) -> Result<VisibleTextSample, UiaError>;
+    fn read_window_metadata(&self, maximum_bytes: usize) -> Result<WindowMetadataSample, UiaError>;
 }
 
 pub(crate) trait UiaTextSourceFactory: Send + Sync {
@@ -161,11 +216,13 @@ impl UiaTextSourceFactory for NativeUiaTextSourceFactory {
 enum UiaOperation {
     Revalidate,
     Read(usize),
+    ReadMetadata(usize),
 }
 
 enum UiaOperationResult {
     Revalidated(Result<(), UiaError>),
     Read(Result<VisibleTextSample, UiaError>),
+    ReadMetadata(Result<WindowMetadataSample, UiaError>),
 }
 
 pub(crate) fn bounded_uia_revalidate(
@@ -180,7 +237,9 @@ pub(crate) fn bounded_uia_revalidate(
         stop_cancellation,
     )? {
         UiaOperationResult::Revalidated(result) => result.map_err(UiaInvocationError::Source),
-        UiaOperationResult::Read(_) => Err(UiaInvocationError::WorkerLost),
+        UiaOperationResult::Read(_) | UiaOperationResult::ReadMetadata(_) => {
+            Err(UiaInvocationError::WorkerLost)
+        }
     }
 }
 
@@ -197,7 +256,28 @@ pub(crate) fn bounded_uia_read(
         stop_cancellation,
     )? {
         UiaOperationResult::Read(result) => result.map_err(UiaInvocationError::Source),
-        UiaOperationResult::Revalidated(_) => Err(UiaInvocationError::WorkerLost),
+        UiaOperationResult::Revalidated(_) | UiaOperationResult::ReadMetadata(_) => {
+            Err(UiaInvocationError::WorkerLost)
+        }
+    }
+}
+
+pub(crate) fn bounded_uia_read_window_metadata(
+    source: Arc<dyn UiaTextSource>,
+    maximum_bytes: usize,
+    external_cancellation: &CancellationToken,
+    stop_cancellation: &CancellationToken,
+) -> Result<WindowMetadataSample, UiaInvocationError> {
+    match invoke_uia(
+        source,
+        UiaOperation::ReadMetadata(maximum_bytes),
+        external_cancellation,
+        stop_cancellation,
+    )? {
+        UiaOperationResult::ReadMetadata(result) => result.map_err(UiaInvocationError::Source),
+        UiaOperationResult::Revalidated(_) | UiaOperationResult::Read(_) => {
+            Err(UiaInvocationError::WorkerLost)
+        }
     }
 }
 
@@ -207,14 +287,22 @@ fn invoke_uia(
     external_cancellation: &CancellationToken,
     stop_cancellation: &CancellationToken,
 ) -> Result<UiaOperationResult, UiaInvocationError> {
+    // A provider call cannot be forcibly cancelled once it enters foreign COM
+    // code. Keep the caller bounded and also cap the process-wide number of
+    // disposable workers that a set of permanently hung providers can retain.
+    let worker_lease = DisposableUiaWorkerLease::reserve()?;
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::Builder::new()
         .name("stein-uia-disposable-operation".to_owned())
         .spawn(move || {
+            let _worker_lease = worker_lease;
             let result = match operation {
                 UiaOperation::Revalidate => UiaOperationResult::Revalidated(source.revalidate()),
                 UiaOperation::Read(maximum_bytes) => {
                     UiaOperationResult::Read(source.read_visible_text(maximum_bytes))
+                }
+                UiaOperation::ReadMetadata(maximum_bytes) => {
+                    UiaOperationResult::ReadMetadata(source.read_window_metadata(maximum_bytes))
                 }
             };
             // A timed-out or cancelled caller has dropped its receiver. In
@@ -272,6 +360,55 @@ impl UiaTextSource for NativeUiaTextSource {
             fingerprint: hasher.finish(),
         })
     }
+
+    fn read_window_metadata(&self, maximum_bytes: usize) -> Result<WindowMetadataSample, UiaError> {
+        if maximum_bytes == 0 || maximum_bytes > MAXIMUM_WINDOW_METADATA_BYTES {
+            return Err(unavailable());
+        }
+        self.revalidate()?;
+        let extracted = native::extract_window_title(self.selected.window, maximum_bytes)?;
+        self.revalidate()?;
+        let (text, redaction_complete) = normalize_window_metadata(&extracted.text, maximum_bytes);
+        let mut hasher = DefaultHasher::new();
+        text.hash(&mut hasher);
+        Ok(WindowMetadataSample {
+            text,
+            complete: extracted.complete && redaction_complete,
+            fingerprint: hasher.finish(),
+        })
+    }
+}
+
+fn normalize_window_metadata(value: &str, maximum_bytes: usize) -> (String, bool) {
+    if contains_absolute_windows_path(value) {
+        let replacement = "[PATH REDACTED]";
+        if replacement.len() <= maximum_bytes {
+            return (replacement.to_owned(), false);
+        }
+        return (String::new(), false);
+    }
+    redact_selected_text(value, maximum_bytes)
+}
+
+fn contains_absolute_windows_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.windows(3).any(|window| {
+        window[0].is_ascii_alphabetic() && window[1] == b':' && matches!(window[2], b'\\' | b'/')
+    }) || value.contains('\\')
+        || value.starts_with('/')
+        || value.contains("//")
+}
+
+fn window_title_read_is_complete(
+    observed_units: usize,
+    written_units: usize,
+    requested_units: usize,
+    text_bytes: usize,
+    maximum_bytes: usize,
+) -> bool {
+    written_units < requested_units
+        && written_units == observed_units
+        && text_bytes <= maximum_bytes
 }
 
 fn require_unlocked_session() -> Result<(), UiaError> {
@@ -328,7 +465,7 @@ mod native {
         GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GA_ROOT, GetAncestor, GetCursorPos, WindowFromPoint,
+        GA_ROOT, GetAncestor, GetCursorPos, GetWindowTextLengthW, GetWindowTextW, WindowFromPoint,
     };
     use zeroize::Zeroize;
 
@@ -343,6 +480,17 @@ mod native {
     }
 
     impl Drop for ExtractedText {
+        fn drop(&mut self) {
+            self.text.zeroize();
+        }
+    }
+
+    pub(super) struct ExtractedWindowMetadata {
+        pub(super) text: String,
+        pub(super) complete: bool,
+    }
+
+    impl Drop for ExtractedWindowMetadata {
         fn drop(&mut self) {
             self.text.zeroize();
         }
@@ -518,6 +666,71 @@ mod native {
         Err(boundary_lost())
     }
 
+    pub(super) fn extract_window_title(
+        selected_window: usize,
+        maximum_bytes: usize,
+    ) -> Result<ExtractedWindowMetadata, UiaError> {
+        if selected_window == 0 || maximum_bytes == 0 {
+            return Err(boundary_lost());
+        }
+        let window = selected_window as windows_sys::Win32::Foundation::HWND;
+        // SAFETY: the exact HWND is revalidated before and after this bounded
+        // metadata read. This call queries only the top-level caption length.
+        let declared_units = unsafe { GetWindowTextLengthW(window) };
+        if declared_units <= 0 {
+            return Err(boundary_lost());
+        }
+        let maximum_units = maximum_bytes.min(i32::MAX as usize - 1);
+        let requested_units = usize::try_from(declared_units)
+            .map_err(|_| unavailable())?
+            .min(maximum_units)
+            .saturating_add(1);
+        let mut buffer = vec![0_u16; requested_units];
+        // SAFETY: `buffer` is writable for `requested_units` UTF-16 elements;
+        // the exact selected top-level HWND remains adapter-local.
+        let written = unsafe {
+            GetWindowTextW(
+                window,
+                buffer.as_mut_ptr(),
+                i32::try_from(requested_units).map_err(|_| unavailable())?,
+            )
+        };
+        if written <= 0 {
+            buffer.zeroize();
+            return Err(boundary_lost());
+        }
+        let written = usize::try_from(written).map_err(|_| unavailable())?;
+        let mut text = String::from_utf16_lossy(&buffer[..written]);
+        buffer.zeroize();
+        // Re-read the caption length after copying. If the title grew while
+        // the bounded buffer was being filled, `GetWindowTextW` can otherwise
+        // look complete solely because the earlier length fit the buffer.
+        // SAFETY: this repeats the metadata-only length query for the same
+        // HWND, which the caller revalidates again before publishing.
+        let observed_units = unsafe { GetWindowTextLengthW(window) };
+        if observed_units <= 0 {
+            text.zeroize();
+            return Err(boundary_lost());
+        }
+        let complete = usize::try_from(observed_units).is_ok_and(|observed| {
+            super::window_title_read_is_complete(
+                observed,
+                written,
+                requested_units,
+                text.len(),
+                maximum_bytes,
+            )
+        });
+        if text.len() > maximum_bytes {
+            let mut boundary = maximum_bytes;
+            while boundary > 0 && !text.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            text.truncate(boundary);
+        }
+        Ok(ExtractedWindowMetadata { text, complete })
+    }
+
     fn extract_pattern(
         pattern: &IUIAutomationTextPattern,
         selected_window: usize,
@@ -634,6 +847,18 @@ mod tests {
                 fingerprint: 1,
             })
         }
+
+        fn read_window_metadata(
+            &self,
+            _maximum_bytes: usize,
+        ) -> Result<WindowMetadataSample, UiaError> {
+            thread::sleep(self.delay);
+            Ok(WindowMetadataSample {
+                text: "synthetic-late-title".to_owned(),
+                complete: true,
+                fingerprint: 2,
+            })
+        }
     }
 
     #[test]
@@ -646,6 +871,67 @@ mod tests {
         let debug = format!("{sample:?}");
         assert!(!debug.contains("synthetic-private-uia-text"));
         assert!(debug.contains("bytes"));
+    }
+
+    #[test]
+    fn window_metadata_debug_and_normalization_do_not_leak_paths() {
+        let sample = WindowMetadataSample {
+            text: "synthetic-private-title".to_owned(),
+            complete: true,
+            fingerprint: 7,
+        };
+        assert!(!format!("{sample:?}").contains("synthetic-private-title"));
+
+        let (redacted, complete) = normalize_window_metadata(
+            r"Project — C:\Users\Synthetic\private.md — Notepad",
+            MAXIMUM_WINDOW_METADATA_BYTES,
+        );
+        assert_eq!(redacted, "[PATH REDACTED]");
+        assert!(!complete);
+
+        for private_path in [
+            r"Project - \Device\HarddiskVolume3\Users\Synthetic\private.md",
+            r"Project - \\server\share\Synthetic\private.md",
+            "Project - //server/share/Synthetic/private.md",
+            "/Users/Synthetic/private.md - Editor",
+        ] {
+            let (redacted, complete) =
+                normalize_window_metadata(private_path, MAXIMUM_WINDOW_METADATA_BYTES);
+            assert_eq!(redacted, "[PATH REDACTED]", "{private_path}");
+            assert!(!complete, "{private_path}");
+        }
+
+        let (bounded, complete) = normalize_window_metadata(
+            &"é".repeat(MAXIMUM_WINDOW_METADATA_BYTES),
+            MAXIMUM_WINDOW_METADATA_BYTES,
+        );
+        assert!(bounded.len() <= MAXIMUM_WINDOW_METADATA_BYTES);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert!(!complete);
+    }
+
+    #[test]
+    fn caption_growth_cannot_be_reported_as_a_complete_metadata_read() {
+        assert!(window_title_read_is_complete(12, 12, 13, 12, 32));
+        assert!(!window_title_read_is_complete(20, 12, 13, 12, 32));
+        assert!(!window_title_read_is_complete(12, 12, 13, 33, 32));
+    }
+
+    #[test]
+    fn permanently_hung_uia_workers_have_a_process_wide_capacity_ceiling() {
+        static TEST_WORKERS: AtomicUsize = AtomicUsize::new(0);
+        let first = DisposableUiaWorkerLease::reserve_from(&TEST_WORKERS, 2).unwrap();
+        let second = DisposableUiaWorkerLease::reserve_from(&TEST_WORKERS, 2).unwrap();
+        assert!(matches!(
+            DisposableUiaWorkerLease::reserve_from(&TEST_WORKERS, 2),
+            Err(UiaInvocationError::WorkerLost)
+        ));
+
+        drop(first);
+        let replacement = DisposableUiaWorkerLease::reserve_from(&TEST_WORKERS, 2).unwrap();
+        assert_eq!(TEST_WORKERS.load(Ordering::Acquire), 2);
+        drop((second, replacement));
+        assert_eq!(TEST_WORKERS.load(Ordering::Acquire), 0);
     }
 
     #[test]

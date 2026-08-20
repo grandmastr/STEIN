@@ -294,8 +294,9 @@ impl CoreApplication {
                         ))
                     } else {
                         let now = time::OffsetDateTime::now_utc();
+                        let approval_id = crate::ModelRouteApprovalId::new_v7();
                         let route = crate::ModelRouteApproval {
-                            id: crate::ModelRouteApprovalId::new_v7(),
+                            id: approval_id,
                             revision: 1,
                             owner: actor.into(),
                             authenticated_client: crate::ClientId::from_uuid(
@@ -304,7 +305,9 @@ impl CoreApplication {
                             provider: input.route.provider_id.clone(),
                             account_profile: input.account_profile.clone(),
                             model: input.route.route_id.clone(),
-                            secret_ref: crate::SecretRef::new(input.route.route_id.clone()),
+                            secret_ref: crate::ModelRouteApproval::approval_scoped_secret_ref(
+                                approval_id,
+                            ),
                             placement: model_placement_from_wire(input.route.placement),
                             allowed_categories: categories,
                             handling: crate::ModelHandlingProfile {
@@ -507,15 +510,43 @@ impl CoreApplication {
                             .map_err(crate::application::second_mind_error_to_application)?;
                         let runtime = self.second_mind().clone();
                         let starting_for_activation = starting.clone();
+                        let activation_owner = starting.owner;
+                        let activation_session_id = starting.id;
                         tokio::spawn(async move {
-                            let _ = runtime
-                                .activate_focus_session(
-                                    crate::ClientAssurance::PrivateCapabilityBound,
-                                    starting_for_activation.owner,
-                                    starting_for_activation.id,
-                                    starting_for_activation.revision,
-                                )
-                                .await;
+                            let activation_runtime = runtime.clone();
+                            let activation = tokio::spawn(async move {
+                                activation_runtime
+                                    .activate_focus_session(
+                                        crate::ClientAssurance::PrivateCapabilityBound,
+                                        starting_for_activation.owner,
+                                        starting_for_activation.id,
+                                        starting_for_activation.revision,
+                                    )
+                                    .await
+                            });
+                            match activation.await {
+                                Ok(Ok(_)) => {}
+                                Ok(Err(_)) => {
+                                    let _ = runtime
+                                        .fail_detached_focus_activation(
+                                            activation_owner,
+                                            activation_session_id,
+                                            false,
+                                            "detached_activation_failed",
+                                        )
+                                        .await;
+                                }
+                                Err(_) => {
+                                    let _ = runtime
+                                        .fail_detached_focus_activation(
+                                            activation_owner,
+                                            activation_session_id,
+                                            true,
+                                            "detached_activation_panicked",
+                                        )
+                                        .await;
+                                }
+                            }
                         });
                         Ok(wire::ResponseBody::StartFocusSession(Box::new(
                             wire::StartFocusSessionResponse {
@@ -809,16 +840,11 @@ impl CoreApplication {
                         }))
                     }),
                 wire::RequestBody::RegisterSelectedResource(input) => {
-                    let kind = match input.kind {
-                        wire::SelectedResourceKind::Window => crate::ResourceKind::Window,
-                        wire::SelectedResourceKind::Document => crate::ResourceKind::Document,
-                        wire::SelectedResourceKind::Workspace => crate::ResourceKind::Workspace,
-                        _ => {
-                            return Err(invalid_application(
-                                "This resource kind does not have a daemon-owned native selector.",
-                            ));
-                        }
-                    };
+                    let kind = daemon_native_resource_kind(input.kind).ok_or_else(|| {
+                        invalid_application(
+                            "This resource kind does not have a daemon-owned native selector.",
+                        )
+                    })?;
                     let resource = self
                         .second_mind()
                         .select_and_register_resource_with_context(
@@ -983,6 +1009,20 @@ impl CoreApplication {
         .await;
 
         result.map_err(|error| error_to_wire(error, request.metadata.correlation_id))
+    }
+}
+
+const fn daemon_native_resource_kind(
+    kind: wire::SelectedResourceKind,
+) -> Option<crate::ResourceKind> {
+    match kind {
+        wire::SelectedResourceKind::Application => Some(crate::ResourceKind::Application),
+        wire::SelectedResourceKind::Window => Some(crate::ResourceKind::Window),
+        wire::SelectedResourceKind::BrowserSurface => Some(crate::ResourceKind::BrowserSurface),
+        wire::SelectedResourceKind::Document => Some(crate::ResourceKind::Document),
+        wire::SelectedResourceKind::Workspace => Some(crate::ResourceKind::Workspace),
+        wire::SelectedResourceKind::ScreenRegion => Some(crate::ResourceKind::ScreenRegion),
+        wire::SelectedResourceKind::Display => None,
     }
 }
 
@@ -1815,6 +1855,17 @@ fn explanation_to_wire(
         decision: wire::PolicyDecisionView {
             policy_decision_id: wire::PolicyDecisionId::from_uuid(decision.id.as_uuid()),
             policy_version: decision.policy_version.clone(),
+            policy_trace: decision
+                .policy_trace
+                .is_complete()
+                .then(|| wire::PolicyTraceView {
+                    policy_profile_id: decision.policy_trace.policy_profile_id.clone(),
+                    user_preferences_revision: decision.policy_trace.user_preferences_revision,
+                    proposed_input_schema_version: decision
+                        .policy_trace
+                        .proposed_input_schema_version,
+                    proposed_input_digest: decision.policy_trace.proposed_input_digest,
+                }),
             outcome: match decision.outcome {
                 crate::PolicyOutcome::Allow => wire::PolicyDecisionOutcome::Allow,
                 crate::PolicyOutcome::Deny => wire::PolicyDecisionOutcome::Deny,
@@ -2776,6 +2827,42 @@ mod tests {
                     && capability.unavailable_reason.is_none()
             }));
         }
+    }
+
+    #[test]
+    fn daemon_native_resource_kind_maps_every_supported_picker_exactly() {
+        for (wire_kind, domain_kind) in [
+            (
+                wire::SelectedResourceKind::Application,
+                crate::ResourceKind::Application,
+            ),
+            (
+                wire::SelectedResourceKind::Window,
+                crate::ResourceKind::Window,
+            ),
+            (
+                wire::SelectedResourceKind::BrowserSurface,
+                crate::ResourceKind::BrowserSurface,
+            ),
+            (
+                wire::SelectedResourceKind::Document,
+                crate::ResourceKind::Document,
+            ),
+            (
+                wire::SelectedResourceKind::Workspace,
+                crate::ResourceKind::Workspace,
+            ),
+            (
+                wire::SelectedResourceKind::ScreenRegion,
+                crate::ResourceKind::ScreenRegion,
+            ),
+        ] {
+            assert_eq!(daemon_native_resource_kind(wire_kind), Some(domain_kind));
+        }
+        assert_eq!(
+            daemon_native_resource_kind(wire::SelectedResourceKind::Display),
+            None
+        );
     }
 
     #[tokio::test]

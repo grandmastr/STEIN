@@ -72,6 +72,37 @@ where
 }
 
 #[test]
+fn policy_trace_is_additive_and_legacy_decisions_remain_readable() {
+    let mut legacy = serde_json::json!({
+        "policy_decision_id": "01990000-0000-7000-8000-000000000001",
+        "policy_version": "phase2-focus-v1",
+        "outcome": "allow",
+        "reason_codes": [],
+        "authority": [],
+        "issued_at": "2026-08-20T10:00:00Z",
+        "expires_at": "2026-08-20T10:00:30Z"
+    });
+    let legacy_decision: PolicyDecisionView = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(legacy_decision.policy_trace.is_none());
+    assert_eq!(serde_json::to_value(legacy_decision).unwrap(), legacy);
+
+    legacy.as_object_mut().unwrap().insert(
+        "policy_trace".to_owned(),
+        serde_json::json!({
+            "policy_profile_id": "phase2-focus-v1",
+            "user_preferences_revision": 7,
+            "proposed_input_schema_version": 1,
+            "proposed_input_digest": vec![9_u8; 32]
+        }),
+    );
+    let traced: PolicyDecisionView = serde_json::from_value(legacy.clone()).unwrap();
+    let trace = traced.policy_trace.as_ref().unwrap();
+    assert_eq!(trace.user_preferences_revision, 7);
+    assert_eq!(trace.proposed_input_digest, [9; 32]);
+    assert_eq!(serde_json::to_value(traced).unwrap(), legacy);
+}
+
+#[test]
 fn all_checked_in_fixtures_round_trip_without_shape_changes() {
     for name in CLIENT_FIXTURES {
         let source: Value = serde_json::from_str(&fixture_text(name)).unwrap();

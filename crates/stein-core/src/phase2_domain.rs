@@ -324,6 +324,16 @@ pub struct ModelRouteApproval {
 }
 
 impl ModelRouteApproval {
+    #[must_use]
+    pub fn approval_scoped_secret_ref(id: ModelRouteApprovalId) -> crate::SecretRef {
+        crate::SecretRef::new(id.as_uuid().to_string())
+    }
+
+    #[must_use]
+    pub fn has_approval_scoped_secret_ref(&self) -> bool {
+        self.secret_ref == Self::approval_scoped_secret_ref(self.id)
+    }
+
     pub fn is_current_at(&self, now: OffsetDateTime) -> bool {
         self.revoked_at.is_none()
             && self.effective_at <= now
@@ -461,6 +471,33 @@ pub enum PolicyOutcome {
     RequireConfirmation,
 }
 
+/// Content-free provenance for one deterministic policy evaluation.
+///
+/// The digest is SHA-256 over the canonical, versioned typed input projection
+/// used by that evaluation. The projection may include private inputs while it
+/// is evaluated, but only this digest is durable. A default trace exists solely
+/// so records written before this field was introduced remain readable; it is
+/// deliberately invalid for delivery authority.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PolicyTrace {
+    pub policy_profile_id: String,
+    pub user_preferences_revision: u64,
+    pub proposed_input_schema_version: u16,
+    pub proposed_input_digest: [u8; 32],
+}
+
+impl PolicyTrace {
+    pub const INPUT_SCHEMA_V1: u16 = 1;
+
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        !self.policy_profile_id.is_empty()
+            && self.user_preferences_revision > 0
+            && self.proposed_input_schema_version == Self::INPUT_SCHEMA_V1
+            && self.proposed_input_digest != [0; 32]
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PolicyDecision {
     pub id: PolicyDecisionId,
@@ -474,6 +511,10 @@ pub struct PolicyDecision {
     pub model_route_revision: u64,
     pub channel: String,
     pub policy_version: String,
+    /// Defaults only to decode legacy records. Default/empty traces are never
+    /// accepted by the delivery action boundary.
+    #[serde(default)]
+    pub policy_trace: PolicyTrace,
     pub issued_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
 }
@@ -486,6 +527,7 @@ pub enum AuditKind {
     ModelRouteApproved,
     ModelRouteRevoked,
     FocusSessionStateChanged,
+    SignificanceDecision,
     InterventionDecision,
     InterventionDelivery,
     InterventionOutcome,
@@ -521,6 +563,10 @@ pub struct AuditRecord {
     pub evidence_categories: BTreeSet<DataCategory>,
     pub evidence_age_ms: Option<u64>,
     pub confidence_basis_points: Option<u16>,
+    /// Present for significance and intervention policy audits. Other audit
+    /// classes remain content-minimal and legacy records decode as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_trace: Option<PolicyTrace>,
     pub occurred_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
 }

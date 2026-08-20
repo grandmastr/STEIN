@@ -936,6 +936,15 @@ pub struct EvidenceView {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PolicyTraceView {
+    pub policy_profile_id: String,
+    pub user_preferences_revision: u64,
+    pub input_schema_version: u16,
+    pub input_digest_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InterventionExplanationView {
     pub intervention_id: String,
     pub candidate_revision: u64,
@@ -943,6 +952,8 @@ pub struct InterventionExplanationView {
     pub evidence: Vec<EvidenceView>,
     pub policy_decision_id: String,
     pub policy_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_trace: Option<PolicyTraceView>,
     pub decision: String,
     pub decision_reason_codes: Vec<String>,
     pub decision_issued_at: String,
@@ -994,6 +1005,16 @@ impl InterventionExplanationView {
                 .collect(),
             policy_decision_id: explanation.decision.policy_decision_id.to_string(),
             policy_version: explanation.decision.policy_version.clone(),
+            policy_trace: explanation
+                .decision
+                .policy_trace
+                .as_ref()
+                .map(|trace| PolicyTraceView {
+                    policy_profile_id: trace.policy_profile_id.clone(),
+                    user_preferences_revision: trace.user_preferences_revision,
+                    input_schema_version: trace.proposed_input_schema_version,
+                    input_digest_sha256: lowercase_hex(&trace.proposed_input_digest),
+                }),
             decision: snake_debug(explanation.decision.outcome),
             decision_reason_codes: explanation
                 .decision
@@ -1010,6 +1031,16 @@ impl InterventionExplanationView {
             correction_recorded: explanation.correction_recorded,
         }
     }
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1152,19 +1183,6 @@ pub struct AbandonGoalInput {
     pub goal_id: String,
     pub expected_revision: u64,
     pub reason: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct StoreModelSecretInput {
-    pub route_id: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SecretMutationView {
-    pub route_id: String,
-    pub configured: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1684,5 +1702,43 @@ mod tests {
                 .map(|value| value.user_preferences_revision),
             Some(2)
         );
+    }
+
+    #[test]
+    fn intervention_explanation_retains_content_free_policy_trace() {
+        let now = UtcTimestamp::now();
+        let explanation = ProtocolExplanationView {
+            intervention_id: stein_protocol::InterventionId::new_v7(),
+            candidate_revision: 3,
+            focus_session_id: stein_protocol::FocusSessionId::new_v7(),
+            evidence: Vec::new(),
+            decision: stein_protocol::PolicyDecisionView {
+                policy_decision_id: stein_protocol::PolicyDecisionId::new_v7(),
+                policy_version: "phase2-focus-v1".to_owned(),
+                policy_trace: Some(stein_protocol::PolicyTraceView {
+                    policy_profile_id: "phase2-focus-v1".to_owned(),
+                    user_preferences_revision: 7,
+                    proposed_input_schema_version: 1,
+                    proposed_input_digest: [0xab; 32],
+                }),
+                outcome: stein_protocol::PolicyDecisionOutcome::Allow,
+                reason_codes: vec![stein_protocol::InterventionReasonCode::DeadlineNear],
+                authority: Vec::new(),
+                issued_at: now,
+                expires_at: now,
+            },
+            delivery_state: stein_protocol::InterventionState::AcceptedByChannel,
+            outcome: stein_protocol::InterventionOutcome::Unacknowledged,
+            delivered_text: Some("Synthetic intervention".to_owned()),
+            correction_recorded: false,
+        };
+
+        let view = InterventionExplanationView::from_protocol(&explanation);
+        let trace = view.policy_trace.expect("policy trace is projected");
+
+        assert_eq!(trace.policy_profile_id, "phase2-focus-v1");
+        assert_eq!(trace.user_preferences_revision, 7);
+        assert_eq!(trace.input_schema_version, 1);
+        assert_eq!(trace.input_digest_sha256, "ab".repeat(32));
     }
 }

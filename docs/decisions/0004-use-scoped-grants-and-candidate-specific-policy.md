@@ -103,6 +103,16 @@ a persistent, revocable model-route approval and does not repeat an unchanged
 provider disclosure for every session. The slice creates no external tool or
 action grant.
 
+CORE validates the resource kind when it creates the grant, rather than waiting
+for a platform adapter to reject it later. Foreground-application, selected
+window metadata, browser location, selected-document, selected-workspace, and
+bounded-pixel grants require `Application`, `Window`, `BrowserSurface`,
+`Document`, `Workspace`, and `ScreenRegion` resources, respectively. Visible
+text accepts either a selected `Window` for UI Automation or a selected
+`BrowserSurface` for the browser producer. Presence, reasoning, and notification
+grants have no selected resource. A mismatched kind creates no grant or audit
+authority.
+
 ### Policy decisions
 
 A policy decision is `allow`, `deny`, or `require_confirmation` and is bound to:
@@ -123,6 +133,22 @@ new user-authorized decision for the same candidate, subject to revalidation.
 A decision reference is not a bearer secret. The action boundary loads it from
 the policy owner and verifies candidate, grant, context, channel, and expiry
 again immediately before the consequential operation.
+
+Each deterministic significance evaluation and candidate-specific intervention
+decision also records a content-free `PolicyTrace`: the exact versioned policy
+profile, the effective `UserPreferencesV1` revision, the canonical policy-input
+schema version, and a SHA-256 digest of that exact typed input projection. The
+projection may contain private candidate/context values only transiently while
+the digest is calculated; neither it nor those values enter policy or audit
+storage. The correlated policy audit carries the same trace. A legacy record
+whose trace is absent/defaulted remains readable for migration compatibility but
+cannot authorize delivery.
+
+The final delivery check requires the current policy-profile and preference,
+model-route, and grant revisions to equal the decision references. Any mismatch
+fails closed. A recovered outbox item receives a new decision and digest only
+after current inputs are revalidated; it never inherits an old trace as fresh
+authority.
 
 ### Direct user actions
 
@@ -185,6 +211,8 @@ the Phase 0 trust rules require a record before delivery.
   decision references cannot create authority.
 - Explanation fixtures identify the scopes and reason codes used without
   exposing tokens or unnecessary private data.
+- Golden policy/audit fixtures match the exact policy trace, change digest when
+  an input changes, and contain no unhashed private policy input.
 - Removing any required audit acknowledgement fails closed for proactive
   delivery.
 

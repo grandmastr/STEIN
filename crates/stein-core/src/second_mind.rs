@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -15,20 +17,22 @@ use crate::{
     ActorId, AuditKind, AuditRecord, AuditRecordId, CandidateId, CapabilityHealth, CapabilityState,
     ChannelAcknowledgement, ClientId, Clock, CreateGoal, DataCategory, DoNotDisturbWindow,
     DurableRepository, EmergencyCommand, EmergencyCommandAcknowledgement, EmergencyCommandStatus,
-    EmergencyControlPort, ExplicitPreferences, FocusSession, FocusSessionId, FocusSessionState,
-    Goal, GoalCreateReceipt, GoalId, GoalPatch, GoalState, GrantState, Intervention,
-    InterventionDecisionWrite, InterventionId, InterventionOutcome, InterventionState,
-    ModelGateway, ModelGatewayErrorKind, ModelReasoningOutput, ModelReasoningRequest,
-    ModelRouteApproval, ModelRouteApprovalId, NativeCaptureStatus, NativeResourceBinding,
-    NativeResourceStatus, NativeStatusAcknowledgement, NativeStatusHeartbeat, NativeStatusPort,
-    NormalizedObservation, NormalizedObservationValue, NotificationDelivery, NotificationPort,
-    ObservationAdapterEvent, ObservationLimits, ObservationPort, ObservationSourceStatus,
-    ObservationStartRequest, ObservationSubscription, OperationKind, OperationReceipt,
-    OutboxEntryId, OutboxState, PendingInterventionDelivery, PermissionGrant, PermissionGrantId,
-    PermissionScope, PlatformPortAvailability, PolicyDecision, PolicyDecisionId, PolicyOutcome,
-    RepositoryError, RepositoryErrorKind, ResourceBinding, ResourceId, ResourceSelectionErrorKind,
-    ResourceSelectionPort, Revision, SecretStore, SensitiveText, SteinIdentity, SystemClock,
-    USER_PREFERENCES_SCHEMA_V1, UpdateGoal, Urgency, WorkingContextItem,
+    EmergencyControlPort, ExplicitPreferences, FocusSession, FocusSessionId,
+    FocusSessionLifecycleWrite, FocusSessionState, Goal, GoalCreateReceipt, GoalId, GoalPatch,
+    GoalState, GrantState, Intervention, InterventionDecisionWrite, InterventionId,
+    InterventionOutcome, InterventionState, InterventionTransitionWrite, ModelGateway,
+    ModelGatewayErrorKind, ModelReasoningOutput, ModelReasoningRequest, ModelRouteApproval,
+    ModelRouteApprovalId, NativeCaptureStatus, NativeResourceBinding, NativeResourceStatus,
+    NativeStatusAcknowledgement, NativeStatusHeartbeat, NativeStatusPort, NormalizedObservation,
+    NormalizedObservationValue, NotificationDelivery, NotificationPort, ObservationAdapterEvent,
+    ObservationLimits, ObservationPort, ObservationSourceStatus, ObservationStartRequest,
+    ObservationSubscription, OperationKind, OperationReceipt, OutboxEntryId, OutboxState,
+    PendingDeliveryTransition, PendingInterventionDelivery, PermissionGrant, PermissionGrantId,
+    PermissionGrantRevocationWrite, PermissionScope, PlatformPortAvailability, PolicyDecision,
+    PolicyDecisionId, PolicyOutcome, PolicyTrace, RepositoryError, RepositoryErrorKind,
+    ResourceBinding, ResourceId, ResourceKind, ResourceSelectionErrorKind, ResourceSelectionPort,
+    Revision, SecretStore, SensitiveText, SteinIdentity, SystemClock, USER_PREFERENCES_SCHEMA_V1,
+    UpdateGoal, Urgency, WorkingContextItem,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -273,11 +277,26 @@ pub struct RetentionMaintenanceResult {
     pub purged_audit_records: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CleanupMaintenanceResult {
+    pub native_resource_attempts: usize,
+    pub native_resource_completed: usize,
+    pub native_resource_pending: usize,
+    pub secret_deletion_attempts: usize,
+    pub secret_deletion_completed: usize,
+    pub secret_deletion_pending: usize,
+}
+
 #[derive(Clone, Debug)]
 struct EphemeralSession {
     observations: VecDeque<NormalizedObservation>,
     source_health: BTreeMap<PermissionGrantId, ObservationSourceStatus>,
+    /// Owns observation/status lifecycle cancellation for the whole session.
     cancellation: CancellationToken,
+    /// Separately gates model use and intervention delivery. Direct-user mute
+    /// and proactive preference changes cancel this token without stopping
+    /// observation authority.
+    proactive_cancellation: CancellationToken,
     last_delivery_elapsed: Option<Duration>,
     intervention_count: u16,
     presence: crate::PresenceState,
@@ -294,10 +313,18 @@ struct EphemeralSession {
 
 impl Default for EphemeralSession {
     fn default() -> Self {
+        Self::with_cancellation(CancellationToken::new())
+    }
+}
+
+impl EphemeralSession {
+    fn with_cancellation(cancellation: CancellationToken) -> Self {
+        let proactive_cancellation = cancellation.child_token();
         Self {
             observations: VecDeque::new(),
             source_health: BTreeMap::new(),
-            cancellation: CancellationToken::new(),
+            cancellation,
+            proactive_cancellation,
             last_delivery_elapsed: None,
             intervention_count: 0,
             presence: crate::PresenceState::Unknown,
@@ -317,7 +344,21 @@ impl Default for EphemeralSession {
 #[derive(Default)]
 struct EphemeralState {
     sessions: HashMap<FocusSessionId, EphemeralSession>,
+    activations: BTreeSet<FocusSessionId>,
     last_recovery_batch_elapsed: HashMap<ActorId, Duration>,
+}
+
+struct FocusActivationPermit {
+    ephemeral: Arc<Mutex<EphemeralState>>,
+    session_id: FocusSessionId,
+}
+
+impl Drop for FocusActivationPermit {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.ephemeral.lock() {
+            state.activations.remove(&self.session_id);
+        }
+    }
 }
 
 struct ModelRequestPermit {
@@ -355,6 +396,7 @@ struct AuditDetails {
     evidence_categories: BTreeSet<DataCategory>,
     evidence_age_ms: Option<u64>,
     confidence_basis_points: Option<u16>,
+    policy_trace: Option<PolicyTrace>,
 }
 
 impl AuditDetails {
@@ -364,6 +406,7 @@ impl AuditDetails {
             evidence_categories,
             evidence_age_ms: None,
             confidence_basis_points: None,
+            policy_trace: None,
         }
     }
 
@@ -376,10 +419,208 @@ impl AuditDetails {
         self.confidence_basis_points = Some(confidence_basis_points);
         self
     }
+
+    fn with_policy_trace(mut self, policy_trace: PolicyTrace) -> Self {
+        self.policy_trace = Some(policy_trace);
+        self
+    }
+
+    fn with_optional_policy_trace(mut self, policy_trace: Option<PolicyTrace>) -> Self {
+        self.policy_trace = policy_trace;
+        self
+    }
 }
 
 const NATIVE_NOTIFICATION_CHANNEL: &str = "windows.native_notification";
 const POLICY_PROFILE_ID: &str = "phase2-focus-v1";
+
+#[derive(Serialize)]
+struct PolicyContextInputV1<'a> {
+    category: DataCategory,
+    value: &'a str,
+    source_id: &'a str,
+    resource_id: Option<Uuid>,
+    observed_at: OffsetDateTime,
+    age_ms: u64,
+    confidence_basis_points: u16,
+}
+
+impl<'a> From<&'a WorkingContextItem> for PolicyContextInputV1<'a> {
+    fn from(value: &'a WorkingContextItem) -> Self {
+        Self {
+            category: value.category,
+            value: value.value.expose(),
+            source_id: &value.source_id,
+            resource_id: value.resource_id.map(ResourceId::as_uuid),
+            observed_at: value.observed_at,
+            age_ms: value.age_ms,
+            confidence_basis_points: value.confidence_basis_points,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct EffectivePreferencesInputV1<'a> {
+    revision: u64,
+    maximum_interventions_per_session: u16,
+    maximum_model_requests_per_hour: u16,
+    intervention_cooldown_ms: u64,
+    proactive_interventions_enabled: bool,
+    proactive_interventions_muted: bool,
+    do_not_disturb_windows: &'a [DoNotDisturbWindow],
+    allowed_delivery_channels: &'a BTreeSet<String>,
+    remote_processing_enabled: bool,
+    restart_continuity_default: bool,
+}
+
+impl<'a> From<&'a EffectivePreferences> for EffectivePreferencesInputV1<'a> {
+    fn from(value: &'a EffectivePreferences) -> Self {
+        Self {
+            revision: value.revision,
+            maximum_interventions_per_session: value.maximum_interventions_per_session,
+            maximum_model_requests_per_hour: value.maximum_model_requests_per_hour,
+            intervention_cooldown_ms: duration_millis_u64(value.intervention_cooldown),
+            proactive_interventions_enabled: value.proactive_interventions_enabled,
+            proactive_interventions_muted: value.proactive_interventions_muted,
+            do_not_disturb_windows: &value.do_not_disturb_windows,
+            allowed_delivery_channels: &value.allowed_delivery_channels,
+            remote_processing_enabled: value.remote_processing_enabled,
+            restart_continuity_default: value.restart_continuity_default,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SignificancePolicyInputV1<'a> {
+    schema: &'static str,
+    policy_profile_id: &'static str,
+    preferences: EffectivePreferencesInputV1<'a>,
+    owner: Uuid,
+    focus_session_id: Uuid,
+    focus_session_revision: u64,
+    goal_id: Uuid,
+    goal_revision: u64,
+    goal_deadline: Option<OffsetDateTime>,
+    evaluated_at: OffsetDateTime,
+    monotonic_elapsed_ms: u64,
+    deadline_risk_horizon_ms: u64,
+    evaluation_interval_ms: u64,
+    significance_generation: u64,
+    last_evaluated_generation: u64,
+    prior_deadline_risk_active: bool,
+    deadline_risk_active: bool,
+    last_evaluation_elapsed_ms: Option<u64>,
+    context: Vec<PolicyContextInputV1<'a>>,
+}
+
+enum SignificanceGateResult {
+    Skipped(&'static str),
+    Evaluated {
+        reason_code: Option<&'static str>,
+        policy_trace: PolicyTrace,
+    },
+}
+
+#[derive(Serialize)]
+struct PriorInterventionPolicyInputV1 {
+    intervention_id: Uuid,
+    candidate_id: Uuid,
+    candidate_revision: u64,
+    focus_session_id: Uuid,
+    state: InterventionState,
+    updated_at: OffsetDateTime,
+}
+
+#[derive(Serialize)]
+struct PendingDeliveryPolicyInputV1 {
+    entry_id: Uuid,
+    intervention_id: Uuid,
+    state: OutboxState,
+}
+
+#[derive(Serialize)]
+struct InterventionPolicyInputV1<'a> {
+    schema: &'static str,
+    policy_profile_id: &'static str,
+    preferences: EffectivePreferencesInputV1<'a>,
+    evaluated_at: OffsetDateTime,
+    owner: Uuid,
+    focus_session_id: Uuid,
+    focus_session_revision: u64,
+    goal_id: Uuid,
+    goal_revision: u64,
+    goal_state: GoalState,
+    goal_deadline: Option<OffsetDateTime>,
+    session_muted: bool,
+    candidate_id: Uuid,
+    candidate_revision: u64,
+    user_visible_text: &'a str,
+    reason_code: &'a str,
+    evidence_summary: &'a str,
+    urgency: Urgency,
+    confidence_basis_points: u16,
+    context: Vec<PolicyContextInputV1<'a>>,
+    permission_grant_revisions: Vec<(Uuid, u64)>,
+    model_route_approval_id: Uuid,
+    model_route_revision: u64,
+    channel: &'static str,
+    notification_available: bool,
+    prior_interventions: Vec<PriorInterventionPolicyInputV1>,
+    pending_deliveries: Vec<PendingDeliveryPolicyInputV1>,
+    ephemeral_intervention_count: u16,
+    ephemeral_presence: &'static str,
+    ephemeral_last_delivery_elapsed_ms: Option<u64>,
+    monotonic_elapsed_ms: u64,
+}
+
+#[derive(Serialize)]
+struct RecoveryPolicyInputV1<'a> {
+    schema: &'static str,
+    policy_profile_id: &'static str,
+    preferences: EffectivePreferencesInputV1<'a>,
+    evaluated_at: OffsetDateTime,
+    owner: Uuid,
+    focus_session_id: Uuid,
+    focus_session_revision: u64,
+    focus_session_state: FocusSessionState,
+    focus_session_muted: bool,
+    goal_id: Uuid,
+    goal_revision: u64,
+    goal_state: GoalState,
+    goal_deadline: Option<OffsetDateTime>,
+    model_route_approval_id: Uuid,
+    model_route_revision: u64,
+    permission_grant_revisions: Vec<(Uuid, u64)>,
+    intervention_id: Uuid,
+    intervention_revision: u64,
+    candidate_id: Uuid,
+    candidate_revision: u64,
+    prior_policy_decision_id: Uuid,
+    prior_policy_trace_digest: [u8; 32],
+    outbox_entry_id: Uuid,
+    queued_text: &'a str,
+    reason_code: &'a str,
+    urgency: Urgency,
+    sensitivity: &'a str,
+    permitted_channels: &'a BTreeSet<String>,
+    deduplication_key: Uuid,
+    created_at: OffsetDateTime,
+    not_before: OffsetDateTime,
+    expires_at: OffsetDateTime,
+    channel: &'static str,
+    presence_active: bool,
+    sources_healthy: bool,
+    entry_grants_current: bool,
+    decision_grants_current: bool,
+    decision_matches: bool,
+    route_current: bool,
+    goal_current: bool,
+    preferences_allow: bool,
+    duplicate_terminal: bool,
+    delivered_count: usize,
+    cooldown_active: bool,
+    notification_available: bool,
+}
 
 #[derive(Clone, Debug)]
 struct EffectivePreferences {
@@ -519,6 +760,50 @@ impl SecondMindRuntime {
         )
     }
 
+    fn acquire_focus_activation(
+        &self,
+        session_id: FocusSessionId,
+        current_revision: u64,
+    ) -> Result<FocusActivationPermit, SecondMindError> {
+        let mut state = self
+            .ephemeral
+            .lock()
+            .map_err(|_| SecondMindError::unavailable("Ephemeral context is unavailable."))?;
+        if !state.activations.insert(session_id) {
+            return Err(SecondMindError::conflict(current_revision));
+        }
+        drop(state);
+        Ok(FocusActivationPermit {
+            ephemeral: Arc::clone(&self.ephemeral),
+            session_id,
+        })
+    }
+
+    fn remove_focus_ephemeral(&self, session_id: FocusSessionId) {
+        if let Ok(mut state) = self.ephemeral.lock()
+            && let Some(ephemeral) = state.sessions.remove(&session_id)
+        {
+            ephemeral.cancellation.cancel();
+        }
+    }
+
+    async fn cleanup_focus_activation(
+        &self,
+        session_id: FocusSessionId,
+        native_status_revision: u64,
+        cancellation: &CancellationToken,
+        started: &[PermissionGrantId],
+    ) {
+        cancellation.cancel();
+        self.remove_focus_ephemeral(session_id);
+        stop_started(&*self.observation, session_id, started).await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.native_status.clear(session_id, native_status_revision),
+        )
+        .await;
+    }
+
     fn effective_preferences(
         &self,
         owner: ActorId,
@@ -532,21 +817,114 @@ impl SecondMindRuntime {
         ))
     }
 
+    fn reconcile_proactive_cancellation_for_owner(
+        &self,
+        owner: ActorId,
+        proactive_enabled: bool,
+        proactive_muted: bool,
+    ) -> Result<(), SecondMindError> {
+        let sessions = self.repository.load_focus_sessions(owner)?;
+        let mut state = self
+            .ephemeral
+            .lock()
+            .map_err(|_| SecondMindError::unavailable("Ephemeral context is unavailable."))?;
+        for session in sessions {
+            let Some(ephemeral) = state.sessions.get_mut(&session.id) else {
+                continue;
+            };
+            let allowed = session.is_working()
+                && !session.muted
+                && proactive_enabled
+                && !proactive_muted
+                && !ephemeral.cancellation.is_cancelled();
+            reconcile_proactive_cancellation(ephemeral, allowed);
+        }
+        Ok(())
+    }
+
+    fn reconcile_proactive_cancellation_for_session(
+        &self,
+        session: &FocusSession,
+        preferences: &EffectivePreferences,
+    ) -> Result<(), SecondMindError> {
+        let mut state = self
+            .ephemeral
+            .lock()
+            .map_err(|_| SecondMindError::unavailable("Ephemeral context is unavailable."))?;
+        if let Some(ephemeral) = state.sessions.get_mut(&session.id) {
+            let allowed = session.is_working()
+                && !session.muted
+                && preferences.proactive_interventions_enabled
+                && !preferences.proactive_interventions_muted
+                && !ephemeral.cancellation.is_cancelled();
+            reconcile_proactive_cancellation(ephemeral, allowed);
+        }
+        Ok(())
+    }
+
+    fn cancel_proactive_cancellation(
+        &self,
+        session_id: FocusSessionId,
+    ) -> Result<(), SecondMindError> {
+        let mut state = self
+            .ephemeral
+            .lock()
+            .map_err(|_| SecondMindError::unavailable("Ephemeral context is unavailable."))?;
+        if let Some(ephemeral) = state.sessions.get_mut(&session_id) {
+            ephemeral.proactive_cancellation.cancel();
+        }
+        Ok(())
+    }
+
+    fn policy_trace<T: Serialize>(
+        &self,
+        user_preferences_revision: u64,
+        input: &T,
+    ) -> Result<PolicyTrace, SecondMindError> {
+        let encoded = serde_json::to_vec(input).map_err(|_| {
+            SecondMindError::unavailable("The policy input could not be canonicalized.")
+        })?;
+        Ok(PolicyTrace {
+            policy_profile_id: POLICY_PROFILE_ID.to_owned(),
+            user_preferences_revision,
+            proposed_input_schema_version: PolicyTrace::INPUT_SCHEMA_V1,
+            proposed_input_digest: Sha256::digest(encoded).into(),
+        })
+    }
+
+    fn persisted_policy_trace(
+        &self,
+        decision_id: PolicyDecisionId,
+    ) -> Result<Option<PolicyTrace>, SecondMindError> {
+        Ok(self
+            .repository
+            .find_policy_decision(decision_id)?
+            .map(|decision| decision.policy_trace)
+            .filter(PolicyTrace::is_complete))
+    }
+
     fn significance_gate(
         &self,
         session: &FocusSession,
         goal: &Goal,
         context: &[WorkingContextItem],
-    ) -> Result<Option<&'static str>, SecondMindError> {
+        preferences: &EffectivePreferences,
+    ) -> Result<SignificanceGateResult, SecondMindError> {
+        let now = self.clock.now_utc();
         let elapsed = self.clock.monotonic_elapsed();
         let deadline_risk_active = goal.deadline.is_some_and(|deadline| {
-            let remaining = deadline - self.clock.now_utc();
+            let remaining = deadline - now;
             remaining.is_positive()
                 && remaining
                     <= time::Duration::try_from(self.config.deadline_risk_horizon)
                         .unwrap_or(time::Duration::MAX)
         });
-        {
+        let (
+            significance_generation,
+            last_evaluated_generation,
+            prior_deadline_risk_active,
+            last_evaluation_elapsed,
+        ) = {
             let mut state = self
                 .ephemeral
                 .lock()
@@ -554,13 +932,14 @@ impl SecondMindRuntime {
             let ephemeral = state.sessions.get_mut(&session.id).ok_or_else(|| {
                 SecondMindError::unavailable("The session has no live ephemeral context.")
             })?;
+            let prior_deadline_risk_active = ephemeral.deadline_risk_active;
             if deadline_risk_active && !ephemeral.deadline_risk_active {
                 ephemeral.significance_generation =
                     ephemeral.significance_generation.saturating_add(1);
             }
             ephemeral.deadline_risk_active = deadline_risk_active;
             if ephemeral.significance_generation == ephemeral.last_evaluated_generation {
-                return Ok(Some("no_relevant_state_change"));
+                return Ok(SignificanceGateResult::Skipped("no_relevant_state_change"));
             }
             if ephemeral
                 .last_significance_evaluation_elapsed
@@ -568,39 +947,76 @@ impl SecondMindRuntime {
                     elapsed.saturating_sub(last) < self.config.significance_evaluation_interval
                 })
             {
-                return Ok(Some("significance_rate_limited"));
+                return Ok(SignificanceGateResult::Skipped("significance_rate_limited"));
             }
+            let significance_generation = ephemeral.significance_generation;
+            let last_evaluated_generation = ephemeral.last_evaluated_generation;
+            let last_evaluation_elapsed = ephemeral.last_significance_evaluation_elapsed;
             ephemeral.last_significance_evaluation_elapsed = Some(elapsed);
             ephemeral.last_evaluated_generation = ephemeral.significance_generation;
-        }
-
-        let Some(deadline) = goal.deadline else {
-            return Ok(Some("deadline_not_configured"));
-        };
-        let remaining = deadline - self.clock.now_utc();
-        if remaining.is_negative() || remaining.is_zero() {
-            return Ok(Some("goal_deadline_elapsed"));
-        }
-        if remaining
-            > time::Duration::try_from(self.config.deadline_risk_horizon)
-                .unwrap_or(time::Duration::MAX)
-        {
-            return Ok(Some("outside_deadline_risk_horizon"));
-        }
-        if !context.iter().any(|item| {
-            matches!(
-                item.category,
-                DataCategory::Goal
-                    | DataCategory::BrowserLocation
-                    | DataCategory::VisibleText
-                    | DataCategory::SelectedDocument
-                    | DataCategory::ScreenPixels
-                    | DataCategory::WorkspaceActivity
+            (
+                significance_generation,
+                last_evaluated_generation,
+                prior_deadline_risk_active,
+                last_evaluation_elapsed,
             )
-        }) {
-            return Ok(Some("no_fresh_significant_evidence"));
-        }
-        Ok(None)
+        };
+
+        let reason_code = if let Some(deadline) = goal.deadline {
+            let remaining = deadline - now;
+            if remaining.is_negative() || remaining.is_zero() {
+                Some("goal_deadline_elapsed")
+            } else if remaining
+                > time::Duration::try_from(self.config.deadline_risk_horizon)
+                    .unwrap_or(time::Duration::MAX)
+            {
+                Some("outside_deadline_risk_horizon")
+            } else if !context.iter().any(|item| {
+                matches!(
+                    item.category,
+                    DataCategory::Goal
+                        | DataCategory::BrowserLocation
+                        | DataCategory::VisibleText
+                        | DataCategory::SelectedDocument
+                        | DataCategory::ScreenPixels
+                        | DataCategory::WorkspaceActivity
+                )
+            }) {
+                Some("no_fresh_significant_evidence")
+            } else {
+                None
+            }
+        } else {
+            Some("deadline_not_configured")
+        };
+
+        let input = SignificancePolicyInputV1 {
+            schema: "stein.significance-policy-input.v1",
+            policy_profile_id: POLICY_PROFILE_ID,
+            preferences: preferences.into(),
+            owner: session.owner.as_uuid(),
+            focus_session_id: session.id.as_uuid(),
+            focus_session_revision: session.revision,
+            goal_id: goal.id.as_uuid(),
+            goal_revision: goal.revision.get(),
+            goal_deadline: goal.deadline,
+            evaluated_at: now,
+            monotonic_elapsed_ms: duration_millis_u64(elapsed),
+            deadline_risk_horizon_ms: duration_millis_u64(self.config.deadline_risk_horizon),
+            evaluation_interval_ms: duration_millis_u64(
+                self.config.significance_evaluation_interval,
+            ),
+            significance_generation,
+            last_evaluated_generation,
+            prior_deadline_risk_active,
+            deadline_risk_active,
+            last_evaluation_elapsed_ms: last_evaluation_elapsed.map(duration_millis_u64),
+            context: context.iter().map(PolicyContextInputV1::from).collect(),
+        };
+        Ok(SignificanceGateResult::Evaluated {
+            reason_code,
+            policy_trace: self.policy_trace(preferences.revision, &input)?,
+        })
     }
 
     fn begin_model_request(
@@ -727,7 +1143,12 @@ impl SecondMindRuntime {
         intervention_id: InterventionId,
     ) -> bool {
         let now = self.clock.now_utc();
-        if decision.outcome != PolicyOutcome::Allow || now >= decision.expires_at {
+        if decision.outcome != PolicyOutcome::Allow
+            || now >= decision.expires_at
+            || !decision.policy_trace.is_complete()
+            || decision.policy_version != POLICY_PROFILE_ID
+            || decision.policy_trace.policy_profile_id != POLICY_PROFILE_ID
+        {
             return false;
         }
         let Ok(session) = find_session(&*self.repository, decision.focus_session_id) else {
@@ -757,7 +1178,8 @@ impl SecondMindRuntime {
         let Ok(preferences) = self.effective_preferences(decision.owner) else {
             return false;
         };
-        if route.revision != decision.model_route_revision
+        if decision.policy_trace.user_preferences_revision != preferences.revision
+            || route.revision != decision.model_route_revision
             || !route.is_current_at(now)
             || (route.placement == crate::ModelPlacement::Remote
                 && !preferences.remote_processing_enabled)
@@ -771,17 +1193,18 @@ impl SecondMindRuntime {
         let Ok(grants) = self.repository.load_grants(decision.owner) else {
             return false;
         };
-        if !decision
-            .permission_grant_revisions
-            .iter()
-            .all(|(id, revision)| {
-                grants.iter().any(|grant| {
-                    grant.id == *id
-                        && grant.revision == *revision
-                        && grant.focus_session_id == Some(session.id)
-                        && grant.is_current_at(now)
+        if decision.permission_grant_revisions.is_empty()
+            || !decision
+                .permission_grant_revisions
+                .iter()
+                .all(|(id, revision)| {
+                    grants.iter().any(|grant| {
+                        grant.id == *id
+                            && grant.revision == *revision
+                            && grant.focus_session_id == Some(session.id)
+                            && grant.is_current_at(now)
+                    })
                 })
-            })
         {
             return false;
         }
@@ -1022,7 +1445,9 @@ impl SecondMindRuntime {
                 EmergencyCommandStatus::Rejected
             } else {
                 match envelope.command {
-                    EmergencyCommand::OpenStein => EmergencyCommandStatus::Accepted,
+                    // CORE has no launch/presentation port. Reject instead of
+                    // acknowledging a UI action that no component performed.
+                    EmergencyCommand::OpenStein => EmergencyCommandStatus::Rejected,
                     EmergencyCommand::SetInterventionsMuted { session_id, muted } => {
                         let session = find_session(&*self.repository, session_id)?;
                         match self
@@ -1570,14 +1995,22 @@ impl SecondMindRuntime {
             version: "user-preferences-v1".to_owned(),
             recorded_at: value.updated_at,
         };
-        let effective_policy = EffectivePreferences::from_record(
+        let effective_preferences = EffectivePreferences::from_record(
             &self.config,
             value.owner,
             value.updated_at,
             Some(value.clone()),
         );
-        let effective_policy = self.effective_policy_from(effective_policy);
-        self.commit(context, |events| {
+        // Move cancellation authority before the durable preference boundary:
+        // restrictive changes stop in-flight work immediately, while enabling
+        // changes remain denied by the old durable record until the commit.
+        self.reconcile_proactive_cancellation_for_owner(
+            value.owner,
+            effective_preferences.proactive_interventions_enabled,
+            effective_preferences.proactive_interventions_muted,
+        )?;
+        let effective_policy = self.effective_policy_from(effective_preferences.clone());
+        let save_result = self.commit(context, |events| {
             self.repository
                 .save_preferences(&value, expected_revision)?;
             events.push(CoreEvent::UserPreferencesViewChanged {
@@ -1585,7 +2018,40 @@ impl SecondMindRuntime {
                 effective_policy,
             });
             Ok(())
-        })?;
+        });
+        if let Err(error) = save_result {
+            // A failed permissive update must not leave newly armed authority.
+            // A failed restrictive update may remain conservatively cancelled
+            // if the current record cannot be reloaded.
+            if let Ok(current) = self.effective_preferences(value.owner) {
+                let _ = self.reconcile_proactive_cancellation_for_owner(
+                    value.owner,
+                    current.proactive_interventions_enabled,
+                    current.proactive_interventions_muted,
+                );
+            }
+            return Err(error);
+        }
+        // Reconcile once more against concurrent session mute/state changes.
+        self.reconcile_proactive_cancellation_for_owner(
+            value.owner,
+            effective_preferences.proactive_interventions_enabled,
+            effective_preferences.proactive_interventions_muted,
+        )?;
+        if !effective_preferences.proactive_interventions_enabled
+            || effective_preferences.proactive_interventions_muted
+        {
+            self.cancel_queued_interventions(
+                value.owner,
+                None,
+                if effective_preferences.proactive_interventions_muted {
+                    "interventions_muted"
+                } else {
+                    "proactive_interventions_disabled"
+                },
+                context,
+            )?;
+        }
         Ok(value)
     }
 
@@ -1745,7 +2211,9 @@ impl SecondMindRuntime {
         .await
         {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(SecondMindError::unavailable(error.summary)),
+            Ok(Err(_)) => Err(SecondMindError::unavailable(
+                "Native resource cleanup failed after durable authority changed.",
+            )),
             Err(_) => {
                 cancellation.cancel();
                 Err(SecondMindError::deadline_exceeded(
@@ -1785,6 +2253,75 @@ impl SecondMindRuntime {
                 .complete_native_resource_cleanup(owner, cleanup.resource_id)?;
         }
         Ok(())
+    }
+
+    /// Retries a bounded batch of private cleanup obligations without
+    /// recreating or consulting them as authority. Individual platform
+    /// failures remain pending and are reported only as content-free counts;
+    /// repository/invariant failures stop maintenance fail-closed.
+    pub async fn recover_cleanup_obligations(
+        &self,
+        owner: ActorId,
+    ) -> Result<CleanupMaintenanceResult, SecondMindError> {
+        let native_cleanups = self.repository.load_native_resource_cleanups(owner)?;
+        let secret_cleanups = self.repository.load_secret_deletion_cleanups(owner)?;
+        let resources = self.repository.load_resources(owner)?;
+        let routes = self.repository.load_model_routes(owner)?;
+        let mut result = CleanupMaintenanceResult {
+            native_resource_pending: native_cleanups.len(),
+            secret_deletion_pending: secret_cleanups.len(),
+            ..CleanupMaintenanceResult::default()
+        };
+
+        for mut cleanup in native_cleanups
+            .into_iter()
+            .take(self.config.recovery_batch_size)
+        {
+            if resources
+                .iter()
+                .any(|resource| resource.id == cleanup.resource_id)
+            {
+                return Err(SecondMindError::unavailable(
+                    "A native cleanup obligation still has live resource authority.",
+                ));
+            }
+            result.native_resource_attempts = result.native_resource_attempts.saturating_add(1);
+            let binding = NativeResourceBinding::new(std::mem::take(&mut cleanup.opaque_reference));
+            if self.release_native_binding(binding).await.is_ok() {
+                self.repository
+                    .complete_native_resource_cleanup(owner, cleanup.resource_id)?;
+                result.native_resource_completed =
+                    result.native_resource_completed.saturating_add(1);
+                result.native_resource_pending = result.native_resource_pending.saturating_sub(1);
+            }
+        }
+
+        for cleanup in secret_cleanups
+            .into_iter()
+            .take(self.config.recovery_batch_size)
+        {
+            let route_is_revoked = routes.iter().any(|route| {
+                route.id == cleanup.model_route_approval_id
+                    && route.owner == owner
+                    && route.revoked_at.is_some()
+                    && route.secret_ref == cleanup.secret_ref
+            });
+            if !route_is_revoked {
+                return Err(SecondMindError::unavailable(
+                    "A secret cleanup obligation is not fenced by revoked route authority.",
+                ));
+            }
+            result.secret_deletion_attempts = result.secret_deletion_attempts.saturating_add(1);
+            if self.secret_store.delete(&cleanup.secret_ref).is_ok() {
+                self.repository
+                    .complete_secret_deletion_cleanup(owner, cleanup.model_route_approval_id)?;
+                result.secret_deletion_completed =
+                    result.secret_deletion_completed.saturating_add(1);
+                result.secret_deletion_pending = result.secret_deletion_pending.saturating_sub(1);
+            }
+        }
+
+        Ok(result)
     }
 
     pub(crate) fn save_resource_binding_with_context(
@@ -1943,16 +2480,32 @@ impl SecondMindRuntime {
                 "Only an active goal can receive a focus-session permission.",
             ));
         }
-        if let Some(resource_id) = command.selected_resource_id
-            && !self
-                .repository
-                .load_resources(command.owner)?
-                .iter()
-                .any(|resource| resource.id == resource_id)
+        if goal
+            .deadline
+            .is_some_and(|deadline| command.expires_at > deadline)
         {
             return Err(SecondMindError::invalid(
-                "The selected resource binding does not exist.",
+                "Permission expiry cannot extend beyond the goal deadline.",
             ));
+        }
+        if let Some(resource_id) = command.selected_resource_id {
+            let resources = self.repository.load_resources(command.owner)?;
+            let resource = resources
+                .iter()
+                .find(|resource| resource.id == resource_id)
+                .ok_or_else(|| {
+                    SecondMindError::invalid("The selected resource binding does not exist.")
+                })?;
+            if !resource_kind_matches_scope(command.scope, resource.kind) {
+                return Err(SecondMindError::invalid(
+                    "The selected resource kind does not match the permission scope.",
+                ));
+            }
+            if command.daemon_restart_allowed && resource.kind == ResourceKind::BrowserSurface {
+                return Err(SecondMindError::invalid(
+                    "Browser permission cannot continue after a daemon restart; select the tab again.",
+                ));
+            }
         }
         let grant = PermissionGrant {
             id: PermissionGrantId::new_v7(),
@@ -2030,12 +2583,33 @@ impl SecondMindRuntime {
         if route.revision != expected_revision {
             return Err(SecondMindError::conflict(route.revision));
         }
+        if route.revoked_at.is_some() {
+            return Err(SecondMindError::invalid(
+                "The model route approval is already revoked.",
+            ));
+        }
         validate_text(&reason, 1, 120, "The revocation reason is invalid.")?;
         let expected = route.revision;
         route.revision = route.revision.saturating_add(1);
         route.revoked_at = Some(self.clock.now_utc());
+        let cleanup = crate::SecretDeletionCleanup {
+            owner,
+            model_route_approval_id: route.id,
+            secret_ref: route.secret_ref.clone(),
+            created_at: self.clock.now_utc(),
+        };
+        let audit = self.build_audit_record(
+            owner,
+            AuditKind::ModelRouteRevoked,
+            route.id.as_uuid(),
+            AuditDetails::new(
+                vec!["model_route_revoked".to_owned()],
+                route.allowed_categories.clone(),
+            ),
+        );
         self.commit(self.daemon_context(), |events| {
-            self.repository.save_model_route(&route, Some(expected))?;
+            self.repository
+                .save_revoked_model_route_with_cleanup(&route, expected, &cleanup, &audit)?;
             events.push(CoreEvent::PermissionViewChanged {
                 change: PermissionViewChange::Revoked,
                 permission: PermissionRecord::ModelRouteApproval(route.clone()),
@@ -2064,18 +2638,11 @@ impl SecondMindRuntime {
         }
         self.secret_store.delete(&route.secret_ref).map_err(|_| {
             SecondMindError::unavailable(
-                "The model route is revoked, but its native credential could not be deleted.",
+                "The model route is revoked, but its native credential cleanup remains pending.",
             )
         })?;
-        self.append_audit(
-            owner,
-            AuditKind::ModelRouteRevoked,
-            route.id.as_uuid(),
-            AuditDetails::new(
-                vec!["model_route_revoked".to_owned()],
-                route.allowed_categories.clone(),
-            ),
-        )?;
+        self.repository
+            .complete_secret_deletion_cleanup(owner, route.id)?;
         Ok(route)
     }
 
@@ -2098,7 +2665,8 @@ impl SecondMindRuntime {
         }
         let now = self.clock.now_utc();
         let goal = self.get_goal(command.owner, command.goal_id)?;
-        if goal.state != GoalState::Active {
+        if goal.state != GoalState::Active || goal.deadline.is_some_and(|deadline| now >= deadline)
+        {
             return Err(SecondMindError::invalid(
                 "Only an active goal can be focused.",
             ));
@@ -2293,9 +2861,13 @@ impl SecondMindRuntime {
                 "Only a starting focus session can activate its adapters.",
             ));
         }
+        let _activation = self.acquire_focus_activation(session.id, session.revision)?;
         let now = self.clock.now_utc();
         let goal = self.get_goal(owner, session.goal_id)?;
-        if goal.state != GoalState::Active || goal.revision.get() != session.goal_revision {
+        if goal.state != GoalState::Active
+            || goal.revision.get() != session.goal_revision
+            || goal.deadline.is_some_and(|deadline| now >= deadline)
+        {
             return self.fail_start(&mut session, "goal_changed_before_activation");
         }
         let route = find_route(&*self.repository, owner, session.model_route_approval_id)?;
@@ -2319,11 +2891,15 @@ impl SecondMindRuntime {
         if selected_resources != session.selected_resource_ids {
             return self.fail_start(&mut session, "resource_changed_before_activation");
         }
-        let observation_grants: Vec<_> = grants
+        let mut observation_grants: Vec<_> = grants
             .iter()
             .filter(|grant| grant.scope.is_observation())
             .cloned()
             .collect();
+        observation_grants.sort_by_key(|grant| observation_start_tier(grant.scope));
+        let resources = self.repository.load_resources(owner)?;
+        let preferences = self.effective_preferences(session.owner)?;
+        let cancellation = CancellationToken::new();
 
         let published_at = self.clock.now_utc();
         let mut status = NativeCaptureStatus {
@@ -2336,24 +2912,31 @@ impl SecondMindRuntime {
             published_at,
             heartbeat_deadline: published_at + time::Duration::seconds(10),
         };
-        let status_ack = self.native_status.publish(&status).await;
+        let status_ack = tokio::time::timeout(
+            self.config.native_status_heartbeat_timeout,
+            self.native_status.publish(&status),
+        )
+        .await;
         if !self.native_status.availability().is_available()
             || !self.emergency_control.availability().is_available()
-            || !status_ack
-                .as_ref()
-                .is_ok_and(|ack| valid_status_acknowledgement(&status, ack))
+            || !matches!(
+                status_ack,
+                Ok(Ok(ref acknowledgement))
+                    if valid_status_acknowledgement(&status, acknowledgement)
+            )
         {
+            self.cleanup_focus_activation(session.id, status.revision, &cancellation, &[])
+                .await;
             return self.fail_start(&mut session, "native_status_unavailable");
         }
 
-        let cancellation = CancellationToken::new();
         let mut started = Vec::new();
         let mut source_health = BTreeMap::new();
         let mut subscriptions = Vec::new();
-        let resources = self.repository.load_resources(owner)?;
         for grant in &observation_grants {
             if !self.observation.availability(grant.scope).is_available() {
-                stop_started(&*self.observation, session.id, &started).await;
+                self.cleanup_focus_activation(session.id, status.revision, &cancellation, &started)
+                    .await;
                 return self.fail_start(&mut session, "observation_source_unavailable");
             }
             let resource = grant
@@ -2364,63 +2947,113 @@ impl SecondMindRuntime {
                 resource,
                 limits: observation_limits(&self.config, grant.scope),
             };
-            match self
-                .observation
-                .start(&request, cancellation.child_token())
-                .await
+            match tokio::time::timeout(
+                self.config.native_status_heartbeat_timeout,
+                self.observation.start(&request, cancellation.child_token()),
+            )
+            .await
             {
-                Ok(subscription) => {
-                    validate_source_status(grant, &subscription.initial_status)?;
+                Ok(Ok(subscription)) => {
+                    if validate_source_status(grant, &subscription.initial_status).is_err() {
+                        started.push(grant.id);
+                        self.cleanup_focus_activation(
+                            session.id,
+                            status.revision,
+                            &cancellation,
+                            &started,
+                        )
+                        .await;
+                        return self.fail_start(&mut session, "observation_source_status_invalid");
+                    }
                     source_health.insert(grant.id, subscription.initial_status.clone());
                     started.push(grant.id);
                     subscriptions.push((grant.id, subscription));
                 }
-                Err(_) => {
-                    cancellation.cancel();
-                    stop_started(&*self.observation, session.id, &started).await;
+                Ok(Err(_)) | Err(_) => {
+                    started.push(grant.id);
+                    self.cleanup_focus_activation(
+                        session.id,
+                        status.revision,
+                        &cancellation,
+                        &started,
+                    )
+                    .await;
                     return self.fail_start(&mut session, "observation_source_start_failed");
                 }
             }
         }
 
+        let source_degraded = source_health
+            .values()
+            .any(|value| value.health != crate::SourceHealth::Healthy);
+        let active_revision = session.revision.saturating_add(1);
+        let mut ephemeral = EphemeralSession {
+            source_health,
+            native_status_revision: Some(active_revision),
+            ..EphemeralSession::with_cancellation(cancellation.clone())
+        };
+        reconcile_proactive_cancellation(
+            &mut ephemeral,
+            !session.muted
+                && preferences.proactive_interventions_enabled
+                && !preferences.proactive_interventions_muted,
+        );
+        let install_result = self
+            .ephemeral
+            .lock()
+            .map_err(|_| SecondMindError::unavailable("Ephemeral context is unavailable."))
+            .and_then(|mut state| {
+                if state.sessions.contains_key(&session.id) {
+                    return Err(SecondMindError::unavailable(
+                        "The focus session already has live ephemeral context.",
+                    ));
+                }
+                state.sessions.insert(session.id, ephemeral);
+                Ok(())
+            });
+        if install_result.is_err() {
+            self.cleanup_focus_activation(session.id, status.revision, &cancellation, &started)
+                .await;
+            return self.fail_start(&mut session, "ephemeral_context_unavailable");
+        }
+
+        let expected = session.revision;
         session.state = FocusSessionState::Active;
         session.started_at = Some(self.clock.now_utc());
         session.updated_at = self.clock.now_utc();
-        session.source_degraded = source_health
-            .values()
-            .any(|value| value.health != crate::SourceHealth::Healthy);
-        session.revision += 1;
-        self.commit(self.daemon_context(), |events| {
-            self.repository.save_focus_session(&session, Some(1))?;
+        session.source_degraded = source_degraded;
+        session.revision = active_revision;
+        if let Err(error) = self.commit(self.daemon_context(), |events| {
+            self.persist_focus_lifecycle_transition(
+                &session,
+                expected,
+                AuditDetails::new(vec!["focus_session_active".to_owned()], BTreeSet::new()),
+            )?;
             self.push_focus_and_capture(events, FocusSessionViewChange::Started, &session);
             Ok(())
-        })?;
+        }) {
+            self.cleanup_focus_activation(session.id, status.revision, &cancellation, &started)
+                .await;
+            return Err(error);
+        }
         status.revision = session.revision;
         status.source_degraded = session.source_degraded;
         status.published_at = self.clock.now_utc();
         status.heartbeat_deadline = status.published_at + time::Duration::seconds(10);
-        let acknowledgement = self.native_status.publish(&status).await;
-        if !acknowledgement
-            .as_ref()
-            .is_ok_and(|ack| valid_status_acknowledgement(&status, ack))
-        {
-            cancellation.cancel();
-            stop_started(&*self.observation, session.id, &started).await;
+        let acknowledgement = tokio::time::timeout(
+            self.config.native_status_heartbeat_timeout,
+            self.native_status.publish(&status),
+        )
+        .await;
+        if !matches!(
+            acknowledgement,
+            Ok(Ok(ref acknowledgement))
+                if valid_status_acknowledgement(&status, acknowledgement)
+        ) {
+            self.cleanup_focus_activation(session.id, status.revision, &cancellation, &started)
+                .await;
             return self.fail_start(&mut session, "native_status_acknowledgement_lost");
         }
-        self.ephemeral
-            .lock()
-            .map_err(|_| SecondMindError::unavailable("Ephemeral context is unavailable."))?
-            .sessions
-            .insert(
-                session.id,
-                EphemeralSession {
-                    source_health,
-                    cancellation: cancellation.clone(),
-                    native_status_revision: Some(status.revision),
-                    ..EphemeralSession::default()
-                },
-            );
         for (grant_id, subscription) in subscriptions {
             self.spawn_observation_subscription(
                 session.id,
@@ -2431,12 +3064,6 @@ impl SecondMindRuntime {
         }
         self.spawn_native_status_monitor(session.id, cancellation.child_token());
         self.spawn_native_status_heartbeat(session.id, cancellation.child_token());
-        self.append_audit(
-            session.owner,
-            AuditKind::FocusSessionStateChanged,
-            session.id.as_uuid(),
-            AuditDetails::new(vec!["focus_session_active".to_owned()], BTreeSet::new()),
-        )?;
         Ok(session)
     }
 
@@ -2450,25 +3077,111 @@ impl SecondMindRuntime {
             .await
     }
 
+    pub(crate) async fn fail_detached_focus_activation(
+        &self,
+        owner: ActorId,
+        session_id: FocusSessionId,
+        include_active: bool,
+        reason: &'static str,
+    ) -> Result<(), SecondMindError> {
+        let mut session = find_session(&*self.repository, session_id)?;
+        if session.owner != owner {
+            return Err(SecondMindError::permission(
+                "The focus session belongs to another actor.",
+            ));
+        }
+        if session.state != FocusSessionState::Starting
+            && !(include_active && session.state == FocusSessionState::Active)
+        {
+            return Ok(());
+        }
+        let started = self
+            .repository
+            .load_grants(owner)
+            .map(|grants| {
+                grants
+                    .into_iter()
+                    .filter(|grant| {
+                        session.permission_grant_ids.contains(&grant.id)
+                            && grant.scope.is_observation()
+                    })
+                    .map(|grant| grant.id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|_| session.permission_grant_ids.iter().copied().collect());
+        self.cleanup_focus_activation(
+            session.id,
+            session.revision,
+            &CancellationToken::new(),
+            &started,
+        )
+        .await;
+        self.mark_focus_start_failed(&mut session, reason)
+    }
+
     fn fail_start(
         &self,
         session: &mut FocusSession,
         reason: &'static str,
     ) -> Result<FocusSession, SecondMindError> {
+        self.mark_focus_start_failed(session, reason)?;
+        Err(SecondMindError::unavailable(
+            "A required observation source could not start.",
+        ))
+    }
+
+    fn mark_focus_start_failed(
+        &self,
+        session: &mut FocusSession,
+        reason: &'static str,
+    ) -> Result<(), SecondMindError> {
         session.state = FocusSessionState::Failed;
         session.failure_reason = Some(reason.to_owned());
         session.updated_at = self.clock.now_utc();
         let expected = session.revision;
         session.revision += 1;
         self.commit(self.daemon_context(), |events| {
-            self.repository
-                .save_focus_session(session, Some(expected))?;
+            self.persist_focus_lifecycle_transition(
+                session,
+                expected,
+                AuditDetails::new(
+                    vec!["focus_session_failed".to_owned(), reason.to_owned()],
+                    BTreeSet::new(),
+                ),
+            )?;
             self.push_focus_and_capture(events, FocusSessionViewChange::Failed, session);
             Ok(())
         })?;
-        Err(SecondMindError::unavailable(
-            "A required observation source could not start.",
-        ))
+        Ok(())
+    }
+
+    fn mark_focus_recovery_pending(
+        &self,
+        session: &mut FocusSession,
+        reason: &'static str,
+    ) -> Result<(), SecondMindError> {
+        let expected = session.revision;
+        session.state = FocusSessionState::Recovering;
+        session.source_degraded = true;
+        session.failure_reason = Some(reason.to_owned());
+        session.updated_at = self.clock.now_utc();
+        session.revision = session.revision.saturating_add(1);
+        self.commit(self.daemon_context(), |events| {
+            self.persist_focus_lifecycle_transition(
+                session,
+                expected,
+                AuditDetails::new(
+                    vec![
+                        "focus_session_recovery_pending".to_owned(),
+                        reason.to_owned(),
+                    ],
+                    BTreeSet::new(),
+                ),
+            )?;
+            self.push_focus_and_capture(events, FocusSessionViewChange::RecoveryStarted, session);
+            Ok(())
+        })?;
+        Ok(())
     }
 
     fn spawn_observation_subscription(
@@ -2922,16 +3635,9 @@ impl SecondMindRuntime {
                     ephemeral.significance_generation =
                         ephemeral.significance_generation.saturating_add(1);
                 }
-                let cutoff = now
-                    - time::Duration::try_from(self.config.observation_ttl)
-                        .unwrap_or(time::Duration::MAX);
-                while ephemeral
+                ephemeral
                     .observations
-                    .front()
-                    .is_some_and(|value| value.provenance.observed_at <= cutoff)
-                {
-                    ephemeral.observations.pop_front();
-                }
+                    .retain(|value| observation_is_within_retention(&self.config, value, now));
             }
             if presence_changed {
                 events.push(CoreEvent::CaptureStateChanged {
@@ -2946,8 +3652,6 @@ impl SecondMindRuntime {
         &self,
     ) -> Result<RetentionMaintenanceResult, SecondMindError> {
         let now = self.clock.now_utc();
-        let observation_ttl =
-            time::Duration::try_from(self.config.observation_ttl).unwrap_or(time::Duration::MAX);
         let removed_observations = {
             let mut state = self
                 .ephemeral
@@ -2957,8 +3661,7 @@ impl SecondMindRuntime {
             for session in state.sessions.values_mut() {
                 let before = session.observations.len();
                 session.observations.retain(|observation| {
-                    let age = now - observation.provenance.observed_at;
-                    !age.is_negative() && age < observation_ttl
+                    observation_is_within_retention(&self.config, observation, now)
                 });
                 removed = removed.saturating_add(before.saturating_sub(session.observations.len()));
             }
@@ -2973,6 +3676,7 @@ impl SecondMindRuntime {
 
     pub async fn run_retention_maintenance(
         &self,
+        owner: ActorId,
         shutdown: CancellationToken,
     ) -> Result<(), SecondMindError> {
         let mut interval = tokio::time::interval(self.config.retention_maintenance_interval);
@@ -2987,6 +3691,7 @@ impl SecondMindRuntime {
                 () = shutdown.cancelled() => return Ok(()),
                 _ = interval.tick() => {
                     self.run_retention_maintenance_once()?;
+                    self.recover_cleanup_obligations(owner).await?;
                 }
             }
         }
@@ -3008,6 +3713,7 @@ impl SecondMindRuntime {
                 biased;
                 () = shutdown.cancelled() => return Ok(()),
                 _ = interval.tick() => {
+                    self.reconcile_focus_authority(owner).await?;
                     let sessions = self.repository.load_focus_sessions(owner)?;
                     for session in sessions
                         .into_iter()
@@ -3015,7 +3721,10 @@ impl SecondMindRuntime {
                     {
                         tokio::select! {
                             biased;
-                            () = shutdown.cancelled() => return Ok(()),
+                            () = shutdown.cancelled() => {
+                                self.cancel_proactive_cancellation(session.id)?;
+                                return Ok(());
+                            },
                             result = self.run_reasoning_cycle(session.id) => {
                                 result?;
                             }
@@ -3024,6 +3733,90 @@ impl SecondMindRuntime {
                 }
             }
         }
+    }
+
+    async fn reconcile_focus_authority(&self, owner: ActorId) -> Result<usize, SecondMindError> {
+        let now = self.clock.now_utc();
+        let goals = self.repository.load_goals(owner)?;
+        let grants = self.repository.load_grants(owner)?;
+        let routes = self.repository.load_model_routes(owner)?;
+        let sessions = self.repository.load_focus_sessions(owner)?;
+        let mut ended = 0usize;
+
+        for session in sessions {
+            if session.state == FocusSessionState::Stopping {
+                match self
+                    .finish_end_focus_session(owner, session.id, session.revision)
+                    .await
+                {
+                    Ok(_) => ended = ended.saturating_add(1),
+                    Err(error)
+                        if matches!(
+                            error.code,
+                            SecondMindErrorCode::Conflict | SecondMindErrorCode::NotFound
+                        ) => {}
+                    Err(error) => return Err(error),
+                }
+                continue;
+            }
+            if session.state != FocusSessionState::Active {
+                continue;
+            }
+
+            let grants_are_current = session.permission_grant_ids.iter().all(|grant_id| {
+                grants.iter().any(|grant| {
+                    grant.id == *grant_id
+                        && grant.owner == owner
+                        && grant.focus_session_id == Some(session.id)
+                        && grant.is_current_at(now)
+                })
+            });
+            let route_is_current = routes.iter().any(|route| {
+                route.id == session.model_route_approval_id && route.is_current_at(now)
+            });
+            let goal_is_current = goals.iter().any(|goal| {
+                goal.id == session.goal_id
+                    && goal.revision.get() == session.goal_revision
+                    && goal.state == GoalState::Active
+                    && goal.deadline.is_none_or(|deadline| now < deadline)
+            });
+            if grants_are_current && route_is_current && goal_is_current {
+                continue;
+            }
+
+            let stopping = match self.end_focus_session(
+                ClientAssurance::NativeEmergencyControl,
+                owner,
+                session.id,
+                session.revision,
+                EndFocusReason::Expired,
+            ) {
+                Ok(stopping) if stopping.state == FocusSessionState::Stopping => stopping,
+                Ok(_) => continue,
+                Err(error)
+                    if matches!(
+                        error.code,
+                        SecondMindErrorCode::Conflict | SecondMindErrorCode::NotFound
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match self
+                .finish_end_focus_session(owner, stopping.id, stopping.revision)
+                .await
+            {
+                Ok(_) => ended = ended.saturating_add(1),
+                Err(error)
+                    if matches!(
+                        error.code,
+                        SecondMindErrorCode::Conflict | SecondMindErrorCode::NotFound
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(ended)
     }
 
     pub async fn run_reasoning_cycle(
@@ -3059,11 +3852,19 @@ impl SecondMindRuntime {
                 reason_code: "delivery_channel_not_allowed".to_owned(),
             });
         }
-        let route = find_route(
+        let route = match find_route(
             &*self.repository,
             session.owner,
             session.model_route_approval_id,
-        )?;
+        ) {
+            Ok(route) => route,
+            Err(error) if error.code == SecondMindErrorCode::NotFound => {
+                return Ok(ReasoningCycleResult::Silence {
+                    reason_code: "reasoning_authority_unavailable".to_owned(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
         if route.placement == crate::ModelPlacement::Remote
             && !preferences.remote_processing_enabled
         {
@@ -3076,14 +3877,32 @@ impl SecondMindRuntime {
                 reason_code: "reasoning_route_unavailable".to_owned(),
             });
         }
-        let grants = resolve_grants(
+        let grants = match resolve_grants(
             &*self.repository,
             session.owner,
             session.id,
             &session.permission_grant_ids,
             now,
-        )?;
+        ) {
+            Ok(grants) => grants,
+            Err(error)
+                if matches!(
+                    error.code,
+                    SecondMindErrorCode::NotFound | SecondMindErrorCode::PermissionDenied
+                ) =>
+            {
+                return Ok(ReasoningCycleResult::Silence {
+                    reason_code: "reasoning_authority_unavailable".to_owned(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let (context, presence, cancellation) = self.assemble_context(&session, &route, &grants)?;
+        if cancellation.is_cancelled() {
+            return Ok(ReasoningCycleResult::Silence {
+                reason_code: "proactive_authority_cancelled".to_owned(),
+            });
+        }
         if presence != crate::PresenceState::Active {
             return Ok(ReasoningCycleResult::Silence {
                 reason_code: "presence_not_active".to_owned(),
@@ -3094,14 +3913,42 @@ impl SecondMindRuntime {
                 reason_code: "no_fresh_significant_evidence".to_owned(),
             });
         }
-        if let Some(reason_code) = self.significance_gate(&session, &goal, &context)? {
-            return Ok(ReasoningCycleResult::Silence {
-                reason_code: reason_code.to_owned(),
-            });
+        match self.significance_gate(&session, &goal, &context, &preferences)? {
+            SignificanceGateResult::Skipped(reason_code) => {
+                return Ok(ReasoningCycleResult::Silence {
+                    reason_code: reason_code.to_owned(),
+                });
+            }
+            SignificanceGateResult::Evaluated {
+                reason_code,
+                policy_trace,
+            } => {
+                let audit_reason = reason_code.unwrap_or("significance_policy_passed");
+                self.append_audit(
+                    session.owner,
+                    AuditKind::SignificanceDecision,
+                    session.id.as_uuid(),
+                    AuditDetails::new(
+                        vec![audit_reason.to_owned()],
+                        context.iter().map(|item| item.category).collect(),
+                    )
+                    .with_policy_trace(policy_trace),
+                )?;
+                if let Some(reason_code) = reason_code {
+                    return Ok(ReasoningCycleResult::Silence {
+                        reason_code: reason_code.to_owned(),
+                    });
+                }
+            }
         }
         if let Some(reason_code) = self.pre_model_delivery_gate(&session, &preferences)? {
             return Ok(ReasoningCycleResult::Silence {
                 reason_code: reason_code.to_owned(),
+            });
+        }
+        if cancellation.is_cancelled() {
+            return Ok(ReasoningCycleResult::Silence {
+                reason_code: "proactive_authority_cancelled".to_owned(),
             });
         }
         let model_permit = match self
@@ -3160,6 +4007,11 @@ impl SecondMindRuntime {
                 });
             }
         };
+        if cancellation.is_cancelled() {
+            return Ok(ReasoningCycleResult::Silence {
+                reason_code: "proactive_authority_cancelled".to_owned(),
+            });
+        }
         drop(model_permit);
         match output {
             ModelReasoningOutput::Silence { reason_code } => {
@@ -3258,6 +4110,12 @@ impl SecondMindRuntime {
                 confidence_basis_points: observation.provenance.confidence_basis_points,
             });
         }
+        // Single-operation evidence is handed to at most this one context
+        // assembly. The returned request owns its bounded copy; the session
+        // cannot replay it into a later model cycle.
+        ephemeral.observations.retain(|observation| {
+            observation.provenance.retention != crate::ObservationRetention::SingleOperation
+        });
         if let Some(correction) = &ephemeral.correction {
             items.push(WorkingContextItem {
                 category: DataCategory::Goal,
@@ -3272,7 +4130,7 @@ impl SecondMindRuntime {
         Ok((
             items,
             ephemeral.presence,
-            ephemeral.cancellation.child_token(),
+            ephemeral.proactive_cancellation.child_token(),
         ))
     }
 
@@ -3292,11 +4150,19 @@ impl SecondMindRuntime {
         preferences: &EffectivePreferences,
     ) -> Result<ReasoningCycleResult, SecondMindError> {
         let now = self.clock.now_utc();
+        let monotonic_elapsed = self.clock.monotonic_elapsed();
+        let goal = self.get_goal(session.owner, session.goal_id)?;
         let notification_grant = grants
             .iter()
             .find(|grant| grant.scope == PermissionScope::InterveneDesktopNotification)
             .ok_or_else(|| SecondMindError::permission("Notification permission is missing."))?;
         let prior_interventions = self.repository.load_interventions(session.owner)?;
+        let notification_available = self.notification.availability().is_available();
+        let pending_deliveries = if notification_available {
+            Vec::new()
+        } else {
+            self.repository.load_pending_deliveries(session.owner)?
+        };
         let mut reasons = vec![format!("policy_profile:{POLICY_PROFILE_ID}")];
         let mut allow = true;
         if !preferences.proactive_interventions_enabled {
@@ -3352,9 +4218,8 @@ impl SecondMindRuntime {
             allow = false;
             reasons.push("intervention_cooldown".to_owned());
         }
-        if !self.notification.availability().is_available() {
-            let pending = self.repository.load_pending_deliveries(session.owner)?;
-            let queued: Vec<_> = pending
+        if !notification_available {
+            let queued: Vec<_> = pending_deliveries
                 .iter()
                 .filter(|entry| entry.state == OutboxState::Queued)
                 .collect();
@@ -3374,7 +4239,7 @@ impl SecondMindRuntime {
                 reasons.push("outbox_capacity".to_owned());
             }
         }
-        {
+        let (ephemeral_intervention_count, ephemeral_presence, ephemeral_last_delivery_elapsed) = {
             let state = self
                 .ephemeral
                 .lock()
@@ -3392,8 +4257,7 @@ impl SecondMindRuntime {
                 }
             }
             if ephemeral.last_delivery_elapsed.is_some_and(|last| {
-                self.clock.monotonic_elapsed().saturating_sub(last)
-                    < preferences.intervention_cooldown
+                monotonic_elapsed.saturating_sub(last) < preferences.intervention_cooldown
             }) {
                 allow = false;
                 if !reasons
@@ -3407,7 +4271,12 @@ impl SecondMindRuntime {
                 allow = false;
                 reasons.push("presence_not_active".to_owned());
             }
-        }
+            (
+                ephemeral.intervention_count,
+                ephemeral.presence,
+                ephemeral.last_delivery_elapsed,
+            )
+        };
         if !notification_grant.is_current_at(now) {
             allow = false;
             reasons.push("notification_grant_not_current".to_owned());
@@ -3416,6 +4285,70 @@ impl SecondMindRuntime {
             reasons.push("policy_checks_passed".to_owned());
         }
 
+        let mut permission_grant_revisions: Vec<_> = grants
+            .iter()
+            .map(|grant| (grant.id, grant.revision))
+            .collect();
+        permission_grant_revisions.sort_by_key(|(id, revision)| (*id, *revision));
+        let mut prior_policy_inputs: Vec<_> = prior_interventions
+            .iter()
+            .map(|intervention| PriorInterventionPolicyInputV1 {
+                intervention_id: intervention.id.as_uuid(),
+                candidate_id: intervention.candidate_id.as_uuid(),
+                candidate_revision: intervention.candidate_revision,
+                focus_session_id: intervention.focus_session_id.as_uuid(),
+                state: intervention.state,
+                updated_at: intervention.updated_at,
+            })
+            .collect();
+        prior_policy_inputs.sort_by_key(|value| value.intervention_id);
+        let mut pending_policy_inputs: Vec<_> = pending_deliveries
+            .iter()
+            .map(|entry| PendingDeliveryPolicyInputV1 {
+                entry_id: entry.id.as_uuid(),
+                intervention_id: entry.intervention_id.as_uuid(),
+                state: entry.state,
+            })
+            .collect();
+        pending_policy_inputs.sort_by_key(|value| value.entry_id);
+        let policy_input = InterventionPolicyInputV1 {
+            schema: "stein.intervention-policy-input.v1",
+            policy_profile_id: POLICY_PROFILE_ID,
+            preferences: preferences.into(),
+            evaluated_at: now,
+            owner: session.owner.as_uuid(),
+            focus_session_id: session.id.as_uuid(),
+            focus_session_revision: session.revision,
+            goal_id: goal.id.as_uuid(),
+            goal_revision: goal.revision.get(),
+            goal_state: goal.state,
+            goal_deadline: goal.deadline,
+            session_muted: session.muted,
+            candidate_id: candidate_id.as_uuid(),
+            candidate_revision: 1,
+            user_visible_text: &user_visible_text,
+            reason_code: &reason_code,
+            evidence_summary: &evidence_summary,
+            urgency,
+            confidence_basis_points,
+            context: context.iter().map(PolicyContextInputV1::from).collect(),
+            permission_grant_revisions: permission_grant_revisions
+                .iter()
+                .map(|(id, revision)| (id.as_uuid(), *revision))
+                .collect(),
+            model_route_approval_id: route.id.as_uuid(),
+            model_route_revision: route.revision,
+            channel: NATIVE_NOTIFICATION_CHANNEL,
+            notification_available,
+            prior_interventions: prior_policy_inputs,
+            pending_deliveries: pending_policy_inputs,
+            ephemeral_intervention_count,
+            ephemeral_presence: presence_wire_name(ephemeral_presence),
+            ephemeral_last_delivery_elapsed_ms: ephemeral_last_delivery_elapsed
+                .map(duration_millis_u64),
+            monotonic_elapsed_ms: duration_millis_u64(monotonic_elapsed),
+        };
+        let policy_trace = self.policy_trace(preferences.revision, &policy_input)?;
         let decision = PolicyDecision {
             id: PolicyDecisionId::new_v7(),
             candidate_id,
@@ -3428,13 +4361,11 @@ impl SecondMindRuntime {
                 PolicyOutcome::Deny
             },
             reason_codes: reasons.clone(),
-            permission_grant_revisions: grants
-                .iter()
-                .map(|grant| (grant.id, grant.revision))
-                .collect(),
+            permission_grant_revisions,
             model_route_revision: route.revision,
             channel: NATIVE_NOTIFICATION_CHANNEL.to_owned(),
             policy_version: POLICY_PROFILE_ID.to_owned(),
+            policy_trace: policy_trace.clone(),
             issued_at: now,
             expires_at: now
                 + time::Duration::try_from(self.config.policy_validity)
@@ -3447,9 +4378,9 @@ impl SecondMindRuntime {
             AuditKind::InterventionDecision,
             candidate_id.as_uuid(),
             AuditDetails::new(reasons, evidence_categories)
-                .with_candidate_evidence(evidence_age_ms, confidence_basis_points),
+                .with_candidate_evidence(evidence_age_ms, confidence_basis_points)
+                .with_policy_trace(policy_trace),
         );
-        let goal = self.get_goal(session.owner, session.goal_id)?;
         let mut expiry = (now
             + time::Duration::try_from(self.config.outbox_entry_ttl)
                 .unwrap_or(time::Duration::MAX))
@@ -3534,7 +4465,17 @@ impl SecondMindRuntime {
             intervention.revision += 1;
             intervention.updated_at = current_now;
             self.commit(self.daemon_context(), |events| {
-                self.repository.save_intervention(&intervention, Some(1))?;
+                self.persist_intervention_transition(
+                    &intervention,
+                    1,
+                    AuditKind::InterventionDelivery,
+                    AuditDetails::new(
+                        vec!["authority_changed_before_delivery".to_owned()],
+                        BTreeSet::new(),
+                    )
+                    .with_policy_trace(decision.policy_trace.clone()),
+                    None,
+                )?;
                 Self::push_intervention_update(
                     events,
                     &intervention,
@@ -3542,15 +4483,6 @@ impl SecondMindRuntime {
                 );
                 Ok(())
             })?;
-            self.append_audit(
-                session.owner,
-                AuditKind::InterventionDelivery,
-                intervention.id.as_uuid(),
-                AuditDetails::new(
-                    vec!["authority_changed_before_delivery".to_owned()],
-                    BTreeSet::new(),
-                ),
-            )?;
             return Ok(ReasoningCycleResult::Silence {
                 reason_code: "authority_changed_before_delivery".to_owned(),
             });
@@ -3569,7 +4501,7 @@ impl SecondMindRuntime {
             ),
             expires_at: intervention.expires_at,
         };
-        let delivery_cancellation = self.session_cancellation(session.id)?;
+        let delivery_cancellation = self.proactive_cancellation(session.id)?;
         let channel_available = self.notification.availability().is_available();
         let acknowledgement = if channel_available {
             Some(
@@ -3583,65 +4515,70 @@ impl SecondMindRuntime {
         } else {
             None
         };
+        if acknowledgement.as_ref().is_some_and(Result::is_err) {
+            delivery_cancellation.cancel();
+        }
         let authority_after_attempt = !delivery_cancellation.is_cancelled()
             && self.delivery_authority_is_current(&decision, session.goal_id, intervention.id);
-        self.commit(self.daemon_context(), |events| {
-            match acknowledgement {
-                Some(Ok(Ok(ChannelAcknowledgement::AcceptedByChannel))) => {
-                    intervention.state = InterventionState::AcceptedByChannel;
-                    intervention.delivered_at = Some(self.clock.now_utc());
-                    intervention.revision += 1;
-                    intervention.updated_at = self.clock.now_utc();
-                    self.repository.save_intervention(&intervention, Some(1))?;
-                    let mut state = self.ephemeral.lock().map_err(|_| {
-                        SecondMindError::unavailable("Ephemeral context is unavailable.")
-                    })?;
-                    if let Some(ephemeral) = state.sessions.get_mut(&session.id) {
-                        ephemeral.last_delivery_elapsed = Some(self.clock.monotonic_elapsed());
-                        ephemeral.intervention_count =
-                            ephemeral.intervention_count.saturating_add(1);
-                    }
-                }
-                Some(Ok(Ok(ChannelAcknowledgement::DeliveryUnknown))) | Some(Err(_)) => {
-                    intervention.state = InterventionState::DeliveryUnknown;
-                    intervention.revision += 1;
-                    intervention.updated_at = self.clock.now_utc();
-                    self.repository.save_intervention(&intervention, Some(1))?;
-                    let mut state = self.ephemeral.lock().map_err(|_| {
-                        SecondMindError::unavailable("Ephemeral context is unavailable.")
-                    })?;
-                    if let Some(ephemeral) = state.sessions.get_mut(&session.id) {
-                        ephemeral.last_delivery_elapsed = Some(self.clock.monotonic_elapsed());
-                        ephemeral.intervention_count =
-                            ephemeral.intervention_count.saturating_add(1);
-                    }
-                }
-                Some(Ok(Ok(ChannelAcknowledgement::DeliveryFailed))) | Some(Ok(Err(_))) => {
-                    if !authority_after_attempt {
-                        intervention.state = InterventionState::Cancelled;
-                        scrub_intervention(&mut intervention);
-                        intervention.revision += 1;
-                        intervention.updated_at = self.clock.now_utc();
-                        self.repository.save_intervention(&intervention, Some(1))?;
-                    } else {
-                        intervention.state = InterventionState::DeliveryFailed;
-                        intervention.revision += 1;
-                        intervention.updated_at = self.clock.now_utc();
-                        self.repository.save_intervention(&intervention, Some(1))?;
-                    }
-                }
-                None if authority_after_attempt => self.queue_intervention(
-                    &mut intervention,
-                    &decision,
-                    notification_grant,
-                    &delivery,
-                )?,
-                None => {
+        let delivery_transition = match acknowledgement {
+            Some(Ok(Ok(ChannelAcknowledgement::AcceptedByChannel))) => {
+                intervention.state = InterventionState::AcceptedByChannel;
+                intervention.delivered_at = Some(self.clock.now_utc());
+                intervention.revision += 1;
+                intervention.updated_at = self.clock.now_utc();
+                None
+            }
+            Some(Ok(Ok(ChannelAcknowledgement::DeliveryUnknown))) | Some(Err(_)) => {
+                intervention.state = InterventionState::DeliveryUnknown;
+                intervention.revision += 1;
+                intervention.updated_at = self.clock.now_utc();
+                None
+            }
+            Some(Ok(Ok(ChannelAcknowledgement::DeliveryFailed))) | Some(Ok(Err(_))) => {
+                if !authority_after_attempt {
                     intervention.state = InterventionState::Cancelled;
                     scrub_intervention(&mut intervention);
-                    intervention.revision += 1;
-                    intervention.updated_at = self.clock.now_utc();
-                    self.repository.save_intervention(&intervention, Some(1))?;
+                } else {
+                    intervention.state = InterventionState::DeliveryFailed;
+                }
+                intervention.revision += 1;
+                intervention.updated_at = self.clock.now_utc();
+                None
+            }
+            None if authority_after_attempt => self
+                .queue_intervention(&mut intervention, &decision, notification_grant, &delivery)?
+                .map(PendingDeliveryTransition::Enqueue),
+            None => {
+                intervention.state = InterventionState::Cancelled;
+                scrub_intervention(&mut intervention);
+                intervention.revision += 1;
+                intervention.updated_at = self.clock.now_utc();
+                None
+            }
+        };
+        let consumes_delivery_cap = matches!(
+            intervention.state,
+            InterventionState::AcceptedByChannel | InterventionState::DeliveryUnknown
+        );
+        self.commit(self.daemon_context(), |events| {
+            self.persist_intervention_transition(
+                &intervention,
+                1,
+                AuditKind::InterventionDelivery,
+                AuditDetails::new(
+                    vec![format!("delivery_{:?}", intervention.state).to_lowercase()],
+                    BTreeSet::new(),
+                )
+                .with_policy_trace(decision.policy_trace.clone()),
+                delivery_transition,
+            )?;
+            if consumes_delivery_cap {
+                let mut state = self.ephemeral.lock().map_err(|_| {
+                    SecondMindError::unavailable("Ephemeral context is unavailable.")
+                })?;
+                if let Some(ephemeral) = state.sessions.get_mut(&session.id) {
+                    ephemeral.last_delivery_elapsed = Some(self.clock.monotonic_elapsed());
+                    ephemeral.intervention_count = ephemeral.intervention_count.saturating_add(1);
                 }
             }
             events.push(CoreEvent::InterventionAvailable {
@@ -3668,15 +4605,6 @@ impl SecondMindRuntime {
             });
             Ok(())
         })?;
-        self.append_audit(
-            session.owner,
-            AuditKind::InterventionDelivery,
-            intervention.id.as_uuid(),
-            AuditDetails::new(
-                vec![format!("delivery_{:?}", intervention.state).to_lowercase()],
-                BTreeSet::new(),
-            ),
-        )?;
         Ok(ReasoningCycleResult::Intervention(Box::new(intervention)))
     }
 
@@ -3686,7 +4614,7 @@ impl SecondMindRuntime {
         decision: &PolicyDecision,
         notification_grant: &PermissionGrant,
         delivery: &NotificationDelivery,
-    ) -> Result<(), SecondMindError> {
+    ) -> Result<Option<PendingInterventionDelivery>, SecondMindError> {
         let pending = self
             .repository
             .load_pending_deliveries(intervention.owner)?;
@@ -3720,42 +4648,35 @@ impl SecondMindRuntime {
             }
             .to_owned();
             scrub_intervention(intervention);
-            let expected = intervention.revision;
             intervention.revision += 1;
             intervention.updated_at = self.clock.now_utc();
-            self.repository
-                .save_intervention(intervention, Some(expected))?;
-            return Ok(());
+            return Ok(None);
         }
         let now = self.clock.now_utc();
-        self.repository
-            .enqueue_delivery(&PendingInterventionDelivery {
-                id: OutboxEntryId::new_v7(),
-                owner: intervention.owner,
-                intervention_id: intervention.id,
-                candidate_revision: decision.candidate_revision,
-                policy_decision_id: decision.id,
-                permission_grant_ids: BTreeSet::from([notification_grant.id]),
-                user_visible_text: delivery.body.clone(),
-                reason_code: intervention.reason_code.clone(),
-                urgency: delivery.urgency,
-                sensitivity: "personal".to_owned(),
-                permitted_channels: BTreeSet::from([NATIVE_NOTIFICATION_CHANNEL.to_owned()]),
-                deduplication_key: delivery.deduplication_key,
-                state: OutboxState::Queued,
-                attempt_count: 0,
-                created_at: now,
-                not_before: now,
-                expires_at: delivery.expires_at,
-                last_attempt_at: None,
-            })?;
+        let pending = PendingInterventionDelivery {
+            id: OutboxEntryId::new_v7(),
+            owner: intervention.owner,
+            intervention_id: intervention.id,
+            candidate_revision: decision.candidate_revision,
+            policy_decision_id: decision.id,
+            permission_grant_ids: BTreeSet::from([notification_grant.id]),
+            user_visible_text: delivery.body.clone(),
+            reason_code: intervention.reason_code.clone(),
+            urgency: delivery.urgency,
+            sensitivity: "personal".to_owned(),
+            permitted_channels: BTreeSet::from([NATIVE_NOTIFICATION_CHANNEL.to_owned()]),
+            deduplication_key: delivery.deduplication_key,
+            state: OutboxState::Queued,
+            attempt_count: 0,
+            created_at: now,
+            not_before: now,
+            expires_at: delivery.expires_at,
+            last_attempt_at: None,
+        };
         intervention.state = InterventionState::Queued;
-        let expected = intervention.revision;
         intervention.revision += 1;
         intervention.updated_at = self.clock.now_utc();
-        self.repository
-            .save_intervention(intervention, Some(expected))?;
-        Ok(())
+        Ok(Some(pending))
     }
 
     pub async fn revalidate_pending_deliveries(
@@ -3798,6 +4719,8 @@ impl SecondMindRuntime {
                 .find(|value| value.id == entry.intervention_id)
                 .ok_or_else(|| SecondMindError::unavailable("Queued intervention is missing."))?;
             if entry.state == OutboxState::Delivering || entry.attempt_count > 0 {
+                let policy_trace = self.persisted_policy_trace(entry.policy_decision_id)?;
+                let expected_delivery_state = entry.state;
                 entry.state = OutboxState::DeliveryUnknown;
                 entry.user_visible_text.clear();
                 intervention.state = InterventionState::DeliveryUnknown;
@@ -3805,9 +4728,20 @@ impl SecondMindRuntime {
                 intervention.revision = intervention.revision.saturating_add(1);
                 intervention.updated_at = now;
                 self.commit(self.daemon_context(), |events| {
-                    self.repository.save_delivery(&entry)?;
-                    self.repository
-                        .save_intervention(&intervention, Some(expected))?;
+                    self.persist_intervention_transition(
+                        &intervention,
+                        expected,
+                        AuditKind::InterventionDelivery,
+                        AuditDetails::new(
+                            vec!["delivery_unknown_after_restart".to_owned()],
+                            BTreeSet::new(),
+                        )
+                        .with_optional_policy_trace(policy_trace),
+                        Some(PendingDeliveryTransition::Update {
+                            delivery: entry.clone(),
+                            expected_state: expected_delivery_state,
+                        }),
+                    )?;
                     Self::push_intervention_update(
                         events,
                         &intervention,
@@ -3815,15 +4749,6 @@ impl SecondMindRuntime {
                     );
                     Ok(())
                 })?;
-                self.append_audit(
-                    owner,
-                    AuditKind::InterventionDelivery,
-                    intervention.id.as_uuid(),
-                    AuditDetails::new(
-                        vec!["delivery_unknown_after_restart".to_owned()],
-                        BTreeSet::new(),
-                    ),
-                )?;
                 changed.push(intervention);
                 continue;
             }
@@ -3893,6 +4818,10 @@ impl SecondMindRuntime {
                     && decision.candidate_revision == entry.candidate_revision
                     && decision.focus_session_id == session.id
                     && decision.outcome == PolicyOutcome::Allow
+                    && decision.policy_trace.is_complete()
+                    && decision.policy_version == POLICY_PROFILE_ID
+                    && decision.policy_trace.policy_profile_id == POLICY_PROFILE_ID
+                    && decision.policy_trace.user_preferences_revision == preferences.revision
                     && now < decision.expires_at
             });
             let route_current = route.as_ref().is_some_and(|route| {
@@ -3957,6 +4886,11 @@ impl SecondMindRuntime {
                 || !preferences_allow
                 || duplicate_terminal
             {
+                let policy_trace = prior_decision
+                    .as_ref()
+                    .map(|decision| decision.policy_trace.clone())
+                    .filter(PolicyTrace::is_complete);
+                let expected_delivery_state = entry.state;
                 entry.state = OutboxState::Expired;
                 entry.user_visible_text.clear();
                 intervention.state = InterventionState::Expired;
@@ -3968,9 +4902,17 @@ impl SecondMindRuntime {
                 intervention.revision = intervention.revision.saturating_add(1);
                 intervention.updated_at = now;
                 self.commit(self.daemon_context(), |events| {
-                    self.repository.save_delivery(&entry)?;
-                    self.repository
-                        .save_intervention(&intervention, Some(expected))?;
+                    self.persist_intervention_transition(
+                        &intervention,
+                        expected,
+                        AuditKind::InterventionDelivery,
+                        AuditDetails::new(vec!["missed_intervention".to_owned()], BTreeSet::new())
+                            .with_optional_policy_trace(policy_trace),
+                        Some(PendingDeliveryTransition::Update {
+                            delivery: entry.clone(),
+                            expected_state: expected_delivery_state,
+                        }),
+                    )?;
                     Self::push_intervention_update(
                         events,
                         &intervention,
@@ -3978,22 +4920,73 @@ impl SecondMindRuntime {
                     );
                     Ok(())
                 })?;
-                self.append_audit(
-                    owner,
-                    AuditKind::InterventionDelivery,
-                    intervention.id.as_uuid(),
-                    AuditDetails::new(vec!["missed_intervention".to_owned()], BTreeSet::new()),
-                )?;
                 changed.push(intervention);
                 continue;
             }
-            if !self.notification.availability().is_available() {
+            let notification_available = self.notification.availability().is_available();
+            if !notification_available {
                 continue;
             }
 
             let Some(route) = route else {
                 continue;
             };
+            let (Some(goal), Some(prior_decision)) = (goal, prior_decision) else {
+                continue;
+            };
+            let mut permission_grant_revisions = prior_decision.permission_grant_revisions.clone();
+            permission_grant_revisions.sort_by_key(|(id, revision)| (*id, *revision));
+            let recovery_input = RecoveryPolicyInputV1 {
+                schema: "stein.intervention-recovery-policy-input.v1",
+                policy_profile_id: POLICY_PROFILE_ID,
+                preferences: (&preferences).into(),
+                evaluated_at: now,
+                owner: owner.as_uuid(),
+                focus_session_id: session.id.as_uuid(),
+                focus_session_revision: session.revision,
+                focus_session_state: session.state,
+                focus_session_muted: session.muted,
+                goal_id: goal.id.as_uuid(),
+                goal_revision: goal.revision.get(),
+                goal_state: goal.state,
+                goal_deadline: goal.deadline,
+                model_route_approval_id: route.id.as_uuid(),
+                model_route_revision: route.revision,
+                permission_grant_revisions: permission_grant_revisions
+                    .iter()
+                    .map(|(id, revision)| (id.as_uuid(), *revision))
+                    .collect(),
+                intervention_id: intervention.id.as_uuid(),
+                intervention_revision: intervention.revision,
+                candidate_id: intervention.candidate_id.as_uuid(),
+                candidate_revision: intervention.candidate_revision,
+                prior_policy_decision_id: prior_decision.id.as_uuid(),
+                prior_policy_trace_digest: prior_decision.policy_trace.proposed_input_digest,
+                outbox_entry_id: entry.id.as_uuid(),
+                queued_text: &entry.user_visible_text,
+                reason_code: &entry.reason_code,
+                urgency: entry.urgency,
+                sensitivity: &entry.sensitivity,
+                permitted_channels: &entry.permitted_channels,
+                deduplication_key: entry.deduplication_key,
+                created_at: entry.created_at,
+                not_before: entry.not_before,
+                expires_at: entry.expires_at,
+                channel: NATIVE_NOTIFICATION_CHANNEL,
+                presence_active,
+                sources_healthy,
+                entry_grants_current,
+                decision_grants_current,
+                decision_matches,
+                route_current,
+                goal_current,
+                preferences_allow,
+                duplicate_terminal,
+                delivered_count,
+                cooldown_active,
+                notification_available,
+            };
+            let policy_trace = self.policy_trace(preferences.revision, &recovery_input)?;
             let new_decision = PolicyDecision {
                 id: PolicyDecisionId::new_v7(),
                 candidate_id: intervention.candidate_id,
@@ -4005,13 +4998,11 @@ impl SecondMindRuntime {
                     format!("policy_profile:{POLICY_PROFILE_ID}"),
                     "recovery_revalidation_passed".to_owned(),
                 ],
-                permission_grant_revisions: prior_decision
-                    .as_ref()
-                    .map(|decision| decision.permission_grant_revisions.clone())
-                    .unwrap_or_default(),
+                permission_grant_revisions,
                 model_route_revision: route.revision,
                 channel: NATIVE_NOTIFICATION_CHANNEL.to_owned(),
                 policy_version: POLICY_PROFILE_ID.to_owned(),
+                policy_trace: policy_trace.clone(),
                 issued_at: now,
                 expires_at: (now
                     + time::Duration::try_from(self.config.policy_validity)
@@ -4032,7 +5023,8 @@ impl SecondMindRuntime {
                 owner,
                 AuditKind::InterventionDecision,
                 intervention.candidate_id.as_uuid(),
-                AuditDetails::new(new_decision.reason_codes.clone(), evidence_categories),
+                AuditDetails::new(new_decision.reason_codes.clone(), evidence_categories)
+                    .with_policy_trace(policy_trace),
             );
             let write = InterventionDecisionWrite {
                 decision: new_decision.clone(),
@@ -4058,6 +5050,7 @@ impl SecondMindRuntime {
                 intervention.goal_id,
                 intervention.id,
             ) {
+                let expected_delivery_state = entry.state;
                 entry.state = OutboxState::Cancelled;
                 entry.policy_decision_id = new_decision.id;
                 entry.user_visible_text.clear();
@@ -4069,9 +5062,20 @@ impl SecondMindRuntime {
                 scrub_intervention(&mut intervention);
                 intervention.revision = intervention.revision.saturating_add(1);
                 intervention.updated_at = self.clock.now_utc();
-                self.repository.save_delivery(&entry)?;
-                self.repository
-                    .save_intervention(&intervention, Some(expected))?;
+                self.persist_intervention_transition(
+                    &intervention,
+                    expected,
+                    AuditKind::InterventionDelivery,
+                    AuditDetails::new(
+                        vec!["authority_changed_before_recovery_delivery".to_owned()],
+                        BTreeSet::new(),
+                    )
+                    .with_policy_trace(new_decision.policy_trace.clone()),
+                    Some(PendingDeliveryTransition::Update {
+                        delivery: entry.clone(),
+                        expected_state: expected_delivery_state,
+                    }),
+                )?;
                 if let Some(publication) = publication_fence {
                     publication.publish(vec![CoreEvent::InterventionHistoryChanged {
                         change: InterventionHistoryViewChange::Updated,
@@ -4080,15 +5084,6 @@ impl SecondMindRuntime {
                         entry: Some(intervention.clone()),
                     }]);
                 }
-                self.append_audit(
-                    owner,
-                    AuditKind::InterventionDelivery,
-                    intervention.id.as_uuid(),
-                    AuditDetails::new(
-                        vec!["authority_changed_before_recovery_delivery".to_owned()],
-                        BTreeSet::new(),
-                    ),
-                )?;
                 changed.push(intervention);
                 continue;
             }
@@ -4105,7 +5100,7 @@ impl SecondMindRuntime {
             entry.last_attempt_at = Some(now);
             entry.policy_decision_id = new_decision.id;
             self.repository.save_delivery(&entry)?;
-            let delivery_cancellation = self.session_cancellation(session.id)?;
+            let delivery_cancellation = self.proactive_cancellation(session.id)?;
             let result = tokio::time::timeout(
                 self.config.notification_attempt_deadline,
                 self.notification.deliver(
@@ -4122,12 +5117,16 @@ impl SecondMindRuntime {
                 ),
             )
             .await;
+            if result.is_err() {
+                delivery_cancellation.cancel();
+            }
             let authority_after_attempt = !delivery_cancellation.is_cancelled()
                 && self.delivery_authority_is_current(
                     &new_decision,
                     intervention.goal_id,
                     intervention.id,
                 );
+            let expected_delivery_state = entry.state;
             entry.state = match result {
                 Ok(Ok(ChannelAcknowledgement::AcceptedByChannel)) => OutboxState::AcceptedByChannel,
                 Ok(Ok(ChannelAcknowledgement::DeliveryUnknown)) | Err(_) => {
@@ -4155,9 +5154,20 @@ impl SecondMindRuntime {
             intervention.delivered_at =
                 (entry.state == OutboxState::AcceptedByChannel).then_some(now);
             self.commit(self.daemon_context(), |events| {
-                self.repository.save_delivery(&entry)?;
-                self.repository
-                    .save_intervention(&intervention, Some(expected))?;
+                self.persist_intervention_transition(
+                    &intervention,
+                    expected,
+                    AuditKind::InterventionDelivery,
+                    AuditDetails::new(
+                        vec![format!("delivery_{:?}", intervention.state).to_lowercase()],
+                        BTreeSet::new(),
+                    )
+                    .with_policy_trace(new_decision.policy_trace.clone()),
+                    Some(PendingDeliveryTransition::Update {
+                        delivery: entry.clone(),
+                        expected_state: expected_delivery_state,
+                    }),
+                )?;
                 Self::push_intervention_update(
                     events,
                     &intervention,
@@ -4187,15 +5197,6 @@ impl SecondMindRuntime {
                 ephemeral.last_delivery_elapsed = Some(self.clock.monotonic_elapsed());
                 ephemeral.intervention_count = ephemeral.intervention_count.saturating_add(1);
             }
-            self.append_audit(
-                owner,
-                AuditKind::InterventionDelivery,
-                intervention.id.as_uuid(),
-                AuditDetails::new(
-                    vec![format!("delivery_{:?}", intervention.state).to_lowercase()],
-                    BTreeSet::new(),
-                ),
-            )?;
             changed.push(intervention);
         }
         Ok(changed)
@@ -4230,7 +5231,14 @@ impl SecondMindRuntime {
         grant.revocation_reason = Some(bound_text(reason, 120));
         grant.revision += 1;
         self.commit(self.daemon_context(), |events| {
-            self.repository.save_grant(&grant, Some(expected))?;
+            self.persist_permission_revocation(
+                &grant,
+                expected,
+                AuditDetails::new(
+                    vec!["permission_revoked".to_owned()],
+                    BTreeSet::from([category_for_scope(grant.scope)]),
+                ),
+            )?;
             events.push(CoreEvent::PermissionViewChanged {
                 change: PermissionViewChange::Revoked,
                 permission: PermissionRecord::SessionGrant(grant.clone()),
@@ -4270,15 +5278,6 @@ impl SecondMindRuntime {
             }
         }
         self.cancel_outbox_for_grant(owner, grant_id)?;
-        self.append_audit(
-            owner,
-            AuditKind::PermissionRevoked,
-            grant.id.as_uuid(),
-            AuditDetails::new(
-                vec!["permission_revoked".to_owned()],
-                BTreeSet::from([category_for_scope(grant.scope)]),
-            ),
-        )?;
         Ok(grant)
     }
 
@@ -4300,11 +5299,14 @@ impl SecondMindRuntime {
         if session.revision != expected_revision {
             return Err(SecondMindError::conflict(session.revision));
         }
+        let preferences = self.effective_preferences(owner)?;
+        let context = self.daemon_context();
         let expected = session.revision;
         session.muted = muted;
         session.updated_at = self.clock.now_utc();
         session.revision += 1;
-        self.commit(self.daemon_context(), |events| {
+        self.reconcile_proactive_cancellation_for_session(&session, &preferences)?;
+        let save_result = self.commit(context, |events| {
             self.repository
                 .save_focus_session(&session, Some(expected))?;
             self.push_focus_and_capture(
@@ -4317,9 +5319,27 @@ impl SecondMindRuntime {
                 &session,
             );
             Ok(())
-        })?;
+        });
+        if let Err(error) = save_result {
+            if let (Ok(current_session), Ok(current_preferences)) = (
+                find_session(&*self.repository, session_id),
+                self.effective_preferences(owner),
+            ) {
+                let _ = self.reconcile_proactive_cancellation_for_session(
+                    &current_session,
+                    &current_preferences,
+                );
+            }
+            return Err(error);
+        }
+        self.reconcile_proactive_cancellation_for_session(&session, &preferences)?;
         if muted {
-            self.cancel_outbox_for_session(owner, session_id)?;
+            self.cancel_queued_interventions(
+                owner,
+                Some(session_id),
+                "interventions_muted",
+                context,
+            )?;
         }
         if self.publish_native_status(&session).await.is_err() {
             if let Ok(state) = self.ephemeral.lock()
@@ -4388,10 +5408,13 @@ impl SecondMindRuntime {
             published_at,
             heartbeat_deadline: published_at + time::Duration::seconds(10),
         };
-        let acknowledgement =
-            self.native_status.publish(&status).await.map_err(|_| {
-                SecondMindError::unavailable("Native capture status is unavailable.")
-            })?;
+        let acknowledgement = tokio::time::timeout(
+            self.config.native_status_heartbeat_timeout,
+            self.native_status.publish(&status),
+        )
+        .await
+        .map_err(|_| SecondMindError::deadline_exceeded("Native capture status timed out."))?
+        .map_err(|_| SecondMindError::unavailable("Native capture status is unavailable."))?;
         if !valid_status_acknowledgement(&status, &acknowledgement) {
             return Err(SecondMindError::unavailable(
                 "Native capture status acknowledgement is invalid.",
@@ -4435,8 +5458,11 @@ impl SecondMindRuntime {
         session.updated_at = self.clock.now_utc();
         session.revision += 1;
         self.commit(self.daemon_context(), |events| {
-            self.repository
-                .save_focus_session(&session, Some(expected))?;
+            self.persist_focus_lifecycle_transition(
+                &session,
+                expected,
+                AuditDetails::new(vec!["focus_session_stopping".to_owned()], BTreeSet::new()),
+            )?;
             if let Ok(mut state) = self.ephemeral.lock()
                 && let Some(ephemeral) = state.sessions.get_mut(&session_id)
             {
@@ -4453,12 +5479,6 @@ impl SecondMindRuntime {
             Ok(())
         })?;
         self.cancel_outbox_for_session(owner, session_id)?;
-        self.append_audit(
-            owner,
-            AuditKind::FocusSessionStateChanged,
-            session.id.as_uuid(),
-            AuditDetails::new(vec!["focus_session_stopping".to_owned()], BTreeSet::new()),
-        )?;
         Ok(session)
     }
 
@@ -4486,19 +5506,23 @@ impl SecondMindRuntime {
             return Err(SecondMindError::conflict(session.revision));
         }
 
+        // This is idempotent and intentionally repeated during restart
+        // recovery: a crash after Stopping committed but before the original
+        // caller scrubbed the outbox must not preserve actionable text.
+        self.cancel_outbox_for_session(owner, session_id)?;
         let grants = self.repository.load_grants(owner)?;
         let mut cleanup_incomplete = false;
         for grant_id in &session.permission_grant_ids {
-            let Some(grant) = grants.iter().find(|grant| grant.id == *grant_id) else {
+            let grant = grants.iter().find(|grant| grant.id == *grant_id);
+            if grant.is_none() {
                 cleanup_incomplete = true;
-                continue;
             };
-            if !grant.scope.is_observation() {
+            if grant.is_some_and(|grant| !grant.scope.is_observation()) {
                 continue;
             }
             let stopped = tokio::time::timeout(
                 Duration::from_secs(5),
-                self.observation.stop(session_id, grant.id),
+                self.observation.stop(session_id, *grant_id),
             )
             .await;
             if !matches!(stopped, Ok(Ok(()))) {
@@ -4533,24 +5557,21 @@ impl SecondMindRuntime {
         }
         session.revision += 1;
         self.commit(self.daemon_context(), |events| {
-            self.repository
-                .save_focus_session(&session, Some(expected))?;
+            self.persist_focus_lifecycle_transition(
+                &session,
+                expected,
+                AuditDetails::new(
+                    vec![if cleanup_incomplete {
+                        "focus_session_ended_cleanup_incomplete".to_owned()
+                    } else {
+                        "focus_session_ended".to_owned()
+                    }],
+                    BTreeSet::new(),
+                ),
+            )?;
             self.push_focus_and_capture(events, FocusSessionViewChange::Ended, &session);
             Ok(())
         })?;
-        self.append_audit(
-            owner,
-            AuditKind::FocusSessionStateChanged,
-            session.id.as_uuid(),
-            AuditDetails::new(
-                vec![if cleanup_incomplete {
-                    "focus_session_ended_cleanup_incomplete".to_owned()
-                } else {
-                    "focus_session_ended".to_owned()
-                }],
-                BTreeSet::new(),
-            ),
-        )?;
         Ok(session)
     }
 
@@ -4585,6 +5606,7 @@ impl SecondMindRuntime {
         if intervention.revision != expected_revision {
             return Err(SecondMindError::conflict(intervention.revision));
         }
+        let policy_trace = self.persisted_policy_trace(intervention.policy_decision_id)?;
         intervention.outcome = outcome;
         intervention.outcome_at = Some(self.clock.now_utc());
         intervention.correction_summary = (outcome == InterventionOutcome::Corrected)
@@ -4592,8 +5614,17 @@ impl SecondMindRuntime {
         intervention.revision += 1;
         intervention.updated_at = self.clock.now_utc();
         self.commit(self.daemon_context(), |events| {
-            self.repository
-                .save_intervention(&intervention, Some(expected_revision))?;
+            self.persist_intervention_transition(
+                &intervention,
+                expected_revision,
+                AuditKind::InterventionOutcome,
+                AuditDetails::new(
+                    vec![format!("outcome_{outcome:?}").to_lowercase()],
+                    BTreeSet::new(),
+                )
+                .with_optional_policy_trace(policy_trace),
+                None,
+            )?;
             if let Some(correction) = correction
                 && let Ok(mut state) = self.ephemeral.lock()
                 && let Some(ephemeral) = state.sessions.get_mut(&intervention.focus_session_id)
@@ -4609,37 +5640,66 @@ impl SecondMindRuntime {
             );
             Ok(())
         })?;
-        self.append_audit(
-            owner,
-            AuditKind::InterventionOutcome,
-            intervention.id.as_uuid(),
-            AuditDetails::new(
-                vec![format!("outcome_{outcome:?}").to_lowercase()],
-                BTreeSet::new(),
-            ),
-        )?;
         Ok(intervention)
     }
 
     pub fn recover_owner(&self, owner: ActorId) -> Result<Vec<FocusSession>, SecondMindError> {
         let now = self.clock.now_utc();
         self.repository.purge_expired_audit(now)?;
+        let goals = self.repository.load_goals(owner)?;
         let grants = self.repository.load_grants(owner)?;
+        let resources = self.repository.load_resources(owner)?;
         let routes = self.repository.load_model_routes(owner)?;
         let mut recovered = Vec::new();
         for mut session in self.repository.load_focus_sessions(owner)? {
+            if session.state == FocusSessionState::Stopping {
+                // Authority was revoked before the durable Stopping transition
+                // committed. Return it to the daemon recovery coordinator so
+                // bounded adapter/native-status cleanup can resume.
+                recovered.push(session);
+                continue;
+            }
             if !session.is_working() {
                 continue;
             }
-            let can_recover = session.daemon_restart_allowed
+            if self
+                .ephemeral
+                .lock()
+                .map_err(|_| SecondMindError::unavailable("Ephemeral context is unavailable."))?
+                .activations
+                .contains(&session.id)
+            {
+                return Err(SecondMindError::unavailable(
+                    "A focus-session activation is already in progress.",
+                ));
+            }
+            let can_recover = goals.iter().any(|goal| {
+                goal.id == session.goal_id
+                    && goal.revision.get() == session.goal_revision
+                    && goal.state == GoalState::Active
+                    && goal.deadline.is_none_or(|deadline| now < deadline)
+            }) && session.daemon_restart_allowed
                 && session.permission_grant_ids.iter().all(|id| {
                     grants.iter().any(|grant| {
-                        grant.id == *id && grant.daemon_restart_allowed && grant.is_current_at(now)
+                        grant.id == *id
+                            && grant.daemon_restart_allowed
+                            && grant.is_current_at(now)
+                            && grant.selected_resource_id.is_none_or(|resource_id| {
+                                resources.iter().any(|resource| {
+                                    resource.id == resource_id
+                                        && resource_kind_allows_restart(resource.kind)
+                                })
+                            })
                     })
                 })
                 && routes.iter().any(|route| {
                     route.id == session.model_route_approval_id && route.is_current_at(now)
                 });
+            if can_recover && session.state == FocusSessionState::Recovering {
+                recovered.push(session);
+                continue;
+            }
+            self.remove_focus_ephemeral(session.id);
             let expected = session.revision;
             if can_recover {
                 session.state = FocusSessionState::Recovering;
@@ -4647,15 +5707,14 @@ impl SecondMindRuntime {
                 session.updated_at = now;
                 session.revision += 1;
                 self.commit(self.daemon_context(), |events| {
-                    self.repository
-                        .save_focus_session(&session, Some(expected))?;
-                    self.ephemeral
-                        .lock()
-                        .map_err(|_| {
-                            SecondMindError::unavailable("Ephemeral context is unavailable.")
-                        })?
-                        .sessions
-                        .insert(session.id, EphemeralSession::default());
+                    self.persist_focus_lifecycle_transition(
+                        &session,
+                        expected,
+                        AuditDetails::new(
+                            vec!["focus_session_recovery_started".to_owned()],
+                            BTreeSet::new(),
+                        ),
+                    )?;
                     self.push_focus_and_capture(
                         events,
                         FocusSessionViewChange::RecoveryStarted,
@@ -4670,8 +5729,14 @@ impl SecondMindRuntime {
                 session.failure_reason = Some("restart_continuity_not_authorized".to_owned());
                 session.revision += 1;
                 self.commit(self.daemon_context(), |events| {
-                    self.repository
-                        .save_focus_session(&session, Some(expected))?;
+                    self.persist_focus_lifecycle_transition(
+                        &session,
+                        expected,
+                        AuditDetails::new(
+                            vec!["restart_continuity_not_authorized".to_owned()],
+                            BTreeSet::new(),
+                        ),
+                    )?;
                     self.push_focus_and_capture(events, FocusSessionViewChange::Ended, &session);
                     Ok(())
                 })?;
@@ -4698,8 +5763,12 @@ impl SecondMindRuntime {
                 "The focus session is not awaiting adapter recovery.",
             ));
         }
+        let _activation = self.acquire_focus_activation(session.id, session.revision)?;
         let goal = self.get_goal(owner, session.goal_id)?;
-        if goal.state != GoalState::Active || goal.revision.get() != session.goal_revision {
+        if goal.state != GoalState::Active
+            || goal.revision.get() != session.goal_revision
+            || goal.deadline.is_some_and(|deadline| now >= deadline)
+        {
             return Err(SecondMindError::permission(
                 "The recovering focus session no longer matches its goal.",
             ));
@@ -4722,27 +5791,36 @@ impl SecondMindRuntime {
                 "The recovering focus session resource bindings changed.",
             ));
         }
+        let resources = self.repository.load_resources(owner)?;
+        let preferences = self.effective_preferences(session.owner)?;
+        let cancellation = CancellationToken::new();
         if !self.emergency_control.availability().is_available()
             || self.publish_native_status(&session).await.is_err()
         {
+            self.cleanup_focus_activation(session.id, session.revision, &cancellation, &[])
+                .await;
             return Err(SecondMindError::unavailable(
                 "Independent native status and stop control are required for recovery.",
             ));
         }
 
-        let observation_grants: Vec<_> = grants
+        let mut observation_grants: Vec<_> = grants
             .into_iter()
             .filter(|grant| grant.scope.is_observation())
             .collect();
-        let resources = self.repository.load_resources(owner)?;
-        let cancellation = CancellationToken::new();
+        observation_grants.sort_by_key(|grant| observation_start_tier(grant.scope));
         let mut started = Vec::new();
         let mut source_health = BTreeMap::new();
         let mut subscriptions = Vec::new();
         for grant in &observation_grants {
             if !self.observation.availability(grant.scope).is_available() {
-                cancellation.cancel();
-                stop_started(&*self.observation, session.id, &started).await;
+                self.cleanup_focus_activation(
+                    session.id,
+                    session.revision,
+                    &cancellation,
+                    &started,
+                )
+                .await;
                 return Err(SecondMindError::unavailable(
                     "A required recovering observation source is unavailable.",
                 ));
@@ -4755,15 +5833,22 @@ impl SecondMindRuntime {
                 resource,
                 limits: observation_limits(&self.config, grant.scope),
             };
-            let subscription = match self
-                .observation
-                .start(&request, cancellation.child_token())
-                .await
+            let subscription = match tokio::time::timeout(
+                self.config.native_status_heartbeat_timeout,
+                self.observation.start(&request, cancellation.child_token()),
+            )
+            .await
             {
-                Ok(subscription) => subscription,
-                Err(_) => {
-                    cancellation.cancel();
-                    stop_started(&*self.observation, session.id, &started).await;
+                Ok(Ok(subscription)) => subscription,
+                Ok(Err(_)) | Err(_) => {
+                    started.push(grant.id);
+                    self.cleanup_focus_activation(
+                        session.id,
+                        session.revision,
+                        &cancellation,
+                        &started,
+                    )
+                    .await;
                     return Err(SecondMindError::unavailable(
                         "A recovering observation source failed to restart.",
                     ));
@@ -4778,8 +5863,13 @@ impl SecondMindRuntime {
                     > time::Duration::try_from(self.config.source_freshness)
                         .unwrap_or(time::Duration::MAX)
             {
-                cancellation.cancel();
-                stop_started(&*self.observation, session.id, &started).await;
+                self.cleanup_focus_activation(
+                    session.id,
+                    session.revision,
+                    &cancellation,
+                    &started,
+                )
+                .await;
                 return Err(SecondMindError::unavailable(
                     "A recovering observation source is not freshly healthy.",
                 ));
@@ -4789,40 +5879,62 @@ impl SecondMindRuntime {
         }
 
         let expected = session.revision;
+        let active_revision = session.revision.saturating_add(1);
+        let mut ephemeral = EphemeralSession {
+            source_health,
+            native_status_revision: Some(active_revision),
+            ..EphemeralSession::with_cancellation(cancellation.clone())
+        };
+        reconcile_proactive_cancellation(
+            &mut ephemeral,
+            !session.muted
+                && preferences.proactive_interventions_enabled
+                && !preferences.proactive_interventions_muted,
+        );
+        let install_result = self
+            .ephemeral
+            .lock()
+            .map_err(|_| SecondMindError::unavailable("Ephemeral context is unavailable."))
+            .map(|mut state| {
+                if let Some(previous) = state.sessions.insert(session.id, ephemeral) {
+                    previous.cancellation.cancel();
+                }
+            });
+        if let Err(error) = install_result {
+            self.cleanup_focus_activation(session.id, session.revision, &cancellation, &started)
+                .await;
+            return Err(error);
+        }
         session.state = FocusSessionState::Active;
         session.source_degraded = false;
+        session.failure_reason = None;
         session.updated_at = self.clock.now_utc();
-        session.revision = session.revision.saturating_add(1);
-        self.commit(self.daemon_context(), |events| {
-            self.repository
-                .save_focus_session(&session, Some(expected))?;
-            self.ephemeral
-                .lock()
-                .map_err(|_| SecondMindError::unavailable("Ephemeral context is unavailable."))?
-                .sessions
-                .insert(
-                    session.id,
-                    EphemeralSession {
-                        source_health,
-                        cancellation: cancellation.clone(),
-                        ..EphemeralSession::default()
-                    },
-                );
+        session.revision = active_revision;
+        if let Err(error) = self.commit(self.daemon_context(), |events| {
+            self.persist_focus_lifecycle_transition(
+                &session,
+                expected,
+                AuditDetails::new(vec!["focus_session_recovered".to_owned()], BTreeSet::new()),
+            )?;
             self.push_focus_and_capture(events, FocusSessionViewChange::Recovered, &session);
             Ok(())
-        })?;
-        if self.publish_native_status(&session).await.is_err() {
-            let _ = self
-                .pause_capture_for_native_status_loss(
-                    session.id,
-                    "Native capture status acknowledgement was lost during recovery.",
-                )
+        }) {
+            self.cleanup_focus_activation(session.id, expected, &cancellation, &started)
                 .await;
+            return Err(error);
+        }
+        if self.publish_native_status(&session).await.is_err() {
+            self.cleanup_focus_activation(session.id, session.revision, &cancellation, &started)
+                .await;
+            let _ = self.mark_focus_recovery_pending(
+                &mut session,
+                "native_status_acknowledgement_lost_during_recovery",
+            );
             return Err(SecondMindError::unavailable(
                 "Native capture status acknowledgement was lost during recovery.",
             ));
         }
-        self.commit(self.daemon_context(), |events| {
+        let _ = self.commit(self.daemon_context(), |events| {
             events.push(CoreEvent::CapabilityHealthChanged {
                 capability: CapabilityHealth {
                     id: "platform.native_status",
@@ -4831,7 +5943,7 @@ impl SecondMindRuntime {
                 },
             });
             Ok(())
-        })?;
+        });
         for (grant_id, subscription) in subscriptions {
             self.spawn_observation_subscription(
                 session.id,
@@ -4842,79 +5954,73 @@ impl SecondMindRuntime {
         }
         self.spawn_native_status_monitor(session.id, cancellation.child_token());
         self.spawn_native_status_heartbeat(session.id, cancellation.child_token());
-        self.append_audit(
-            owner,
-            AuditKind::FocusSessionStateChanged,
-            session.id.as_uuid(),
-            AuditDetails::new(vec!["focus_session_recovered".to_owned()], BTreeSet::new()),
-        )?;
         Ok(session)
     }
 
-    pub fn mark_recovered_sources_healthy(
+    fn cancel_queued_interventions(
         &self,
         owner: ActorId,
-        session_id: FocusSessionId,
-        healthy_scopes: BTreeSet<PermissionScope>,
-    ) -> Result<FocusSession, SecondMindError> {
-        let mut session = find_session(&*self.repository, session_id)?;
-        if session.owner != owner || session.state != FocusSessionState::Recovering {
-            return Err(SecondMindError::invalid(
-                "The focus session is not awaiting recovery evidence.",
-            ));
-        }
-        let grants = resolve_grants(
-            &*self.repository,
-            owner,
-            session.id,
-            &session.permission_grant_ids,
-            self.clock.now_utc(),
-        )?;
-        let required: BTreeSet<_> = grants
-            .iter()
-            .filter(|grant| grant.scope.is_observation())
-            .map(|grant| grant.scope)
-            .collect();
-        if !required.is_subset(&healthy_scopes) {
-            return Err(SecondMindError::unavailable(
-                "Fresh health is missing for a required observation source.",
-            ));
-        }
-        let expected = session.revision;
-        session.state = FocusSessionState::Active;
-        session.source_degraded = false;
-        session.updated_at = self.clock.now_utc();
-        session.revision += 1;
-        self.commit(self.daemon_context(), |events| {
-            self.repository
-                .save_focus_session(&session, Some(expected))?;
-            if let Ok(mut state) = self.ephemeral.lock()
-                && let Some(ephemeral) = state.sessions.get_mut(&session_id)
-            {
-                let observed_at = self.clock.now_utc();
-                ephemeral.source_health = grants
-                    .iter()
-                    .filter(|grant| grant.scope.is_observation())
-                    .map(|grant| {
-                        (
-                            grant.id,
-                            ObservationSourceStatus {
-                                source_id: format!("recovered:{}", grant.id),
-                                grant_id: grant.id,
-                                scope: grant.scope,
-                                resource_id: grant.selected_resource_id,
-                                health: crate::SourceHealth::Healthy,
-                                detail: "The recovered observation source is freshly healthy.",
-                                observed_at,
-                            },
-                        )
-                    })
-                    .collect();
+        session_filter: Option<FocusSessionId>,
+        reason_code: &'static str,
+        context: EventContext,
+    ) -> Result<(), SecondMindError> {
+        let now = self.clock.now_utc();
+        let interventions = self.repository.load_interventions(owner)?;
+        for mut entry in self.repository.load_pending_deliveries(owner)? {
+            if entry.state != OutboxState::Queued {
+                continue;
             }
-            self.push_focus_and_capture(events, FocusSessionViewChange::Recovered, &session);
-            Ok(())
-        })?;
-        Ok(session)
+            let Some(mut intervention) = interventions
+                .iter()
+                .find(|intervention| intervention.id == entry.intervention_id)
+                .cloned()
+            else {
+                if session_filter.is_some() {
+                    continue;
+                }
+                // The delivery payload is the most sensitive retained copy;
+                // clear it even if the corresponding history record is
+                // unavailable, then surface the repository inconsistency.
+                self.repository.save_delivery(&entry)?;
+                return Err(SecondMindError::unavailable(
+                    "A queued intervention is unavailable.",
+                ));
+            };
+            if session_filter.is_some_and(|session_id| intervention.focus_session_id != session_id)
+            {
+                continue;
+            }
+            let expected_delivery_state = entry.state;
+            entry.state = OutboxState::Cancelled;
+            entry.user_visible_text.clear();
+            let expected = intervention.revision;
+            intervention.state = InterventionState::Cancelled;
+            intervention.outcome = InterventionOutcome::Expired;
+            intervention.outcome_at = Some(now);
+            intervention.reason_code = reason_code.to_owned();
+            scrub_intervention(&mut intervention);
+            intervention.revision = intervention.revision.saturating_add(1);
+            intervention.updated_at = now;
+            self.commit(context, |events| {
+                self.persist_intervention_transition(
+                    &intervention,
+                    expected,
+                    AuditKind::InterventionDelivery,
+                    AuditDetails::new(vec![reason_code.to_owned()], BTreeSet::new()),
+                    Some(PendingDeliveryTransition::Update {
+                        delivery: entry.clone(),
+                        expected_state: expected_delivery_state,
+                    }),
+                )?;
+                Self::push_intervention_update(
+                    events,
+                    &intervention,
+                    InterventionHistoryViewChange::Updated,
+                );
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     fn cancel_outbox_for_grant(
@@ -4933,7 +6039,7 @@ impl SecondMindRuntime {
         Ok(())
     }
 
-    fn session_cancellation(
+    fn proactive_cancellation(
         &self,
         session_id: FocusSessionId,
     ) -> Result<CancellationToken, SecondMindError> {
@@ -4942,7 +6048,7 @@ impl SecondMindRuntime {
             .map_err(|_| SecondMindError::unavailable("Ephemeral context is unavailable."))?
             .sessions
             .get(&session_id)
-            .map(|session| session.cancellation.child_token())
+            .map(|session| session.proactive_cancellation.child_token())
             .ok_or_else(|| {
                 SecondMindError::unavailable("The session has no live cancellation authority.")
             })
@@ -5008,10 +6114,73 @@ impl SecondMindRuntime {
             evidence_categories: details.evidence_categories,
             evidence_age_ms: details.evidence_age_ms,
             confidence_basis_points: details.confidence_basis_points,
+            policy_trace: details.policy_trace,
             occurred_at: now,
             expires_at: now
                 + time::Duration::try_from(self.config.audit_ttl).unwrap_or(time::Duration::MAX),
         }
+    }
+
+    fn persist_focus_lifecycle_transition(
+        &self,
+        session: &FocusSession,
+        expected_revision: u64,
+        details: AuditDetails,
+    ) -> Result<(), SecondMindError> {
+        let audit = self.build_audit_record(
+            session.owner,
+            AuditKind::FocusSessionStateChanged,
+            session.id.as_uuid(),
+            details,
+        );
+        self.repository
+            .save_focus_session_transition(&FocusSessionLifecycleWrite {
+                session: session.clone(),
+                expected_revision,
+                audit,
+            })?;
+        Ok(())
+    }
+
+    fn persist_permission_revocation(
+        &self,
+        grant: &PermissionGrant,
+        expected_revision: u64,
+        details: AuditDetails,
+    ) -> Result<(), SecondMindError> {
+        let audit = self.build_audit_record(
+            grant.owner,
+            AuditKind::PermissionRevoked,
+            grant.id.as_uuid(),
+            details,
+        );
+        self.repository
+            .save_permission_grant_revocation(&PermissionGrantRevocationWrite {
+                grant: grant.clone(),
+                expected_revision,
+                audit,
+            })?;
+        Ok(())
+    }
+
+    fn persist_intervention_transition(
+        &self,
+        intervention: &Intervention,
+        expected_revision: u64,
+        kind: AuditKind,
+        details: AuditDetails,
+        delivery: Option<PendingDeliveryTransition>,
+    ) -> Result<(), SecondMindError> {
+        let audit =
+            self.build_audit_record(intervention.owner, kind, intervention.id.as_uuid(), details);
+        self.repository
+            .save_intervention_transition(&InterventionTransitionWrite {
+                intervention: intervention.clone(),
+                expected_revision,
+                audit,
+                delivery,
+            })?;
+        Ok(())
     }
 
     fn append_audit(
@@ -5024,6 +6193,36 @@ impl SecondMindRuntime {
         let record = self.build_audit_record(owner, kind, subject_id, details);
         self.repository.append_audit(&record)?;
         Ok(record)
+    }
+}
+
+fn observation_is_within_retention(
+    config: &SecondMindConfig,
+    observation: &NormalizedObservation,
+    now: OffsetDateTime,
+) -> bool {
+    let configured_ttl = match observation.provenance.retention {
+        crate::ObservationRetention::EphemeralSession => config.observation_ttl,
+        crate::ObservationRetention::SingleOperation => config
+            .observation_ttl
+            .min(config.maximum_model_evidence_age),
+    };
+    let ttl = time::Duration::try_from(configured_ttl).unwrap_or(time::Duration::MAX);
+    let age = now - observation.provenance.observed_at;
+    !age.is_negative() && age < ttl
+}
+
+fn duration_millis_u64(value: Duration) -> u64 {
+    u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
+}
+
+const fn presence_wire_name(value: crate::PresenceState) -> &'static str {
+    match value {
+        crate::PresenceState::Active => "active",
+        crate::PresenceState::Idle => "idle",
+        crate::PresenceState::Locked => "locked",
+        crate::PresenceState::SwitchedAway => "switched_away",
+        crate::PresenceState::Unknown => "unknown",
     }
 }
 
@@ -5133,6 +6332,17 @@ fn scrub_intervention(intervention: &mut Intervention) {
     intervention.evidence.clear();
 }
 
+fn reconcile_proactive_cancellation(ephemeral: &mut EphemeralSession, allowed: bool) {
+    if allowed {
+        if ephemeral.proactive_cancellation.is_cancelled() && !ephemeral.cancellation.is_cancelled()
+        {
+            ephemeral.proactive_cancellation = ephemeral.cancellation.child_token();
+        }
+    } else {
+        ephemeral.proactive_cancellation.cancel();
+    }
+}
+
 const fn consumes_intervention_cooldown(state: InterventionState) -> bool {
     matches!(
         state,
@@ -5189,7 +6399,7 @@ fn validate_model_route(
 ) -> Result<(), SecondMindError> {
     if route.provider.trim().is_empty()
         || route.model.trim().is_empty()
-        || route.secret_ref.as_str().trim().is_empty()
+        || !route.has_approval_scoped_secret_ref()
         || route.purpose != "reason.focus_context"
         || route.maximum_input_tokens == 0
         || route.maximum_input_tokens > 8_000
@@ -5221,13 +6431,29 @@ fn validate_grant_input(
     )?;
     if command.effective_at < now - time::Duration::minutes(1)
         || command.expires_at <= command.effective_at
+        || command.expires_at > command.effective_at + time::Duration::hours(8)
     {
         return Err(SecondMindError::invalid(
-            "Permission effective and expiry times are invalid.",
+            "Permission effective and expiry times are invalid or exceed the eight-hour maximum.",
         ));
     }
-    let needs_resource = matches!(
-        command.scope,
+    if command.scope == PermissionScope::ObserveScreenPixels && command.daemon_restart_allowed {
+        return Err(SecondMindError::invalid(
+            "Screen-pixel permission cannot continue after a daemon restart; select the source again.",
+        ));
+    }
+    let needs_resource = scope_requires_resource(command.scope);
+    if needs_resource != command.selected_resource_id.is_some() {
+        return Err(SecondMindError::invalid(
+            "The permission resource binding does not match its scope.",
+        ));
+    }
+    Ok(())
+}
+
+const fn scope_requires_resource(scope: PermissionScope) -> bool {
+    matches!(
+        scope,
         PermissionScope::ObserveDesktopForegroundApplication
             | PermissionScope::ObserveDesktopWindowMetadata
             | PermissionScope::ObserveBrowserLocation
@@ -5235,13 +6461,42 @@ fn validate_grant_input(
             | PermissionScope::ObserveContentSelectedDocument
             | PermissionScope::ObserveScreenPixels
             | PermissionScope::ObserveWorkspaceActivity
-    );
-    if needs_resource != command.selected_resource_id.is_some() {
-        return Err(SecondMindError::invalid(
-            "The permission resource binding does not match its scope.",
-        ));
-    }
-    Ok(())
+    )
+}
+
+const fn resource_kind_matches_scope(scope: PermissionScope, kind: ResourceKind) -> bool {
+    matches!(
+        (scope, kind),
+        (
+            PermissionScope::ObserveDesktopForegroundApplication,
+            ResourceKind::Application
+        ) | (
+            PermissionScope::ObserveDesktopWindowMetadata,
+            ResourceKind::Window
+        ) | (
+            PermissionScope::ObserveBrowserLocation,
+            ResourceKind::BrowserSurface
+        ) | (
+            PermissionScope::ObserveContentVisibleText,
+            ResourceKind::Window | ResourceKind::BrowserSurface
+        ) | (
+            PermissionScope::ObserveContentSelectedDocument,
+            ResourceKind::Document
+        ) | (
+            PermissionScope::ObserveScreenPixels,
+            ResourceKind::ScreenRegion
+        ) | (
+            PermissionScope::ObserveWorkspaceActivity,
+            ResourceKind::Workspace
+        )
+    )
+}
+
+const fn resource_kind_allows_restart(kind: ResourceKind) -> bool {
+    !matches!(
+        kind,
+        ResourceKind::BrowserSurface | ResourceKind::ScreenRegion
+    )
 }
 
 fn validate_candidate(
@@ -5521,6 +6776,17 @@ fn observation_to_context(value: &NormalizedObservationValue) -> Option<Sensitiv
     }
 }
 
+const fn observation_start_tier(scope: PermissionScope) -> u8 {
+    match scope {
+        PermissionScope::ObserveBrowserLocation
+        | PermissionScope::ObserveContentSelectedDocument
+        | PermissionScope::ObserveContentVisibleText
+        | PermissionScope::ObserveDesktopWindowMetadata => 0,
+        PermissionScope::ObserveScreenPixels => 2,
+        _ => 1,
+    }
+}
+
 fn observation_limits(config: &SecondMindConfig, scope: PermissionScope) -> ObservationLimits {
     let minimum_interval = match scope {
         PermissionScope::ObserveDesktopPresence
@@ -5563,7 +6829,11 @@ async fn stop_started(
     grants: &[PermissionGrantId],
 ) {
     for grant_id in grants {
-        let _ = observation.stop(session_id, *grant_id).await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            observation.stop(session_id, *grant_id),
+        )
+        .await;
     }
 }
 
@@ -5655,7 +6925,7 @@ mod tests {
     use crate::{
         EmergencyControlPort, IdempotencyKey, InterventionTone, ManualClock, MemoryRepository,
         ModelHandlingProfile, ModelPlacement, ObservationPortError, ObservationSourceStatus,
-        PlatformPortAvailability, ResourceId, ResourceKind, SourceHealth,
+        PlatformPortAvailability, ResourceId, SourceHealth,
     };
 
     fn idempotency(seed: u8) -> IdempotencyContext {
@@ -5665,10 +6935,283 @@ mod tests {
         }
     }
 
+    #[test]
+    fn observation_start_order_is_stable_and_places_structured_sources_before_pixels() {
+        let mut scopes = vec![
+            PermissionScope::ObserveScreenPixels,
+            PermissionScope::ObserveDesktopPresence,
+            PermissionScope::ObserveContentSelectedDocument,
+            PermissionScope::ObserveWorkspaceActivity,
+            PermissionScope::ObserveBrowserLocation,
+            PermissionScope::ObserveContentVisibleText,
+            PermissionScope::ObserveDesktopWindowMetadata,
+            PermissionScope::ObserveDesktopForegroundApplication,
+        ];
+        scopes.sort_by_key(|scope| observation_start_tier(*scope));
+        assert_eq!(
+            scopes,
+            vec![
+                PermissionScope::ObserveContentSelectedDocument,
+                PermissionScope::ObserveBrowserLocation,
+                PermissionScope::ObserveContentVisibleText,
+                PermissionScope::ObserveDesktopWindowMetadata,
+                PermissionScope::ObserveDesktopPresence,
+                PermissionScope::ObserveWorkspaceActivity,
+                PermissionScope::ObserveDesktopForegroundApplication,
+                PermissionScope::ObserveScreenPixels,
+            ]
+        );
+    }
+
+    #[test]
+    fn screen_pixel_grant_cannot_claim_daemon_restart_continuity() {
+        let now = datetime!(2026-08-20 12:00 UTC);
+        let command = GrantPermission {
+            idempotency: idempotency(1),
+            owner: ActorId::new_v7(),
+            goal_id: GoalId::new_v7(),
+            client_id: ClientId::new_v7(),
+            device_id: crate::DeviceId::new_v7(),
+            scope: PermissionScope::ObserveScreenPixels,
+            selected_resource_id: Some(ResourceId::new_v7()),
+            purpose: "Synthetic bounded pixel fixture".to_owned(),
+            client_disconnect_allowed: true,
+            daemon_restart_allowed: true,
+            effective_at: now,
+            expires_at: now + time::Duration::minutes(5),
+            consent_copy_version: "phase2-consent-v1".to_owned(),
+        };
+
+        let error = validate_grant_input(&command, now).unwrap_err();
+
+        assert_eq!(error.code, SecondMindErrorCode::InvalidArgument);
+        assert_eq!(
+            error.summary,
+            "Screen-pixel permission cannot continue after a daemon restart; select the source again."
+        );
+
+        let mut process_lifetime_only = command;
+        process_lifetime_only.daemon_restart_allowed = false;
+        assert!(validate_grant_input(&process_lifetime_only, now).is_ok());
+
+        process_lifetime_only.expires_at =
+            process_lifetime_only.effective_at + time::Duration::hours(8);
+        assert!(validate_grant_input(&process_lifetime_only, now).is_ok());
+        process_lifetime_only.expires_at += time::Duration::nanoseconds(1);
+        let error = validate_grant_input(&process_lifetime_only, now).unwrap_err();
+        assert_eq!(error.code, SecondMindErrorCode::InvalidArgument);
+        assert_eq!(
+            error.summary,
+            "Permission effective and expiry times are invalid or exceed the eight-hour maximum."
+        );
+    }
+
+    #[test]
+    fn grant_permission_rejects_a_resource_kind_that_does_not_match_the_scope() {
+        assert!(resource_kind_matches_scope(
+            PermissionScope::ObserveContentVisibleText,
+            ResourceKind::Window
+        ));
+        assert!(resource_kind_matches_scope(
+            PermissionScope::ObserveContentVisibleText,
+            ResourceKind::BrowserSurface
+        ));
+        let fixture = fixture(Vec::new(), true);
+        let now = fixture.clock.now_utc();
+        let goal = fixture
+            .runtime
+            .create_goal(
+                ClientAssurance::PrivateCapabilityBound,
+                CreateGoal {
+                    actor: fixture.owner,
+                    idempotency_key: IdempotencyKey::new_v7(),
+                    title: "Synthetic resource authority".to_owned(),
+                    success_statement: "Mismatched resource kinds are rejected.".to_owned(),
+                    deadline: None,
+                },
+            )
+            .unwrap();
+        fixture
+            .runtime
+            .save_resource_binding(
+                ClientAssurance::PrivateCapabilityBound,
+                ResourceBinding {
+                    id: fixture.resource,
+                    owner: fixture.owner,
+                    kind: ResourceKind::Workspace,
+                    opaque_reference: "synthetic-workspace-token".to_owned(),
+                    display_label: "Synthetic workspace".to_owned(),
+                    revision: 1,
+                    created_at: now,
+                },
+            )
+            .unwrap();
+        let command = GrantPermission {
+            idempotency: idempotency(2),
+            owner: fixture.owner,
+            goal_id: goal.id,
+            client_id: fixture.client,
+            device_id: fixture.device,
+            scope: PermissionScope::ObserveContentVisibleText,
+            selected_resource_id: Some(fixture.resource),
+            purpose: "Synthetic exact-resource fixture".to_owned(),
+            client_disconnect_allowed: true,
+            daemon_restart_allowed: false,
+            effective_at: now,
+            expires_at: now + time::Duration::minutes(5),
+            consent_copy_version: "phase2-consent-v1".to_owned(),
+        };
+
+        let error = fixture
+            .runtime
+            .grant_permission(ClientAssurance::PrivateCapabilityBound, command)
+            .unwrap_err();
+
+        assert_eq!(error.code, SecondMindErrorCode::InvalidArgument);
+        assert_eq!(
+            error.summary,
+            "The selected resource kind does not match the permission scope."
+        );
+        assert!(
+            fixture
+                .repository
+                .load_grants(fixture.owner)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn browser_surface_grant_cannot_claim_daemon_restart_continuity() {
+        assert!(!resource_kind_allows_restart(ResourceKind::BrowserSurface));
+        assert!(!resource_kind_allows_restart(ResourceKind::ScreenRegion));
+        assert!(resource_kind_allows_restart(ResourceKind::Window));
+        let fixture = fixture(Vec::new(), true);
+        let now = fixture.clock.now_utc();
+        let goal = fixture
+            .runtime
+            .create_goal(
+                ClientAssurance::PrivateCapabilityBound,
+                CreateGoal {
+                    actor: fixture.owner,
+                    idempotency_key: IdempotencyKey::new_v7(),
+                    title: "Synthetic browser continuity".to_owned(),
+                    success_statement: "Connection-bound authority is explicit.".to_owned(),
+                    deadline: None,
+                },
+            )
+            .unwrap();
+        fixture
+            .runtime
+            .save_resource_binding(
+                ClientAssurance::PrivateCapabilityBound,
+                ResourceBinding {
+                    id: fixture.resource,
+                    owner: fixture.owner,
+                    kind: ResourceKind::BrowserSurface,
+                    opaque_reference: "synthetic-browser-binding".to_owned(),
+                    display_label: "Synthetic selected Edge tab".to_owned(),
+                    revision: 1,
+                    created_at: now,
+                },
+            )
+            .unwrap();
+        let command = GrantPermission {
+            idempotency: idempotency(3),
+            owner: fixture.owner,
+            goal_id: goal.id,
+            client_id: fixture.client,
+            device_id: fixture.device,
+            scope: PermissionScope::ObserveBrowserLocation,
+            selected_resource_id: Some(fixture.resource),
+            purpose: "Synthetic connection-bound browser fixture".to_owned(),
+            client_disconnect_allowed: true,
+            daemon_restart_allowed: true,
+            effective_at: now,
+            expires_at: now + time::Duration::minutes(5),
+            consent_copy_version: "phase2-consent-v1".to_owned(),
+        };
+
+        let error = fixture
+            .runtime
+            .grant_permission(ClientAssurance::PrivateCapabilityBound, command)
+            .unwrap_err();
+        assert_eq!(error.code, SecondMindErrorCode::InvalidArgument);
+        assert_eq!(
+            error.summary,
+            "Browser permission cannot continue after a daemon restart; select the tab again."
+        );
+        assert!(
+            fixture
+                .repository
+                .load_grants(fixture.owner)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn grant_permission_cannot_outlive_its_goal_deadline() {
+        let fixture = fixture(Vec::new(), true);
+        let now = fixture.clock.now_utc();
+        let deadline = now + time::Duration::minutes(30);
+        let goal = fixture
+            .runtime
+            .create_goal(
+                ClientAssurance::PrivateCapabilityBound,
+                CreateGoal {
+                    actor: fixture.owner,
+                    idempotency_key: IdempotencyKey::new_v7(),
+                    title: "Synthetic bounded permission".to_owned(),
+                    success_statement: "The permission ends with its goal.".to_owned(),
+                    deadline: Some(deadline),
+                },
+            )
+            .unwrap();
+        let mut command = GrantPermission {
+            idempotency: idempotency(92),
+            owner: fixture.owner,
+            goal_id: goal.id,
+            client_id: fixture.client,
+            device_id: fixture.device,
+            scope: PermissionScope::ObserveDesktopPresence,
+            selected_resource_id: None,
+            purpose: "Synthetic goal-bounded permission".to_owned(),
+            client_disconnect_allowed: true,
+            daemon_restart_allowed: false,
+            effective_at: now,
+            expires_at: deadline + time::Duration::nanoseconds(1),
+            consent_copy_version: "phase2-consent-v1".to_owned(),
+        };
+
+        let error = fixture
+            .runtime
+            .grant_permission(ClientAssurance::PrivateCapabilityBound, command.clone())
+            .unwrap_err();
+        assert_eq!(error.code, SecondMindErrorCode::InvalidArgument);
+        assert_eq!(
+            error.summary,
+            "Permission expiry cannot extend beyond the goal deadline."
+        );
+
+        command.idempotency = idempotency(93);
+        command.expires_at = deadline;
+        assert!(
+            fixture
+                .runtime
+                .grant_permission(ClientAssurance::PrivateCapabilityBound, command)
+                .is_ok()
+        );
+    }
+
     #[derive(Default)]
     struct AvailableObservation {
         repository: Option<MemoryRepository>,
         cleanup_states: Mutex<Vec<FocusSessionState>>,
+        corrupt_next_initial_status: AtomicBool,
+        bump_session_revision_on_next_start: AtomicBool,
+        hang_next_start: AtomicBool,
+        start_calls: AtomicUsize,
     }
 
     impl AvailableObservation {
@@ -5676,7 +7219,25 @@ mod tests {
             Self {
                 repository: Some(repository),
                 cleanup_states: Mutex::new(Vec::new()),
+                corrupt_next_initial_status: AtomicBool::new(false),
+                bump_session_revision_on_next_start: AtomicBool::new(false),
+                hang_next_start: AtomicBool::new(false),
+                start_calls: AtomicUsize::new(0),
             }
+        }
+
+        fn corrupt_next_initial_status(&self) {
+            self.corrupt_next_initial_status
+                .store(true, Ordering::SeqCst);
+        }
+
+        fn bump_session_revision_on_next_start(&self) {
+            self.bump_session_revision_on_next_start
+                .store(true, Ordering::SeqCst);
+        }
+
+        fn hang_next_start(&self) {
+            self.hang_next_start.store(true, Ordering::SeqCst);
         }
     }
 
@@ -5691,21 +7252,52 @@ mod tests {
             cancellation: CancellationToken,
         ) -> crate::PortFuture<'a, Result<ObservationSubscription, ObservationPortError>> {
             Box::pin(async move {
+                self.start_calls.fetch_add(1, Ordering::SeqCst);
+                if self.hang_next_start.swap(false, Ordering::SeqCst) {
+                    cancellation.cancelled().await;
+                    return Err(ObservationPortError {
+                        kind: crate::ObservationPortErrorKind::Cancelled,
+                        summary: "Synthetic source start was cancelled.",
+                    });
+                }
+                if self
+                    .bump_session_revision_on_next_start
+                    .swap(false, Ordering::SeqCst)
+                    && let (Some(repository), Some(session_id)) =
+                        (&self.repository, request.grant.focus_session_id)
+                {
+                    let mut session = repository
+                        .find_focus_session(session_id)
+                        .expect("synthetic repository is available")
+                        .expect("synthetic focus session exists");
+                    let expected = session.revision;
+                    session.revision = session.revision.saturating_add(1);
+                    repository
+                        .save_focus_session(&session, Some(expected))
+                        .expect("synthetic revision race is installed");
+                }
                 let (events, receiver) = tokio::sync::mpsc::channel(8);
                 tokio::spawn(async move {
                     cancellation.cancelled().await;
                     drop(events);
                 });
+                let mut initial_status = ObservationSourceStatus {
+                    source_id: format!("synthetic:{}", request.grant.id),
+                    grant_id: request.grant.id,
+                    scope: request.grant.scope,
+                    resource_id: request.grant.selected_resource_id,
+                    health: SourceHealth::Healthy,
+                    detail: "Synthetic source is healthy.",
+                    observed_at: request.grant.effective_at,
+                };
+                if self
+                    .corrupt_next_initial_status
+                    .swap(false, Ordering::SeqCst)
+                {
+                    initial_status.grant_id = PermissionGrantId::new_v7();
+                }
                 Ok(ObservationSubscription {
-                    initial_status: ObservationSourceStatus {
-                        source_id: format!("synthetic:{}", request.grant.id),
-                        grant_id: request.grant.id,
-                        scope: request.grant.scope,
-                        resource_id: request.grant.selected_resource_id,
-                        health: SourceHealth::Healthy,
-                        detail: "Synthetic source is healthy.",
-                        observed_at: request.grant.effective_at,
-                    },
+                    initial_status,
                     events: receiver,
                 })
             })
@@ -5728,10 +7320,97 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ScriptedCleanupSecretStore {
+        failures_remaining: AtomicUsize,
+        delete_calls: AtomicUsize,
+    }
+
+    impl ScriptedCleanupSecretStore {
+        fn fail_next_delete(&self) {
+            self.failures_remaining.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl SecretStore for ScriptedCleanupSecretStore {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn read(
+            &self,
+            _key: &crate::SecretKey,
+        ) -> Result<Option<crate::SecretValue>, crate::SecretStoreError> {
+            Ok(None)
+        }
+
+        fn delete(&self, _key: &crate::SecretKey) -> Result<bool, crate::SecretStoreError> {
+            self.delete_calls.fetch_add(1, Ordering::SeqCst);
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                Err(crate::SecretStoreError {
+                    kind: crate::SecretStoreErrorKind::Unavailable,
+                    summary: "Synthetic adapter diagnostic must not cross the cleanup boundary.",
+                })
+            } else {
+                Ok(false)
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct ScriptedResourceCleanup {
+        failures_remaining: AtomicUsize,
+        release_calls: AtomicUsize,
+    }
+
+    impl ScriptedResourceCleanup {
+        fn fail_next_release(&self) {
+            self.failures_remaining.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl ResourceSelectionPort for ScriptedResourceCleanup {
+        fn availability(&self) -> PlatformPortAvailability {
+            PlatformPortAvailability::Available
+        }
+
+        fn release<'a>(
+            &'a self,
+            _binding: NativeResourceBinding,
+            _cancellation: CancellationToken,
+        ) -> crate::PortFuture<'a, Result<(), crate::ResourceSelectionError>> {
+            self.release_calls.fetch_add(1, Ordering::SeqCst);
+            let fail = self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+            Box::pin(async move {
+                if fail {
+                    Err(crate::ResourceSelectionError {
+                        kind: ResourceSelectionErrorKind::Unavailable,
+                        summary: "Synthetic native cleanup exposed private diagnostic text.",
+                        retryable: true,
+                    })
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
     struct ScriptedModel {
         outputs: Mutex<VecDeque<ModelReasoningOutput>>,
         calls: AtomicUsize,
         hang: AtomicBool,
+        cancellation_observed: Arc<AtomicBool>,
     }
 
     impl ScriptedModel {
@@ -5740,6 +7419,7 @@ mod tests {
                 outputs: Mutex::new(outputs.into_iter().collect()),
                 calls: AtomicUsize::new(0),
                 hang: AtomicBool::new(false),
+                cancellation_observed: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -5752,13 +7432,26 @@ mod tests {
         fn reason<'a>(
             &'a self,
             request: &'a ModelReasoningRequest,
-            _cancellation: CancellationToken,
+            cancellation: CancellationToken,
         ) -> crate::PortFuture<'a, Result<ModelReasoningOutput, crate::ModelGatewayError>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let hang = self.hang.load(Ordering::SeqCst);
+            if hang {
+                let watcher_cancellation = cancellation.clone();
+                let cancellation_observed = self.cancellation_observed.clone();
+                tokio::spawn(async move {
+                    watcher_cancellation.cancelled().await;
+                    cancellation_observed.store(true, Ordering::SeqCst);
+                });
+            }
             Box::pin(async move {
                 if hang {
-                    return std::future::pending().await;
+                    cancellation.cancelled().await;
+                    return Err(crate::ModelGatewayError {
+                        kind: ModelGatewayErrorKind::Cancelled,
+                        summary: "Synthetic model cancellation was observed.",
+                        retryable: false,
+                    });
                 }
                 assert!(request.permitted_categories.contains(&DataCategory::Goal));
                 assert!(
@@ -5783,6 +7476,7 @@ mod tests {
         available: AtomicBool,
         hang: AtomicBool,
         calls: AtomicUsize,
+        cancellation_observed: Arc<AtomicBool>,
         audit_seen_before_delivery: AtomicBool,
         repository: MemoryRepository,
         owner: ActorId,
@@ -5809,6 +7503,14 @@ mod tests {
         {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let hang = self.hang.load(Ordering::SeqCst);
+            if hang {
+                let watcher_cancellation = cancellation.clone();
+                let cancellation_observed = self.cancellation_observed.clone();
+                tokio::spawn(async move {
+                    watcher_cancellation.cancelled().await;
+                    cancellation_observed.store(true, Ordering::SeqCst);
+                });
+            }
             let acknowledgement = *self
                 .acknowledgement
                 .lock()
@@ -5836,7 +7538,11 @@ mod tests {
             }
             Box::pin(async move {
                 if hang {
-                    return std::future::pending().await;
+                    cancellation.cancelled().await;
+                    return Err(crate::NotificationPortError {
+                        summary: "Synthetic delivery cancellation was observed.",
+                        retryable: false,
+                    });
                 }
                 if cancellation.is_cancelled() {
                     Err(crate::NotificationPortError {
@@ -5853,6 +7559,8 @@ mod tests {
     #[derive(Default)]
     struct TestStatus {
         publishes: AtomicUsize,
+        fail_publish_on_call: AtomicUsize,
+        clears: Mutex<Vec<(FocusSessionId, u64)>>,
         heartbeats: Mutex<VecDeque<Result<NativeStatusHeartbeat, crate::NativeStatusError>>>,
         heartbeat_notify: tokio::sync::Notify,
     }
@@ -5868,6 +7576,10 @@ mod tests {
                 .push_back(heartbeat);
             self.heartbeat_notify.notify_one();
         }
+
+        fn fail_publish_on_call(&self, call: usize) {
+            self.fail_publish_on_call.store(call, Ordering::SeqCst);
+        }
     }
 
     impl NativeStatusPort for TestStatus {
@@ -5880,13 +7592,20 @@ mod tests {
             status: &'a NativeCaptureStatus,
         ) -> crate::PortFuture<'a, Result<NativeStatusAcknowledgement, crate::NativeStatusError>>
         {
-            self.publishes.fetch_add(1, Ordering::SeqCst);
+            let call = self.publishes.fetch_add(1, Ordering::SeqCst) + 1;
+            let fail = self.fail_publish_on_call.load(Ordering::SeqCst) == call;
             Box::pin(async move {
                 assert!(
                     status
                         .active_scopes
                         .contains(&PermissionScope::ObserveDesktopPresence)
                 );
+                if fail {
+                    return Err(crate::NativeStatusError {
+                        summary: "Synthetic native status acknowledgement was lost.",
+                        retryable: true,
+                    });
+                }
                 Ok(NativeStatusAcknowledgement {
                     session_id: status.session_id,
                     revision: status.revision,
@@ -5902,6 +7621,10 @@ mod tests {
             revision: u64,
         ) -> crate::PortFuture<'a, Result<NativeStatusAcknowledgement, crate::NativeStatusError>>
         {
+            self.clears
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((session_id, revision));
             Box::pin(async move {
                 let now = OffsetDateTime::now_utc();
                 Ok(NativeStatusAcknowledgement {
@@ -6072,6 +7795,7 @@ mod tests {
             available: AtomicBool::new(notification_available),
             hang: AtomicBool::new(false),
             calls: AtomicUsize::new(0),
+            cancellation_observed: Arc::new(AtomicBool::new(false)),
             audit_seen_before_delivery: AtomicBool::new(false),
             repository: repository.clone(),
             owner,
@@ -6113,12 +7837,73 @@ mod tests {
         }
     }
 
+    fn cleanup_runtime(
+        config: SecondMindConfig,
+        repository: &MemoryRepository,
+        clock: Arc<ManualClock>,
+        secret_store: Arc<ScriptedCleanupSecretStore>,
+        resource_selection: Arc<ScriptedResourceCleanup>,
+    ) -> SecondMindRuntime {
+        SecondMindRuntime::new(
+            config,
+            SecondMindPorts {
+                repository: Arc::new(repository.clone()),
+                clock,
+                observation: Arc::new(UnavailableObservationPort),
+                model: Arc::new(UnavailableModelGateway),
+                notification: Arc::new(crate::UnavailableNotificationPort),
+                native_status: Arc::new(crate::UnavailableNativeStatusPort),
+                emergency_control: Arc::new(crate::UnavailableEmergencyControlPort),
+                secret_store,
+                resource_selection,
+            },
+        )
+        .unwrap()
+    }
+
+    fn cleanup_route(owner: ActorId, now: OffsetDateTime) -> ModelRouteApproval {
+        let id = ModelRouteApprovalId::new_v7();
+        ModelRouteApproval {
+            id,
+            revision: 1,
+            owner,
+            authenticated_client: ClientId::new_v7(),
+            provider: "synthetic".to_owned(),
+            account_profile: "cleanup-fixture".to_owned(),
+            model: "deterministic-v1".to_owned(),
+            secret_ref: ModelRouteApproval::approval_scoped_secret_ref(id),
+            placement: ModelPlacement::Local,
+            allowed_categories: BTreeSet::from([DataCategory::Goal]),
+            handling: ModelHandlingProfile {
+                profile_id: "synthetic-no-retention-v1".to_owned(),
+                retention: crate::ProviderRetentionPolicy::None,
+                training_use: crate::ProviderTrainingUse::Excluded,
+                data_residency: None,
+                core_persists_prompt_or_response: false,
+                tools_enabled: false,
+            },
+            purpose: "reason.focus_context".to_owned(),
+            maximum_input_tokens: 1_200,
+            maximum_output_tokens: 220,
+            fallback: None,
+            fallback_allowed: false,
+            effective_at: now,
+            expires_at: Some(now + time::Duration::hours(3)),
+            revoked_at: None,
+            disclosure_version: "synthetic-v1".to_owned(),
+        }
+    }
+
     struct ActiveFixture {
         fixture: Fixture,
         grants: Vec<PermissionGrant>,
     }
 
     async fn start(fixture: Fixture) -> ActiveFixture {
+        try_start(fixture).await.unwrap()
+    }
+
+    async fn try_start(fixture: Fixture) -> Result<ActiveFixture, SecondMindError> {
         let now = fixture.clock.now_utc();
         let mut preferences = fixture
             .runtime
@@ -6163,15 +7948,16 @@ mod tests {
             )
             .unwrap();
         let route_idempotency = idempotency(1);
+        let route_approval_id = ModelRouteApprovalId::new_v7();
         let route_input = ModelRouteApproval {
-            id: ModelRouteApprovalId::new_v7(),
+            id: route_approval_id,
             revision: 1,
             owner: fixture.owner,
             authenticated_client: fixture.client,
             provider: "synthetic".to_owned(),
             account_profile: "fixture".to_owned(),
             model: "deterministic-v1".to_owned(),
-            secret_ref: crate::SecretRef::new("synthetic-route"),
+            secret_ref: ModelRouteApproval::approval_scoped_secret_ref(route_approval_id),
             placement: ModelPlacement::Local,
             allowed_categories: BTreeSet::from([
                 DataCategory::Goal,
@@ -6260,7 +8046,7 @@ mod tests {
                 client_disconnect_allowed: true,
                 daemon_restart_allowed: true,
                 effective_at: now,
-                expires_at: now + time::Duration::hours(2),
+                expires_at: goal.deadline.expect("synthetic goal has a deadline"),
                 consent_copy_version: "phase2-consent-v1".to_owned(),
             };
             let grant = fixture
@@ -6328,11 +8114,184 @@ mod tests {
                 fixture.session,
                 starting.revision,
             )
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(active.state, FocusSessionState::Active);
         let grants = fixture.repository.load_grants(fixture.owner).unwrap();
-        ActiveFixture { fixture, grants }
+        Ok(ActiveFixture { fixture, grants })
+    }
+
+    #[tokio::test]
+    async fn invalid_initial_source_status_fails_the_session_and_stops_the_source() {
+        let fixture = fixture(Vec::new(), true);
+        let repository = fixture.repository.clone();
+        let observation = fixture.observation.clone();
+        let status = fixture.status.clone();
+        let runtime = fixture.runtime.clone();
+        let session_id = fixture.session;
+        observation.corrupt_next_initial_status();
+
+        let error = try_start(fixture)
+            .await
+            .err()
+            .expect("activation must fail");
+
+        assert_eq!(error.code, SecondMindErrorCode::Unavailable);
+        let failed = repository
+            .find_focus_session(session_id)
+            .unwrap()
+            .expect("failed focus session remains durable");
+        assert_eq!(failed.state, FocusSessionState::Failed);
+        assert_eq!(
+            failed.failure_reason.as_deref(),
+            Some("observation_source_status_invalid")
+        );
+        assert_eq!(
+            observation.cleanup_states.lock().unwrap().as_slice(),
+            &[FocusSessionState::Starting]
+        );
+        assert_eq!(status.clears.lock().unwrap().as_slice(), &[(session_id, 1)]);
+        assert!(
+            repository
+                .load_audit(failed.owner, OffsetDateTime::UNIX_EPOCH, 100)
+                .unwrap()
+                .iter()
+                .any(|record| {
+                    record.kind == AuditKind::FocusSessionStateChanged
+                        && record.subject_id == session_id.as_uuid()
+                        && record
+                            .reason_codes
+                            .iter()
+                            .any(|reason| reason == "observation_source_status_invalid")
+                })
+        );
+        assert!(
+            !runtime
+                .ephemeral
+                .lock()
+                .unwrap()
+                .sessions
+                .contains_key(&session_id)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_observation_start_is_bounded_and_clears_native_status() {
+        let fixture = fixture(Vec::new(), true);
+        let repository = fixture.repository.clone();
+        let observation = fixture.observation.clone();
+        let status = fixture.status.clone();
+        let session_id = fixture.session;
+        observation.hang_next_start();
+        let activation = tokio::spawn(try_start(fixture));
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let error = activation
+            .await
+            .expect("the activation task remains supervised")
+            .err()
+            .expect("the hung source start must fail closed");
+
+        assert_eq!(error.code, SecondMindErrorCode::Unavailable);
+        let failed = repository
+            .find_focus_session(session_id)
+            .unwrap()
+            .expect("the failed activation remains durable");
+        assert_eq!(failed.state, FocusSessionState::Failed);
+        assert_eq!(
+            failed.failure_reason.as_deref(),
+            Some("observation_source_start_failed")
+        );
+        assert_eq!(
+            observation.cleanup_states.lock().unwrap().as_slice(),
+            &[FocusSessionState::Starting]
+        );
+        assert_eq!(status.clears.lock().unwrap().as_slice(), &[(session_id, 1)]);
+    }
+
+    #[tokio::test]
+    async fn activation_revision_conflict_cleans_every_started_source_and_native_status() {
+        let fixture = fixture(Vec::new(), true);
+        let repository = fixture.repository.clone();
+        let observation = fixture.observation.clone();
+        let status = fixture.status.clone();
+        let runtime = fixture.runtime.clone();
+        let session_id = fixture.session;
+        observation.bump_session_revision_on_next_start();
+
+        let error = try_start(fixture)
+            .await
+            .err()
+            .expect("the synthetic activation commit must conflict");
+
+        assert_eq!(error.code, SecondMindErrorCode::Conflict);
+        let durable = repository
+            .find_focus_session(session_id)
+            .unwrap()
+            .expect("the starting session remains durable");
+        assert_eq!(durable.state, FocusSessionState::Starting);
+        assert_eq!(durable.revision, 2);
+        assert_eq!(
+            observation.cleanup_states.lock().unwrap().as_slice(),
+            &[FocusSessionState::Starting, FocusSessionState::Starting]
+        );
+        assert_eq!(status.clears.lock().unwrap().as_slice(), &[(session_id, 1)]);
+        assert!(
+            !runtime
+                .ephemeral
+                .lock()
+                .unwrap()
+                .sessions
+                .contains_key(&session_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_activation_failure_supervision_does_not_leave_starting_durable() {
+        let fixture = fixture(Vec::new(), true);
+        let repository = fixture.repository.clone();
+        let observation = fixture.observation.clone();
+        let status = fixture.status.clone();
+        let runtime = fixture.runtime.clone();
+        let owner = fixture.owner;
+        let session_id = fixture.session;
+        observation.bump_session_revision_on_next_start();
+        let _ = try_start(fixture)
+            .await
+            .err()
+            .expect("the synthetic activation commit must conflict");
+
+        runtime
+            .fail_detached_focus_activation(owner, session_id, false, "detached_activation_failed")
+            .await
+            .unwrap();
+
+        let failed = repository
+            .find_focus_session(session_id)
+            .unwrap()
+            .expect("supervised activation failure remains durable");
+        assert_eq!(failed.state, FocusSessionState::Failed);
+        assert_eq!(
+            failed.failure_reason.as_deref(),
+            Some("detached_activation_failed")
+        );
+        assert_eq!(
+            status.clears.lock().unwrap().as_slice(),
+            &[(session_id, 1), (session_id, 2)]
+        );
+        assert!(
+            repository
+                .load_audit(owner, OffsetDateTime::UNIX_EPOCH, 100)
+                .unwrap()
+                .iter()
+                .any(|record| {
+                    record.subject_id == session_id.as_uuid()
+                        && record
+                            .reason_codes
+                            .iter()
+                            .any(|reason| reason == "detached_activation_failed")
+                })
+        );
     }
 
     fn observe(active: &ActiveFixture) {
@@ -6462,18 +8421,14 @@ mod tests {
     }
 
     fn stop_synthetic_background_tasks(active: &ActiveFixture) {
-        let cancellation = active
-            .fixture
-            .runtime
-            .ephemeral
-            .lock()
-            .unwrap()
-            .sessions
-            .get(&active.fixture.session)
-            .unwrap()
-            .cancellation
-            .clone();
-        cancellation.cancel();
+        let mut state = active.fixture.runtime.ephemeral.lock().unwrap();
+        let ephemeral = state.sessions.get_mut(&active.fixture.session).unwrap();
+        ephemeral.cancellation.cancel();
+        // Tests use this helper only to stop spawned source/status tasks while
+        // retaining an isolated live reasoning authority for paused-clock
+        // scheduler assertions.
+        ephemeral.cancellation = CancellationToken::new();
+        ephemeral.proactive_cancellation = ephemeral.cancellation.child_token();
     }
 
     async fn wait_for_model_calls(model: &ScriptedModel, expected: usize) {
@@ -6484,6 +8439,26 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("the synthetic model did not receive {expected} calls");
+    }
+
+    async fn wait_for_notification_calls(notification: &TestNotification, expected: usize) {
+        for _ in 0..100 {
+            if notification.calls.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the synthetic notification adapter did not receive {expected} calls");
+    }
+
+    async fn wait_for_cancellation_observation(observed: &AtomicBool) {
+        for _ in 0..100 {
+            if observed.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the adapter did not observe cancellation");
     }
 
     async fn observe_foreground_churn(active: &ActiveFixture) {
@@ -6609,10 +8584,22 @@ mod tests {
             ),
             expires_at: intervention.expires_at,
         };
-        active
+        let pending = active
             .fixture
             .runtime
             .queue_intervention(&mut intervention, &decision, notification_grant, &delivery)
+            .unwrap();
+        active
+            .fixture
+            .runtime
+            .persist_intervention_transition(
+                &intervention,
+                1,
+                AuditKind::InterventionDelivery,
+                AuditDetails::new(vec!["synthetic_queue_seed".to_owned()], BTreeSet::new())
+                    .with_policy_trace(decision.policy_trace.clone()),
+                pending.map(PendingDeliveryTransition::Enqueue),
+            )
             .unwrap();
         intervention
     }
@@ -6641,6 +8628,50 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn policy_trace_digest_is_deterministic_and_audit_keeps_only_the_digest() {
+        let fixture = fixture(Vec::new(), true);
+        let input = serde_json::json!({
+            "schema": "synthetic.policy-input.v1",
+            "candidate_revision": 7,
+            "private_candidate_text": "synthetic-private-policy-input"
+        });
+        let first = fixture.runtime.policy_trace(3, &input).unwrap();
+        let second = fixture.runtime.policy_trace(3, &input).unwrap();
+        assert_eq!(first, second);
+        assert!(first.is_complete());
+        let mut unknown_schema = first.clone();
+        unknown_schema.proposed_input_schema_version = PolicyTrace::INPUT_SCHEMA_V1 + 1;
+        assert!(!unknown_schema.is_complete());
+
+        let changed = fixture
+            .runtime
+            .policy_trace(
+                3,
+                &serde_json::json!({
+                    "schema": "synthetic.policy-input.v1",
+                    "candidate_revision": 8,
+                    "private_candidate_text": "synthetic-private-policy-input"
+                }),
+            )
+            .unwrap();
+        assert_ne!(first.proposed_input_digest, changed.proposed_input_digest);
+
+        let audit = fixture.runtime.build_audit_record(
+            fixture.owner,
+            AuditKind::SignificanceDecision,
+            fixture.session.as_uuid(),
+            AuditDetails::new(
+                vec!["synthetic_policy_decision".to_owned()],
+                BTreeSet::new(),
+            )
+            .with_policy_trace(first),
+        );
+        let encoded = serde_json::to_string(&audit).unwrap();
+        assert!(encoded.contains("proposed_input_digest"));
+        assert!(!encoded.contains("synthetic-private-policy-input"));
     }
 
     #[test]
@@ -6868,7 +8899,7 @@ mod tests {
         });
         let acknowledgements = wait_for_emergency_acknowledgements(&fixture.emergency, 2).await;
         assert_eq!(acknowledgements[0].revision, 2);
-        assert_eq!(acknowledgements[0].status, EmergencyCommandStatus::Accepted);
+        assert_eq!(acknowledgements[0].status, EmergencyCommandStatus::Rejected);
         assert_eq!(acknowledgements[1].revision, 1);
         assert_eq!(acknowledgements[1].status, EmergencyCommandStatus::Rejected);
         shutdown.cancel();
@@ -6925,6 +8956,60 @@ mod tests {
             cleanup_states
                 .iter()
                 .all(|state| *state == FocusSessionState::Stopping)
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_resumes_stopping_adapter_and_native_status_cleanup() {
+        let active = start(fixture(Vec::new(), true)).await;
+        let stopping = active
+            .fixture
+            .runtime
+            .end_focus_session(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+                active.fixture.session,
+                find_session(&*active.fixture.runtime.repository, active.fixture.session)
+                    .unwrap()
+                    .revision,
+                EndFocusReason::UserRequested,
+            )
+            .unwrap();
+        assert_eq!(stopping.state, FocusSessionState::Stopping);
+        let restarted = SecondMindRuntime::new(
+            SecondMindConfig::default(),
+            SecondMindPorts {
+                repository: Arc::new(active.fixture.repository.clone()),
+                clock: active.fixture.clock.clone(),
+                observation: active.fixture.observation.clone(),
+                model: active.fixture.model.clone(),
+                notification: active.fixture.notification.clone(),
+                native_status: active.fixture.status.clone(),
+                emergency_control: active.fixture.emergency.clone(),
+                secret_store: Arc::new(crate::UnavailableSecretStore::default()),
+                resource_selection: Arc::new(crate::UnavailableResourceSelectionPort),
+            },
+        )
+        .unwrap();
+
+        let recovered = restarted.recover_owner(active.fixture.owner).unwrap();
+        assert_eq!(recovered, vec![stopping.clone()]);
+        let ended = restarted
+            .finish_end_focus_session(active.fixture.owner, stopping.id, stopping.revision)
+            .await
+            .unwrap();
+
+        assert_eq!(ended.state, FocusSessionState::Ended);
+        let cleanup_states = active.fixture.observation.cleanup_states.lock().unwrap();
+        assert!(!cleanup_states.is_empty());
+        assert!(
+            cleanup_states
+                .iter()
+                .all(|state| *state == FocusSessionState::Stopping)
+        );
+        assert_eq!(
+            active.fixture.status.clears.lock().unwrap().as_slice(),
+            &[(stopping.id, stopping.revision)]
         );
     }
 
@@ -7043,6 +9128,116 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn single_operation_observation_is_consumed_by_one_context_assembly() {
+        let active = start(fixture(Vec::new(), true)).await;
+        observe(&active);
+        {
+            let mut state = active.fixture.runtime.ephemeral.lock().unwrap();
+            let session = state.sessions.get_mut(&active.fixture.session).unwrap();
+            let observation = session
+                .observations
+                .iter_mut()
+                .find(|observation| observation.value.category() == DataCategory::WorkspaceActivity)
+                .unwrap();
+            observation.provenance.retention = crate::ObservationRetention::SingleOperation;
+        }
+        let session = find_session(&active.fixture.repository, active.fixture.session).unwrap();
+        let route = find_route(
+            &active.fixture.repository,
+            active.fixture.owner,
+            session.model_route_approval_id,
+        )
+        .unwrap();
+
+        let first = active
+            .fixture
+            .runtime
+            .assemble_context(&session, &route, &active.grants)
+            .unwrap()
+            .0;
+        let second = active
+            .fixture
+            .runtime
+            .assemble_context(&session, &route, &active.grants)
+            .unwrap()
+            .0;
+
+        assert_eq!(
+            first
+                .iter()
+                .filter(|item| item.category == DataCategory::WorkspaceActivity)
+                .count(),
+            1
+        );
+        assert!(
+            second
+                .iter()
+                .all(|item| item.category != DataCategory::WorkspaceActivity)
+        );
+        let state = active.fixture.runtime.ephemeral.lock().unwrap();
+        assert!(
+            state
+                .sessions
+                .get(&active.fixture.session)
+                .unwrap()
+                .observations
+                .iter()
+                .all(|observation| {
+                    observation.provenance.retention != crate::ObservationRetention::SingleOperation
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn single_operation_observation_has_a_bounded_unused_retention_fallback() {
+        let active = start(fixture(Vec::new(), true)).await;
+        observe(&active);
+        {
+            let mut state = active.fixture.runtime.ephemeral.lock().unwrap();
+            let session = state.sessions.get_mut(&active.fixture.session).unwrap();
+            session
+                .observations
+                .iter_mut()
+                .find(|observation| observation.value.category() == DataCategory::WorkspaceActivity)
+                .unwrap()
+                .provenance
+                .retention = crate::ObservationRetention::SingleOperation;
+        }
+
+        active.fixture.clock.advance(Duration::from_secs(119));
+        assert_eq!(
+            active
+                .fixture
+                .runtime
+                .run_retention_maintenance_once()
+                .unwrap()
+                .removed_observations,
+            0
+        );
+        active.fixture.clock.advance(Duration::from_secs(1));
+        assert_eq!(
+            active
+                .fixture
+                .runtime
+                .run_retention_maintenance_once()
+                .unwrap()
+                .removed_observations,
+            1
+        );
+        let state = active.fixture.runtime.ephemeral.lock().unwrap();
+        let observations = &state
+            .sessions
+            .get(&active.fixture.session)
+            .unwrap()
+            .observations;
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].provenance.retention,
+            crate::ObservationRetention::EphemeralSession
+        );
+    }
+
     #[test]
     fn retention_sweep_physically_purges_audit_at_the_expiry_boundary() {
         let fixture = fixture(Vec::new(), true);
@@ -7097,6 +9292,266 @@ mod tests {
         );
     }
 
+    #[test]
+    fn model_route_approval_requires_an_approval_scoped_secret_reference() {
+        let fixture = fixture(Vec::new(), true);
+        let mut route = cleanup_route(fixture.owner, fixture.clock.now_utc());
+        route.secret_ref = crate::SecretRef::new("shared-provider-route-name");
+
+        let error = fixture
+            .runtime
+            .approve_model_route(
+                ClientAssurance::PrivateCapabilityBound,
+                idempotency(0x61),
+                route,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, SecondMindErrorCode::InvalidArgument);
+        assert_eq!(
+            error.summary,
+            "The model route approval is invalid or unsafe."
+        );
+        assert!(
+            fixture
+                .repository
+                .load_model_routes(fixture.owner)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_route_retains_secret_cleanup_until_a_content_free_retry_succeeds() {
+        let owner = ActorId::new_v7();
+        let now = datetime!(2026-08-19 10:00 UTC);
+        let repository = MemoryRepository::default();
+        let clock = Arc::new(ManualClock::new(now));
+        let secret_store = Arc::new(ScriptedCleanupSecretStore::default());
+        secret_store.fail_next_delete();
+        let runtime = cleanup_runtime(
+            SecondMindConfig::default(),
+            &repository,
+            clock,
+            secret_store.clone(),
+            Arc::new(ScriptedResourceCleanup::default()),
+        );
+        let route = cleanup_route(owner, now);
+        repository.save_model_route(&route, None).unwrap();
+
+        let error = runtime
+            .revoke_model_route(
+                ClientAssurance::PrivateCapabilityBound,
+                owner,
+                route.id,
+                route.revision,
+                "Synthetic direct-user revocation".to_owned(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, SecondMindErrorCode::Unavailable);
+        assert_eq!(
+            error.summary,
+            "The model route is revoked, but its native credential cleanup remains pending."
+        );
+        assert!(
+            repository.load_model_routes(owner).unwrap()[0]
+                .revoked_at
+                .is_some()
+        );
+        assert_eq!(
+            repository
+                .load_secret_deletion_cleanups(owner)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            repository
+                .load_audit(owner, OffsetDateTime::UNIX_EPOCH, 10)
+                .unwrap()
+                .iter()
+                .any(|record| record.kind == AuditKind::ModelRouteRevoked)
+        );
+
+        let revoked = repository.load_model_routes(owner).unwrap()[0].clone();
+        let repeated = runtime
+            .revoke_model_route(
+                ClientAssurance::PrivateCapabilityBound,
+                owner,
+                revoked.id,
+                revoked.revision,
+                "Synthetic repeated revocation".to_owned(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(repeated.code, SecondMindErrorCode::InvalidArgument);
+        assert_eq!(
+            repeated.summary,
+            "The model route approval is already revoked."
+        );
+        assert_eq!(repository.load_model_routes(owner).unwrap()[0], revoked);
+        assert_eq!(
+            repository
+                .load_secret_deletion_cleanups(owner)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            repository
+                .load_audit(owner, OffsetDateTime::UNIX_EPOCH, 10)
+                .unwrap()
+                .iter()
+                .filter(|record| record.kind == AuditKind::ModelRouteRevoked)
+                .count(),
+            1
+        );
+        assert_eq!(secret_store.delete_calls.load(Ordering::SeqCst), 1);
+
+        let retry = runtime.recover_cleanup_obligations(owner).await.unwrap();
+        assert_eq!(retry.secret_deletion_attempts, 1);
+        assert_eq!(retry.secret_deletion_completed, 1);
+        assert_eq!(retry.secret_deletion_pending, 0);
+        assert!(
+            repository
+                .load_secret_deletion_cleanups(owner)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repository.load_model_routes(owner).unwrap()[0]
+                .revoked_at
+                .is_some()
+        );
+        assert_eq!(secret_store.delete_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn native_cleanup_retry_never_restores_removed_resource_authority() {
+        let owner = ActorId::new_v7();
+        let repository = MemoryRepository::default();
+        let resource_selection = Arc::new(ScriptedResourceCleanup::default());
+        resource_selection.fail_next_release();
+        let runtime = cleanup_runtime(
+            SecondMindConfig::default(),
+            &repository,
+            Arc::new(ManualClock::new(datetime!(2026-08-19 10:00 UTC))),
+            Arc::new(ScriptedCleanupSecretStore::default()),
+            resource_selection.clone(),
+        );
+        let resource_id = ResourceId::new_v7();
+        repository
+            .save_native_resource_cleanup(&crate::NativeResourceCleanup {
+                owner,
+                resource_id,
+                opaque_reference: "synthetic-native-cleanup-token".to_owned(),
+                created_at: datetime!(2026-08-19 10:00 UTC),
+            })
+            .unwrap();
+        assert!(repository.load_resources(owner).unwrap().is_empty());
+
+        let first = runtime.recover_cleanup_obligations(owner).await.unwrap();
+        assert_eq!(first.native_resource_attempts, 1);
+        assert_eq!(first.native_resource_completed, 0);
+        assert_eq!(first.native_resource_pending, 1);
+        assert!(repository.load_resources(owner).unwrap().is_empty());
+
+        let second = runtime.recover_cleanup_obligations(owner).await.unwrap();
+        assert_eq!(second.native_resource_attempts, 1);
+        assert_eq!(second.native_resource_completed, 1);
+        assert_eq!(second.native_resource_pending, 0);
+        assert!(repository.load_resources(owner).unwrap().is_empty());
+        assert!(
+            repository
+                .load_native_resource_cleanups(owner)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(resource_selection.release_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cleanup_recovery_is_bounded_to_three_records_per_kind_per_pass() {
+        let owner = ActorId::new_v7();
+        let repository = MemoryRepository::default();
+        let resource_selection = Arc::new(ScriptedResourceCleanup::default());
+        let runtime = cleanup_runtime(
+            SecondMindConfig::default(),
+            &repository,
+            Arc::new(ManualClock::new(datetime!(2026-08-19 10:00 UTC))),
+            Arc::new(ScriptedCleanupSecretStore::default()),
+            resource_selection.clone(),
+        );
+        for index in 0..4 {
+            repository
+                .save_native_resource_cleanup(&crate::NativeResourceCleanup {
+                    owner,
+                    resource_id: ResourceId::new_v7(),
+                    opaque_reference: format!("synthetic-bounded-cleanup-{index}"),
+                    created_at: datetime!(2026-08-19 10:00 UTC),
+                })
+                .unwrap();
+        }
+
+        let first = runtime.recover_cleanup_obligations(owner).await.unwrap();
+        assert_eq!(first.native_resource_attempts, 3);
+        assert_eq!(first.native_resource_completed, 3);
+        assert_eq!(first.native_resource_pending, 1);
+        assert_eq!(resource_selection.release_calls.load(Ordering::SeqCst), 3);
+
+        let second = runtime.recover_cleanup_obligations(owner).await.unwrap();
+        assert_eq!(second.native_resource_attempts, 1);
+        assert_eq!(second.native_resource_completed, 1);
+        assert_eq!(second.native_resource_pending, 0);
+        assert_eq!(resource_selection.release_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_retention_maintenance_retries_private_cleanup_obligations() {
+        let owner = ActorId::new_v7();
+        let repository = MemoryRepository::default();
+        let resource_selection = Arc::new(ScriptedResourceCleanup::default());
+        let runtime = cleanup_runtime(
+            SecondMindConfig {
+                retention_maintenance_interval: Duration::from_secs(1),
+                ..SecondMindConfig::default()
+            },
+            &repository,
+            Arc::new(ManualClock::new(datetime!(2026-08-19 10:00 UTC))),
+            Arc::new(ScriptedCleanupSecretStore::default()),
+            resource_selection.clone(),
+        );
+        repository
+            .save_native_resource_cleanup(&crate::NativeResourceCleanup {
+                owner,
+                resource_id: ResourceId::new_v7(),
+                opaque_reference: "synthetic-periodic-cleanup-token".to_owned(),
+                created_at: datetime!(2026-08-19 10:00 UTC),
+            })
+            .unwrap();
+
+        let shutdown = CancellationToken::new();
+        let loop_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move {
+            runtime
+                .run_retention_maintenance(owner, loop_shutdown)
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            repository
+                .load_native_resource_cleanups(owner)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(resource_selection.release_calls.load(Ordering::SeqCst), 1);
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn retention_maintenance_cleans_quiet_sessions_and_shutdown_is_bounded() {
         let config = SecondMindConfig {
@@ -7109,9 +9564,13 @@ mod tests {
 
         let shutdown = CancellationToken::new();
         let runtime = active.fixture.runtime.clone();
+        let owner = active.fixture.owner;
         let loop_shutdown = shutdown.clone();
-        let task =
-            tokio::spawn(async move { runtime.run_retention_maintenance(loop_shutdown).await });
+        let task = tokio::spawn(async move {
+            runtime
+                .run_retention_maintenance(owner, loop_shutdown)
+                .await
+        });
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(1)).await;
         for _ in 0..10 {
@@ -7182,6 +9641,88 @@ mod tests {
         wait_for_model_calls(&active.fixture.model, 1).await;
         shutdown.cancel();
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reasoning_scheduler_ends_an_expired_route_even_when_the_session_is_muted() {
+        let active = start(fixture(Vec::new(), true)).await;
+        let current =
+            find_session(&*active.fixture.runtime.repository, active.fixture.session).unwrap();
+        active
+            .fixture
+            .runtime
+            .set_interventions_muted(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+                active.fixture.session,
+                current.revision,
+                true,
+            )
+            .await
+            .unwrap();
+        let mut route = find_route(
+            &*active.fixture.runtime.repository,
+            active.fixture.owner,
+            current.model_route_approval_id,
+        )
+        .unwrap();
+        let expected_route_revision = route.revision;
+        route.revision = route.revision.saturating_add(1);
+        route.expires_at = Some(active.fixture.clock.now_utc() + time::Duration::seconds(30));
+        active
+            .fixture
+            .repository
+            .save_model_route(&route, Some(expected_route_revision))
+            .unwrap();
+        stop_synthetic_background_tasks(&active);
+        let shutdown = CancellationToken::new();
+        let runtime = active.fixture.runtime.clone();
+        let owner = active.fixture.owner;
+        let loop_shutdown = shutdown.clone();
+        let task =
+            tokio::spawn(
+                async move { runtime.run_reasoning_scheduler(owner, loop_shutdown).await },
+            );
+        tokio::task::yield_now().await;
+
+        active.fixture.clock.advance(Duration::from_secs(60));
+        tokio::time::advance(Duration::from_secs(60)).await;
+        for _ in 0..100 {
+            if find_session(&*active.fixture.runtime.repository, active.fixture.session)
+                .unwrap()
+                .state
+                == FocusSessionState::Ended
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let ended =
+            find_session(&*active.fixture.runtime.repository, active.fixture.session).unwrap();
+        assert_eq!(ended.state, FocusSessionState::Ended);
+        assert_eq!(active.fixture.model.calls.load(Ordering::SeqCst), 0);
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authority_reconciliation_ends_at_the_exact_goal_and_grant_deadline() {
+        let active = start(fixture(Vec::new(), true)).await;
+        active.fixture.clock.advance(Duration::from_secs(20 * 60));
+
+        let ended = active
+            .fixture
+            .runtime
+            .reconcile_focus_authority(active.fixture.owner)
+            .await
+            .unwrap();
+
+        assert_eq!(ended, 1);
+        let session =
+            find_session(&*active.fixture.runtime.repository, active.fixture.session).unwrap();
+        assert_eq!(session.state, FocusSessionState::Ended);
+        assert_eq!(session.failure_reason.as_deref(), Some("ending_expired"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -7311,6 +9852,7 @@ mod tests {
             .expect("scheduler shutdown remained bounded")
             .unwrap()
             .unwrap();
+        wait_for_cancellation_observation(&active.fixture.model.cancellation_observed).await;
         assert!(
             !active
                 .fixture
@@ -7476,6 +10018,45 @@ mod tests {
                 .audit_seen_before_delivery
                 .load(Ordering::SeqCst)
         );
+        let policy_decision = active
+            .fixture
+            .repository
+            .find_policy_decision(intervention.policy_decision_id)
+            .unwrap()
+            .unwrap();
+        let expected_preferences_revision = active
+            .fixture
+            .repository
+            .load_preferences(active.fixture.owner)
+            .unwrap()
+            .unwrap()
+            .revision;
+        assert!(policy_decision.policy_trace.is_complete());
+        assert_eq!(
+            policy_decision.policy_trace.policy_profile_id,
+            POLICY_PROFILE_ID
+        );
+        assert_eq!(
+            policy_decision.policy_trace.user_preferences_revision,
+            expected_preferences_revision
+        );
+        let policy_audits = active
+            .fixture
+            .repository
+            .load_audit(active.fixture.owner, OffsetDateTime::UNIX_EPOCH, 200)
+            .unwrap();
+        assert!(policy_audits.iter().any(|record| {
+            record.kind == AuditKind::SignificanceDecision
+                && record
+                    .policy_trace
+                    .as_ref()
+                    .is_some_and(PolicyTrace::is_complete)
+        }));
+        assert!(policy_audits.iter().any(|record| {
+            record.kind == AuditKind::InterventionDecision
+                && record.subject_id == policy_decision.candidate_id.as_uuid()
+                && record.policy_trace.as_ref() == Some(&policy_decision.policy_trace)
+        }));
 
         let preferences_before_correction = active
             .fixture
@@ -7554,6 +10135,15 @@ mod tests {
                 .unwrap(),
             ReasoningCycleResult::Intervention(_)
         ));
+        let evaluated_before_churn = active
+            .fixture
+            .repository
+            .load_audit(active.fixture.owner, OffsetDateTime::UNIX_EPOCH, 200)
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.kind == AuditKind::SignificanceDecision)
+            .count();
+        assert_eq!(evaluated_before_churn, 1);
         observe_foreground_churn(&active).await;
         let result = active
             .fixture
@@ -7567,6 +10157,15 @@ mod tests {
                 if reason_code == "no_relevant_state_change"
         ));
         assert_eq!(active.fixture.model.calls.load(Ordering::SeqCst), 1);
+        let evaluated_after_churn = active
+            .fixture
+            .repository
+            .load_audit(active.fixture.owner, OffsetDateTime::UNIX_EPOCH, 200)
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.kind == AuditKind::SignificanceDecision)
+            .count();
+        assert_eq!(evaluated_after_churn, evaluated_before_churn);
         active.fixture.clock.advance(Duration::from_secs(5 * 60));
         refresh_workspace_and_observe(&active).await;
         assert!(matches!(
@@ -7840,6 +10439,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabling_proactive_interventions_cancels_an_in_flight_model_without_stopping_observation()
+     {
+        let active = start(fixture(Vec::new(), true)).await;
+        observe(&active);
+        active.fixture.model.hang.store(true, Ordering::SeqCst);
+        let runtime = active.fixture.runtime.clone();
+        let session_id = active.fixture.session;
+        let cycle = tokio::spawn(async move { runtime.run_reasoning_cycle(session_id).await });
+        wait_for_model_calls(&active.fixture.model, 1).await;
+
+        let mut preferences = active
+            .fixture
+            .runtime
+            .user_preferences(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+            )
+            .unwrap();
+        let expected = preferences.revision;
+        preferences.proactive_interventions_enabled = false;
+        active
+            .fixture
+            .runtime
+            .save_preferences(
+                ClientAssurance::PrivateCapabilityBound,
+                preferences,
+                Some(expected),
+            )
+            .unwrap();
+
+        wait_for_cancellation_observation(&active.fixture.model.cancellation_observed).await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), cycle)
+                .await
+                .expect("the cancelled model cycle remained bounded")
+                .unwrap()
+                .unwrap(),
+            ReasoningCycleResult::Silence { ref reason_code }
+                if reason_code == "reasoning_cancelled_or_timed_out"
+        ));
+        let ephemeral = active.fixture.runtime.ephemeral.lock().unwrap();
+        let session = ephemeral.sessions.get(&active.fixture.session).unwrap();
+        assert!(!session.cancellation.is_cancelled());
+        assert!(session.proactive_cancellation.is_cancelled());
+        assert!(
+            active
+                .fixture
+                .repository
+                .load_interventions(active.fixture.owner)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn zero_user_intervention_cap_avoids_model_cost() {
         let active = start(fixture(vec![candidate()], true)).await;
         let mut preferences = active
@@ -8010,7 +10664,8 @@ mod tests {
             active.fixture.owner,
             AuditKind::InterventionDecision,
             decision.candidate_id.as_uuid(),
-            AuditDetails::new(decision.reason_codes.clone(), BTreeSet::new()),
+            AuditDetails::new(decision.reason_codes.clone(), BTreeSet::new())
+                .with_policy_trace(decision.policy_trace.clone()),
         );
         let mut attempted = original.clone();
         attempted.policy_decision_id = decision.id;
@@ -8137,6 +10792,79 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(active.fixture.notification.calls.load(Ordering::SeqCst), 1);
+        wait_for_cancellation_observation(&active.fixture.notification.cancellation_observed).await;
+    }
+
+    #[tokio::test]
+    async fn session_mute_cancels_an_in_flight_notification_and_scrubs_the_intervention() {
+        let active = start(fixture(vec![candidate()], true)).await;
+        active
+            .fixture
+            .notification
+            .hang
+            .store(true, Ordering::SeqCst);
+        observe(&active);
+        let runtime = active.fixture.runtime.clone();
+        let session_id = active.fixture.session;
+        let cycle = tokio::spawn(async move { runtime.run_reasoning_cycle(session_id).await });
+        wait_for_notification_calls(&active.fixture.notification, 1).await;
+
+        let session = find_session(&active.fixture.repository, active.fixture.session).unwrap();
+        let muted = active
+            .fixture
+            .runtime
+            .set_interventions_muted(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+                active.fixture.session,
+                session.revision,
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(muted.muted);
+        wait_for_cancellation_observation(&active.fixture.notification.cancellation_observed).await;
+        let result = tokio::time::timeout(Duration::from_secs(1), cycle)
+            .await
+            .expect("the muted notification cycle remained bounded")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result,
+            ReasoningCycleResult::Intervention(ref intervention)
+                if intervention.state == InterventionState::Cancelled
+                    && intervention.user_visible_text.is_empty()
+                    && intervention.evidence_summary.is_empty()
+                    && intervention.evidence.is_empty()
+        ));
+        {
+            let ephemeral = active.fixture.runtime.ephemeral.lock().unwrap();
+            let session = ephemeral.sessions.get(&active.fixture.session).unwrap();
+            assert!(!session.cancellation.is_cancelled());
+            assert!(session.proactive_cancellation.is_cancelled());
+        }
+        let unmuted = active
+            .fixture
+            .runtime
+            .set_interventions_muted(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+                active.fixture.session,
+                muted.revision,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(!unmuted.muted);
+        let ephemeral = active.fixture.runtime.ephemeral.lock().unwrap();
+        assert!(
+            !ephemeral
+                .sessions
+                .get(&active.fixture.session)
+                .unwrap()
+                .proactive_cancellation
+                .is_cancelled()
+        );
     }
 
     #[tokio::test]
@@ -8178,7 +10906,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabling_proactive_interventions_scrubs_queued_recovery_without_delivery() {
+    async fn disabling_proactive_interventions_immediately_cancels_and_scrubs_queued_delivery() {
         let active = start(fixture(vec![candidate()], false)).await;
         observe(&active);
         assert!(matches!(
@@ -8217,6 +10945,82 @@ mod tests {
             .available
             .store(true, Ordering::SeqCst);
 
+        let interventions = active
+            .fixture
+            .repository
+            .load_interventions(active.fixture.owner)
+            .unwrap();
+        assert_eq!(interventions.len(), 1);
+        assert_eq!(interventions[0].state, InterventionState::Cancelled);
+        assert_eq!(interventions[0].outcome, InterventionOutcome::Expired);
+        assert_eq!(
+            interventions[0].reason_code,
+            "proactive_interventions_disabled"
+        );
+        assert!(interventions[0].user_visible_text.is_empty());
+        assert!(interventions[0].evidence_summary.is_empty());
+        assert!(interventions[0].evidence.is_empty());
+        let outbox = active
+            .fixture
+            .repository
+            .load_pending_deliveries(active.fixture.owner)
+            .unwrap();
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].state, OutboxState::Cancelled);
+        assert!(outbox[0].user_visible_text.is_empty());
+
+        let changed = active
+            .fixture
+            .runtime
+            .revalidate_pending_deliveries(active.fixture.owner)
+            .await
+            .unwrap();
+        assert!(changed.is_empty());
+        assert_eq!(active.fixture.notification.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn any_preferences_revision_change_invalidates_a_queued_policy_decision() {
+        let active = start(fixture(vec![candidate()], false)).await;
+        observe(&active);
+        assert!(matches!(
+            active
+                .fixture
+                .runtime
+                .run_reasoning_cycle(active.fixture.session)
+                .await
+                .unwrap(),
+            ReasoningCycleResult::Intervention(ref intervention)
+                if intervention.state == InterventionState::Queued
+        ));
+
+        let mut preferences = active
+            .fixture
+            .runtime
+            .user_preferences(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+            )
+            .unwrap();
+        let expected = preferences.revision;
+        preferences.preferred_form_of_address = Some("Synthetic operator".to_owned());
+        let updated = active
+            .fixture
+            .runtime
+            .save_preferences(
+                ClientAssurance::PrivateCapabilityBound,
+                preferences,
+                Some(expected),
+            )
+            .unwrap();
+        assert_eq!(updated.revision, expected + 1);
+        assert!(updated.proactive_interventions_enabled);
+        active
+            .fixture
+            .notification
+            .available
+            .store(true, Ordering::SeqCst);
+
         let changed = active
             .fixture
             .runtime
@@ -8225,21 +11029,8 @@ mod tests {
             .unwrap();
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].state, InterventionState::Expired);
-        assert_eq!(changed[0].outcome, InterventionOutcome::Expired);
-        assert_eq!(changed[0].reason_code, "missed_intervention");
         assert!(changed[0].user_visible_text.is_empty());
-        assert!(changed[0].evidence_summary.is_empty());
-        assert!(changed[0].evidence.is_empty());
         assert_eq!(active.fixture.notification.calls.load(Ordering::SeqCst), 0);
-
-        let outbox = active
-            .fixture
-            .repository
-            .load_pending_deliveries(active.fixture.owner)
-            .unwrap();
-        assert_eq!(outbox.len(), 1);
-        assert_eq!(outbox[0].state, OutboxState::Expired);
-        assert!(outbox[0].user_visible_text.is_empty());
     }
 
     #[tokio::test]
@@ -8524,13 +11315,25 @@ mod tests {
     #[tokio::test]
     async fn restart_recovery_requires_authorized_continuity_and_fresh_health() {
         let active = start(fixture(vec![candidate()], true)).await;
+        active
+            .fixture
+            .runtime
+            .ephemeral
+            .lock()
+            .unwrap()
+            .sessions
+            .get(&active.fixture.session)
+            .unwrap()
+            .cancellation
+            .cancel();
         let new_model = Arc::new(ScriptedModel::new([candidate()]));
+        let recovered_observation = Arc::new(AvailableObservation::default());
         let recovered_runtime = SecondMindRuntime::new(
             SecondMindConfig::default(),
             SecondMindPorts {
                 repository: Arc::new(active.fixture.repository.clone()),
                 clock: active.fixture.clock.clone(),
-                observation: Arc::new(AvailableObservation::default()),
+                observation: recovered_observation.clone(),
                 model: new_model.clone(),
                 notification: active.fixture.notification.clone(),
                 native_status: Arc::new(TestStatus::default()),
@@ -8544,6 +11347,12 @@ mod tests {
             .recover_owner(active.fixture.owner)
             .unwrap();
         assert_eq!(recovered[0].state, FocusSessionState::Recovering);
+        let recovering_revision = recovered[0].revision;
+        let repeated = recovered_runtime
+            .recover_owner(active.fixture.owner)
+            .unwrap();
+        assert_eq!(repeated[0].state, FocusSessionState::Recovering);
+        assert_eq!(repeated[0].revision, recovering_revision);
         let result = recovered_runtime
             .run_reasoning_cycle(active.fixture.session)
             .await
@@ -8556,6 +11365,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session.state, FocusSessionState::Active);
+        assert_eq!(
+            recovered_observation.start_calls.load(Ordering::SeqCst),
+            2,
+            "recovery may become active only after every real observation adapter restarts"
+        );
         let result = recovered_runtime
             .run_reasoning_cycle(active.fixture.session)
             .await
@@ -8566,6 +11380,90 @@ mod tests {
                 if reason_code == "presence_not_active"
         ));
         assert_eq!(new_model.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn recovered_activation_status_loss_cleans_sources_and_remains_retryable() {
+        let active = start(fixture(vec![candidate()], true)).await;
+        active
+            .fixture
+            .runtime
+            .ephemeral
+            .lock()
+            .unwrap()
+            .sessions
+            .get(&active.fixture.session)
+            .unwrap()
+            .cancellation
+            .cancel();
+        let repository = active.fixture.repository.clone();
+        let recovered_observation = Arc::new(AvailableObservation::tracking(repository.clone()));
+        let recovered_status = Arc::new(TestStatus::default());
+        recovered_status.fail_publish_on_call(2);
+        let recovered_runtime = SecondMindRuntime::new(
+            SecondMindConfig::default(),
+            SecondMindPorts {
+                repository: Arc::new(repository.clone()),
+                clock: active.fixture.clock.clone(),
+                observation: recovered_observation.clone(),
+                model: Arc::new(ScriptedModel::new([candidate()])),
+                notification: active.fixture.notification.clone(),
+                native_status: recovered_status.clone(),
+                emergency_control: Arc::new(TestEmergency::default()),
+                secret_store: Arc::new(crate::UnavailableSecretStore::default()),
+                resource_selection: Arc::new(crate::UnavailableResourceSelectionPort),
+            },
+        )
+        .unwrap();
+        let recovered = recovered_runtime
+            .recover_owner(active.fixture.owner)
+            .unwrap();
+        assert_eq!(recovered[0].state, FocusSessionState::Recovering);
+
+        let error = recovered_runtime
+            .reactivate_recovered_focus_session(active.fixture.owner, active.fixture.session)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, SecondMindErrorCode::Unavailable);
+        let pending = repository
+            .find_focus_session(active.fixture.session)
+            .unwrap()
+            .expect("recovery-pending focus session remains durable");
+        assert_eq!(pending.state, FocusSessionState::Recovering);
+        assert!(pending.source_degraded);
+        assert_eq!(
+            pending.failure_reason.as_deref(),
+            Some("native_status_acknowledgement_lost_during_recovery")
+        );
+        assert_eq!(
+            recovered_observation
+                .cleanup_states
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[FocusSessionState::Active, FocusSessionState::Active]
+        );
+        assert_eq!(
+            recovered_status.clears.lock().unwrap().as_slice(),
+            &[(active.fixture.session, 4)]
+        );
+        assert!(
+            !recovered_runtime
+                .ephemeral
+                .lock()
+                .unwrap()
+                .sessions
+                .contains_key(&active.fixture.session)
+        );
+
+        recovered_status.fail_publish_on_call(0);
+        let retried = recovered_runtime
+            .reactivate_recovered_focus_session(active.fixture.owner, active.fixture.session)
+            .await
+            .unwrap();
+        assert_eq!(retried.state, FocusSessionState::Active);
+        assert_eq!(recovered_observation.start_calls.load(Ordering::SeqCst), 4);
     }
 
     #[test]

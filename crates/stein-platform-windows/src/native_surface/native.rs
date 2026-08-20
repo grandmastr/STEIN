@@ -12,7 +12,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
-    NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
@@ -20,8 +20,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     IDI_APPLICATION, KillTimer, LoadIconW, MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG,
     PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
     SetTimer, SetWindowLongPtrW, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
-    WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_RBUTTONUP,
-    WM_TIMER, WNDCLASSW,
+    WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_NCCREATE, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
 };
 
 use super::{
@@ -58,7 +57,6 @@ const PROCESS_REQUESTS_MESSAGE: u32 = WM_APP + 0x52;
 const HEALTH_TIMER_ID: usize = 1;
 const HEALTH_TIMER_MILLISECONDS: u32 = 1_000;
 const REQUEST_CAPACITY: usize = 16;
-const MENU_OPEN: usize = 1_001;
 const MENU_MUTE: usize = 1_002;
 const MENU_STOP: usize = 1_003;
 
@@ -344,9 +342,7 @@ unsafe fn window_procedure_inner(
             }
             ICON_CALLBACK_MESSAGE => {
                 let event = (lparam as u32) & 0xffff;
-                if event == NIN_SELECT || event == WM_LBUTTONDBLCLK {
-                    context.shared.enqueue(EmergencyCommand::OpenStein);
-                } else if event == WM_CONTEXTMENU || event == WM_RBUTTONUP {
+                if event == WM_CONTEXTMENU || event == WM_RBUTTONUP {
                     show_status_menu(window, context);
                 }
                 return 0;
@@ -518,7 +514,6 @@ fn show_status_menu(window: HWND, context: &WindowContext) {
     // SAFETY: menu is owned by this function and no longer displayed.
     unsafe { DestroyMenu(menu) };
     match selected {
-        MENU_OPEN => context.shared.enqueue(EmergencyCommand::OpenStein),
         MENU_MUTE => {
             if let Some(session_id) = rendered.current_session {
                 context
@@ -560,7 +555,6 @@ fn populate_status_menu(
             .iter()
             .all(|label| append_disabled(menu, &format!("Resource: {}", escape_menu_label(label))))
         && append_separator(menu)
-        && append_action(menu, MENU_OPEN, "Open STEIN", true)
         && append_action(
             menu,
             MENU_MUTE,

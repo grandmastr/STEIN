@@ -3448,13 +3448,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "stein-broker-windows",
  "stein-core",
  "stein-ipc",
  "stein-model-openai",
  "stein-platform-windows",
  "stein-store-sqlite",
  "tempfile",
+ "time",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -3479,7 +3482,9 @@ dependencies = [
  "tracing",
  "uuid",
  "windows",
+ "windows-core 0.61.2",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -3520,7 +3525,9 @@ name = "stein-platform-windows"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "sha2",
+ "stein-broker-windows",
  "stein-core",
  "tempfile",
  "time",

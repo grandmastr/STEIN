@@ -33,10 +33,11 @@ pub use phase2_domain::{
     InterventionTone, ModelHandlingProfile, ModelPlacement, ModelRouteApproval,
     ModelRouteApprovalId, ModelRouteReference, OutboxEntryId, OutboxState,
     PendingInterventionDelivery, PermissionGrant, PermissionGrantId, PermissionScope,
-    PolicyDecision, PolicyDecisionId, PolicyOutcome, ProviderRetentionPolicy, ProviderTrainingUse,
-    RecordProvenance, RecordProvenanceSource, ResourceBinding, ResourceId, ResourceKind,
-    STEIN_IDENTITY_MIGRATION_V1, STEIN_IDENTITY_SCHEMA_V1, SelectedResourceDeletionTombstone,
-    SteinIdentity, SteinIdentityConstraint, USER_PREFERENCES_SCHEMA_V1, Urgency,
+    PolicyDecision, PolicyDecisionId, PolicyOutcome, PolicyTrace, ProviderRetentionPolicy,
+    ProviderTrainingUse, RecordProvenance, RecordProvenanceSource, ResourceBinding, ResourceId,
+    ResourceKind, STEIN_IDENTITY_MIGRATION_V1, STEIN_IDENTITY_SCHEMA_V1,
+    SelectedResourceDeletionTombstone, SteinIdentity, SteinIdentityConstraint,
+    USER_PREFERENCES_SCHEMA_V1, Urgency,
 };
 pub use phase2_ports::{
     BrowserLocationGranularity, ChannelAcknowledgement, DeliveryChannelHealth,
@@ -62,15 +63,16 @@ pub use ports::{
 };
 pub use protocol_adapter::{ProtocolEvent, ProtocolRequestContext, ProtocolSubscription};
 pub use repository::{
-    DeletionSummary, DurableRepository, GoalCreateReceipt, GoalDeletionResult,
-    GoalDeletionTombstone, MemoryRepository, NativeResourceCleanup, OperationKind,
-    OperationReceipt, OwnerStateSnapshot, RepositoryError, RepositoryErrorKind,
-    SelectedResourceDeletionResult,
+    DeletionSummary, DurableRepository, FocusSessionLifecycleWrite, GoalCreateReceipt,
+    GoalDeletionResult, GoalDeletionTombstone, InterventionTransitionWrite, MemoryRepository,
+    NativeResourceCleanup, OperationKind, OperationReceipt, OwnerStateSnapshot,
+    PendingDeliveryTransition, PermissionGrantRevocationWrite, RepositoryError,
+    RepositoryErrorKind, SecretDeletionCleanup, SelectedResourceDeletionResult,
 };
 pub use second_mind::{
-    ClientAssurance, EffectivePolicy, EndFocusReason, GrantPermission, IdempotencyContext,
-    ReasoningCycleResult, RetentionMaintenanceResult, SecondMindConfig, SecondMindError,
-    SecondMindErrorCode, SecondMindPorts, SecondMindRuntime, StartFocusSession,
+    CleanupMaintenanceResult, ClientAssurance, EffectivePolicy, EndFocusReason, GrantPermission,
+    IdempotencyContext, ReasoningCycleResult, RetentionMaintenanceResult, SecondMindConfig,
+    SecondMindError, SecondMindErrorCode, SecondMindPorts, SecondMindRuntime, StartFocusSession,
     UnavailableModelGateway, UnavailableObservationPort,
 };
 pub use view_publication::{

@@ -126,6 +126,9 @@ Retention, plus the applicable prompt-caching behavior. The adapter never claims
 ZDR merely because it sent `store: false`. Provider terms and behavior are
 versioned handling metadata; if STEIN cannot verify the configured profile or the
 profile changes incompatibly, the route becomes unavailable pending review.
+The initial default profile is closed as
+`openai-responses-default-2026-08`; the desktop consent payload and production
+gateway must use that exact identifier, and contract tests fail on drift.
 
 The OpenAI API key is resolved from the Windows Credential Manager adapter in ADR
 0013 only for the request. It never reaches React, the client protocol, SQLite,

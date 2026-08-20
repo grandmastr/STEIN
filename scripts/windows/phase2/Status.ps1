@@ -30,6 +30,7 @@ $result = [ordered]@{
     package_family_name = $null
     desktop_aumid = $null
     broker_aumid = $null
+    browser_producer_aumid = $null
     version = $null
     package_count = 0
     task_name = $null
@@ -63,6 +64,7 @@ try {
     $result.package_family_name = [string]$record.package_family_name
     $result.desktop_aumid = [string]$record.desktop_aumid
     $result.broker_aumid = [string]$record.broker_aumid
+    $result.browser_producer_aumid = [string]$record.browser_producer_aumid
     $result.version = [string]$record.version
     if ([string]$record.publisher -cne $Publisher -or
         ([string]$record.signing_certificate_thumbprint).ToUpperInvariant() -cne

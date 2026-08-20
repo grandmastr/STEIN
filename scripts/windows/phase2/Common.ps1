@@ -3,6 +3,7 @@ Set-StrictMode -Version 3.0
 $script:SteinPhase2PackageName = "STEIN.PersonalIntelligence"
 $script:SteinPhase2DesktopApplicationId = "Desktop"
 $script:SteinPhase2BrokerApplicationId = "PrivateBroker"
+$script:SteinPhase2BrowserProducerApplicationId = "BrowserObservationProducer"
 $script:SteinPhase2TaskPrefix = "STEIN Core SID-"
 $script:SteinPhase2InstallSchemaVersion = 2
 $script:SteinPhase2IdentitySchemaVersion = 1
@@ -281,12 +282,14 @@ function Get-SteinPhase2ReleaseBundle {
             "package_family_name",
             "desktop_aumid",
             "broker_aumid",
+            "browser_producer_aumid",
             "version",
             "architecture",
             "signing_certificate_thumbprint",
             "core_executable_file",
             "core_executable_size",
             "core_executable_sha256",
+            "browser_host_sha256",
             "cli_executable_file",
             "cli_executable_size",
             "cli_executable_sha256",
@@ -309,12 +312,14 @@ function Get-SteinPhase2ReleaseBundle {
         -Publisher $Publisher
     $expectedDesktopAumid = "$derivedFamily!$script:SteinPhase2DesktopApplicationId"
     $expectedBrokerAumid = "$derivedFamily!$script:SteinPhase2BrokerApplicationId"
+    $expectedBrowserProducerAumid = "$derivedFamily!$script:SteinPhase2BrowserProducerApplicationId"
     if ([int]$identity.identity_schema_version -ne $script:SteinPhase2IdentitySchemaVersion -or
         [string]$identity.package_name -cne $script:SteinPhase2PackageName -or
         [string]$identity.publisher -cne $Publisher -or
         [string]$identity.package_family_name -cne $derivedFamily -or
         [string]$identity.desktop_aumid -cne $expectedDesktopAumid -or
         [string]$identity.broker_aumid -cne $expectedBrokerAumid -or
+        [string]$identity.browser_producer_aumid -cne $expectedBrowserProducerAumid -or
         [string]$identity.version -cne $Version -or
         [string]$identity.architecture -cne "x64" -or
         ([string]$identity.signing_certificate_thumbprint).ToUpperInvariant() -cne $normalizedThumbprint) {
@@ -346,12 +351,15 @@ function Get-SteinPhase2ReleaseBundle {
         -CertificateThumbprint $normalizedThumbprint `
         -Publisher $Publisher `
         -Version $Version `
-        -ExpectedCoreSha256 ([string]$identity.core_executable_sha256)
+        -ExpectedCoreSha256 ([string]$identity.core_executable_sha256) `
+        -ExpectedHostSha256 ([string]$identity.browser_host_sha256)
     if ($null -eq $verification -or
         $verification.PackageFamilyName -cne $derivedFamily -or
         $verification.DesktopAumid -cne $expectedDesktopAumid -or
         $verification.BrokerAumid -cne $expectedBrokerAumid -or
+        $verification.BrowserProducerAumid -cne $expectedBrowserProducerAumid -or
         $verification.BrokerPinnedCoreSha256 -cne [string]$identity.core_executable_sha256 -or
+        $verification.BrowserHostSha256 -cne [string]$identity.browser_host_sha256 -or
         $verification.Sha256 -cne [string]$identity.msix_sha256) {
         throw "Independent MSIX verification did not reproduce the identity record."
     }
@@ -370,12 +378,15 @@ function Get-SteinPhase2ReleaseBundle {
         PackageFamilyName = $derivedFamily
         DesktopAumid = $expectedDesktopAumid
         BrokerAumid = $expectedBrokerAumid
+        BrowserProducerAumid = $expectedBrowserProducerAumid
         Version = $Version
         CertificateThumbprint = $normalizedThumbprint
         MsixSize = [long]$identity.msix_size
         MsixSha256 = [string]$identity.msix_sha256
         CoreSize = [long]$identity.core_executable_size
         CoreSha256 = [string]$identity.core_executable_sha256
+        BrowserHostSha256 = [string]$identity.browser_host_sha256
+        InstalledPayloadFiles = @($verification.InstalledPayloadFiles)
         CliSize = [long]$identity.cli_executable_size
         CliSha256 = [string]$identity.cli_executable_sha256
     }
@@ -387,14 +398,21 @@ function Get-SteinPhase2FileSystemSecurity {
     $sections = [Security.AccessControl.AccessControlSections]::Access -bor
         [Security.AccessControl.AccessControlSections]::Owner -bor
         [Security.AccessControl.AccessControlSections]::Group
-    if ($Item.PSIsContainer) {
-        return [IO.Directory]::GetAccessControl(
-            $Item.FullName,
+    $aclExtensions = "System.IO.FileSystemAclExtensions" -as [type]
+    if ($null -ne $aclExtensions) {
+        if ($Item.PSIsContainer) {
+            return [IO.FileSystemAclExtensions]::GetAccessControl(
+                [IO.DirectoryInfo]$Item,
+                $sections)
+        }
+        return [IO.FileSystemAclExtensions]::GetAccessControl(
+            [IO.FileInfo]$Item,
             $sections)
     }
-    return [IO.File]::GetAccessControl(
-        $Item.FullName,
-        $sections)
+    if ($Item.PSIsContainer) {
+        return [IO.Directory]::GetAccessControl($Item.FullName, $sections)
+    }
+    return [IO.File]::GetAccessControl($Item.FullName, $sections)
 }
 
 function Set-SteinPhase2FileSystemSecurity {
@@ -403,6 +421,19 @@ function Set-SteinPhase2FileSystemSecurity {
         [Parameter(Mandatory = $true)][Security.AccessControl.FileSystemSecurity] $Security
     )
 
+    $aclExtensions = "System.IO.FileSystemAclExtensions" -as [type]
+    if ($null -ne $aclExtensions) {
+        if ($Item.PSIsContainer) {
+            [IO.FileSystemAclExtensions]::SetAccessControl(
+                [IO.DirectoryInfo]$Item,
+                [Security.AccessControl.DirectorySecurity]$Security)
+            return
+        }
+        [IO.FileSystemAclExtensions]::SetAccessControl(
+            [IO.FileInfo]$Item,
+            [Security.AccessControl.FileSecurity]$Security)
+        return
+    }
     if ($Item.PSIsContainer) {
         [IO.Directory]::SetAccessControl(
             $Item.FullName,
@@ -437,13 +468,8 @@ function Protect-SteinPhase2OwnerOnlyPath {
                 [Security.Principal.SecurityIdentifier]))) {
         $security.RemoveAccessRuleSpecific($existingRule)
     }
-    try {
-        $currentOwnerSid = ([Security.Principal.NTAccount]$security.Owner).
-            Translate([Security.Principal.SecurityIdentifier]).Value
-    }
-    catch {
-        $currentOwnerSid = [Security.Principal.SecurityIdentifier]::new($security.Owner).Value
-    }
+    $currentOwnerSid = $security.GetOwner(
+        [Security.Principal.SecurityIdentifier]).Value
     if ($currentOwnerSid -cne $sid.Value) {
         $security.SetOwner($sid)
     }
@@ -489,13 +515,7 @@ function Assert-SteinPhase2OwnerOnlyPath {
     }
     $expectedSid = Get-SteinPhase2CurrentUserSid
     $acl = Get-SteinPhase2FileSystemSecurity -Item $item
-    try {
-        $ownerSid = ([Security.Principal.NTAccount]$acl.Owner).
-            Translate([Security.Principal.SecurityIdentifier]).Value
-    }
-    catch {
-        $ownerSid = [Security.Principal.SecurityIdentifier]::new($acl.Owner).Value
-    }
+    $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
     if ($ownerSid -cne $expectedSid -or -not $acl.AreAccessRulesProtected) {
         throw "A protected STEIN path does not have the exact owner/protection boundary."
     }
@@ -730,6 +750,132 @@ function Get-SteinPhase2InstalledPackages {
     )
 }
 
+function Get-SteinPhase2InstalledPayloadRelativePaths {
+    return @(
+        "AppxManifest.xml",
+        "Assets\Square150x150Logo.png",
+        "Assets\Square44x44Logo.png",
+        "Assets\StoreLogo.png",
+        "Metadata\CoreBinding.json",
+        "bin\stein-desktop.exe",
+        "bin\stein-edge-native-host.exe",
+        "bin\stein-private-broker.exe"
+    )
+}
+
+function Get-SteinPhase2RequiredInstalledPackageRelativePaths {
+    return @(Get-SteinPhase2InstalledPayloadRelativePaths) + @(
+        "AppxBlockMap.xml",
+        "AppxSignature.p7x"
+    )
+}
+
+function Get-SteinPhase2OptionalInstalledPackageRelativePaths {
+    return @("AppxMetadata\CodeIntegrity.cat")
+}
+
+function Assert-SteinPhase2InstalledPayloadFiles {
+    param(
+        [Parameter(Mandatory = $true)][string] $InstallLocation,
+        [Parameter(Mandatory = $true)] $ExpectedFiles
+    )
+
+    $root = ConvertTo-SteinPhase2CanonicalPath -Path $InstallLocation
+    $rootItem = Get-Item -LiteralPath $root -Force -ErrorAction Stop
+    if (-not $rootItem.PSIsContainer -or
+        (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "The installed package root is not a regular directory."
+    }
+
+    Assert-SteinPhase2NoReparseTree -Root $root
+    $requiredInstalledPaths = @(
+        Get-SteinPhase2RequiredInstalledPackageRelativePaths | Sort-Object)
+    $optionalInstalledPaths = @(
+        Get-SteinPhase2OptionalInstalledPackageRelativePaths | Sort-Object)
+    $actualInstalledPaths = @(
+        Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction Stop |
+            ForEach-Object { $_.FullName.Substring($root.Length + 1) } |
+            Sort-Object
+    )
+    $unexpectedInstalledPaths = @(
+        $actualInstalledPaths | Where-Object {
+            $_ -cnotin $requiredInstalledPaths -and $_ -cnotin $optionalInstalledPaths
+        })
+    $missingInstalledPaths = @(
+        $requiredInstalledPaths | Where-Object { $_ -cnotin $actualInstalledPaths })
+    if ($unexpectedInstalledPaths.Count -ne 0 -or $missingInstalledPaths.Count -ne 0) {
+        throw "The installed package does not contain the exact closed deployed file layout."
+    }
+
+    $expectedPaths = @(Get-SteinPhase2InstalledPayloadRelativePaths)
+    $entries = @($ExpectedFiles)
+    if ($entries.Count -ne $expectedPaths.Count) {
+        throw "The signed release payload manifest is incomplete."
+    }
+    $seen = @()
+    $prefix = "$root$([IO.Path]::DirectorySeparatorChar)"
+    foreach ($entry in $entries) {
+        Assert-SteinPhase2JsonShape -Value $entry `
+            -ExpectedProperties @("relative_path", "sha256", "size") `
+            -Description "A signed release payload entry"
+        $relativePath = [string]$entry.relative_path
+        if ($relativePath -cnotin $expectedPaths -or $seen -ccontains $relativePath) {
+            throw "The signed release payload contains an unexpected or duplicate path."
+        }
+        $seen += $relativePath
+
+        $expectedSize = 0L
+        if (-not [long]::TryParse(
+                [string]$entry.size,
+                [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref]$expectedSize) -or
+            $expectedSize -le 0) {
+            throw "The signed release payload contains an invalid file size."
+        }
+        $expectedSha256 = [string]$entry.sha256
+        if ($expectedSha256 -cnotmatch "^[0-9a-f]{64}$") {
+            throw "The signed release payload contains an invalid SHA-256 value."
+        }
+
+        $candidate = [IO.Path]::GetFullPath((Join-Path $root $relativePath))
+        if (-not $candidate.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "An installed package payload path escaped its exact root."
+        }
+        $probe = Split-Path -Parent $candidate
+        while ($probe.Length -ge $root.Length) {
+            $directory = Get-Item -LiteralPath $probe -Force -ErrorAction Stop
+            if (-not $directory.PSIsContainer -or
+                (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                throw "An installed package payload path contains a reparse point."
+            }
+            if ([string]::Equals($probe, $root, [StringComparison]::OrdinalIgnoreCase)) {
+                break
+            }
+            $parent = Split-Path -Parent $probe
+            if ([string]::IsNullOrWhiteSpace($parent) -or $parent -ceq $probe) {
+                throw "An installed package payload path has no exact root."
+            }
+            $probe = $parent
+        }
+
+        $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or
+            (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            $item.Length -ne $expectedSize -or
+            (Get-SteinPhase2Sha256 -Path $item.FullName) -cne $expectedSha256) {
+            throw "An installed package payload file differs from the operator-pinned signed MSIX."
+        }
+    }
+    if (@(Compare-Object `
+            -ReferenceObject ($expectedPaths | Sort-Object) `
+            -DifferenceObject ($seen | Sort-Object) `
+            -CaseSensitive).Count -ne 0) {
+        throw "The signed release payload manifest does not contain the exact installed file set."
+    }
+    return $true
+}
+
 function Assert-SteinPhase2InstalledPackage {
     param([Parameter(Mandatory = $true)] $Bundle)
 
@@ -746,14 +892,19 @@ function Assert-SteinPhase2InstalledPackage {
         throw "The installed MSIX identity does not match the verified release bundle."
     }
 
+    $null = Assert-SteinPhase2InstalledPayloadFiles `
+        -InstallLocation ([string]$package.InstallLocation) `
+        -ExpectedFiles $Bundle.InstalledPayloadFiles
+
     $manifest = Get-AppxPackageManifest -Package $package.PackageFullName -ErrorAction Stop
     $applications = @($manifest.Package.Applications.Application)
-    if ($applications.Count -ne 2) {
-        throw "The installed package does not contain the exact two-application topology."
+    if ($applications.Count -ne 3) {
+        throw "The installed package does not contain the exact three-application topology."
     }
     $applicationIds = @($applications | ForEach-Object { [string]$_.Id } | Sort-Object)
     $expectedIds = @(
         $script:SteinPhase2BrokerApplicationId,
+        $script:SteinPhase2BrowserProducerApplicationId,
         $script:SteinPhase2DesktopApplicationId
     ) | Sort-Object
     if (@(Compare-Object -ReferenceObject $expectedIds -DifferenceObject $applicationIds -CaseSensitive).Count -ne 0) {
@@ -931,6 +1082,7 @@ function New-SteinPhase2InstallRecord {
         package_family_name = $Bundle.PackageFamilyName
         desktop_aumid = $Bundle.DesktopAumid
         broker_aumid = $Bundle.BrokerAumid
+        browser_producer_aumid = $Bundle.BrowserProducerAumid
         version = $Bundle.Version
         architecture = "x64"
         signing_certificate_thumbprint = $Bundle.CertificateThumbprint
@@ -940,6 +1092,7 @@ function New-SteinPhase2InstallRecord {
         msix_sha256 = $Bundle.MsixSha256
         core_executable_size = $Bundle.CoreSize
         core_executable_sha256 = $Bundle.CoreSha256
+        browser_host_sha256 = $Bundle.BrowserHostSha256
         cli_executable_size = $Bundle.CliSize
         cli_executable_sha256 = $Bundle.CliSha256
         migration_readiness = $script:SteinPhase2MigrationReadiness
@@ -975,6 +1128,7 @@ function Read-SteinPhase2InstallRecord {
             "package_family_name",
             "desktop_aumid",
             "broker_aumid",
+            "browser_producer_aumid",
             "version",
             "architecture",
             "signing_certificate_thumbprint",
@@ -984,6 +1138,7 @@ function Read-SteinPhase2InstallRecord {
             "msix_sha256",
             "core_executable_size",
             "core_executable_sha256",
+            "browser_host_sha256",
             "cli_executable_size",
             "cli_executable_sha256",
             "migration_readiness"
@@ -1031,6 +1186,8 @@ function Get-SteinPhase2InstalledBundle {
         $bundle.MsixSha256 -cne [string]$record.msix_sha256 -or
         $bundle.CoreSize -ne [long]$record.core_executable_size -or
         $bundle.CoreSha256 -cne [string]$record.core_executable_sha256 -or
+        $bundle.BrowserProducerAumid -cne [string]$record.browser_producer_aumid -or
+        $bundle.BrowserHostSha256 -cne [string]$record.browser_host_sha256 -or
         $bundle.CliSize -ne [long]$record.cli_executable_size -or
         $bundle.CliSha256 -cne [string]$record.cli_executable_sha256) {
         throw "The protected current release bundle differs from the install record."

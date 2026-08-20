@@ -118,6 +118,83 @@ The diagnostic wire contract does not expose a numeric database schema version,
 which is reported separately as `numeric_schema_version_reported: false`. A
 false overall `healthy` result exits nonzero.
 
+## Read-only installed evidence collection
+
+Use the installed evidence harness only after the exact signed release is
+already installed and running:
+
+```text
+scripts\windows\phase2\Verify-Installed.cmd ^
+  -PackagePath C:\release\STEIN-0.2.1.0-x64.msix ^
+  -Publisher "<exact certificate Subject DN>" ^
+  -CertificateThumbprint "<40 hex characters>" ^
+  -Version 0.2.1.0
+```
+
+`PackagePath` identifies the signed MSIX beside its exact identity, CORE, and
+diagnostic-CLI companions. The harness validates that source bundle, then proves
+that the protected installed copy has the same hashes, Publisher, PFN, desktop
+broker, and browser-producer AUMIDs, version, browser-host digest, and
+broker-pinned CORE digest. The fixed deployed manifest, three executables,
+CORE binding, and three logo assets are independently hashed below the exact
+AppX install location and compared with the operator-pinned signed MSIX; package
+identity/version alone is not accepted as byte equality. The deployed tree must
+also contain the AppX block map and signature, may contain only the exact optional
+`AppxMetadata\CodeIntegrity.cat` catalog, and rejects every other installed file;
+the eight hashed application files cannot be hidden beside an unreviewed payload.
+It finally invokes
+the existing read-only status path and retains a minimized projection of package,
+task, process, ACL, runtime, protocol, capability, persistence-readiness, and
+recovery health. Authenticated actor identifiers, daemon identifiers, private
+snapshots, provider credentials, and private source payloads are not retained.
+
+Every invocation creates a new owner-only
+`artifacts\evidence\phase-2\installed-<UTC timestamp>-<run>` directory. A custom
+`-EvidenceRoot` is allowed only below the repository `artifacts` directory and
+still receives a new timestamped child. Local filesystem arguments are recorded
+as deterministic path hashes; signed artifact hashes and public package/signing
+identity remain exact. The only non-evidence filesystem activity is the
+temporary, independently verified MSIX unpack used by the existing verifier.
+Native signature and unpack tool output is discarded so source and temporary
+paths do not escape through a console transcript; failures retain only bounded
+codes.
+The harness does not install, upgrade, uninstall, start, stop, restart, or alter
+the package, daemon, task, Credential Manager, or installed database.
+
+`generator.json` records repository-relative paths, sizes, and SHA-256 digests
+for the harness, launcher, shared lifecycle/status code, and MSIX verifier code;
+the set is rehashed before the ledger is built. `ledger.json` contains every
+gate from the Phase 2 runbook and gives every row generator and host-provenance
+hashes, a command record, exit result, content-minimized output hash, and
+row-artifact hash. `root-anchor.json` binds the run, generator, host, and ledger
+digests through one deterministic root digest. This is a durable content-
+integrity chain, not a signature or independent authenticity claim; preserve
+the printed root digest in an external operator record when tamper evidence is
+required. The signed-bundle, installed-identity, and status checks
+are supporting evidence only. They cannot by themselves turn the broader
+private-client, persistence, upgrade, policy, native, interactive, or external
+gates into `pass`. Missing fixtures remain `not_run`; unavailable prerequisites
+are `blocked`; an observed prerequisite or attached native failure is `fail`.
+
+The optional `-AttachmentManifest` accepts a closed JSON schema. Start with the
+generated `attachments-template.json`. Each entry binds one gate to either a
+reviewed synthetic PNG screenshot or a content-free JSON native-fixture result,
+plus its exact SHA-256, declared result, UTC timestamp, and affirmative
+`privacy_reviewed`/`synthetic_only` flags. The harness verifies the regular file,
+format, size, and digest but never copies the file or retains its source path.
+Native results must also match the generated
+`native-fixture-result-template.json`: a closed schema containing only bounded
+fixture/command identifiers, gate, result, timestamp, and exit code. A screenshot
+never changes a result. A native `fail` or `blocked` is conservatively reflected;
+a declared native `pass` remains `not_run` until independent semantic review.
+Hash and envelope validation are not validation of fixture meaning.
+
+Exit code `0` means the read-only installed machine checks passed and the ledger
+was written. It does not mean Phase 2 acceptance is complete. Exit `1` means a
+machine check or declared native fixture failed; exit `2` means a required
+machine prerequisite or declared native fixture was blocked. All evidence,
+including failed runs, should be retained.
+
 ## Uninstall and explicit data removal
 
 ```text
@@ -151,8 +228,12 @@ signed installed bundle is still present.
 
 ## Required live evidence (not supplied by static validation)
 
-`packaging\windows-msix\Test-Static.ps1` performs parser, source-contract,
-MakeAppx schema, and temporary-directory safety checks only. It does not run
+`Test-VerifyInstalled.ps1` statically proves that the installed harness contains
+the exact 32-gate set, mandatory trust pins, quoted launcher, attachment
+fail-closed rules, and no direct install/task/process/credential mutation
+commands. `packaging\windows-msix\Test-Static.ps1` runs that contract alongside
+its parser, source-contract, MakeAppx schema, and temporary-directory safety
+checks only. It does not run
 `Add-AppxPackage`, `Remove-AppxPackage`, register/stop/start a task, stop a
 process, mutate Credential Manager, or alter certificate stores.
 

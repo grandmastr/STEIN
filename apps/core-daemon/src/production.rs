@@ -16,6 +16,9 @@ use stein_platform_windows::{
 use stein_store_sqlite::SqliteRepository;
 use uuid::Uuid;
 
+#[cfg(feature = "production-edge-producer")]
+use crate::browser_producer::{WindowsBrowserProducerPort, WindowsObservationWithBrowser};
+
 use crate::toast_registration::exact_desktop_registration_is_healthy;
 use crate::windows_storage::{prepare_repository_path, verify_repository_artifacts};
 
@@ -27,12 +30,19 @@ pub struct ProductionComposition {
     pub core: CoreApplication,
     pub owner: ActorId,
     pub toast_registration_verified: bool,
+    #[cfg(feature = "production-edge-producer")]
+    pub browser_producer: Arc<WindowsBrowserProducerPort>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RecoverySummary {
     pub reactivated_with_fresh_sources: usize,
     pub ended_without_restart_authority: usize,
+    pub resumed_stopping_cleanup: usize,
+    pub native_cleanups_completed: usize,
+    pub native_cleanups_pending: usize,
+    pub secret_cleanups_completed: usize,
+    pub secret_cleanups_pending: usize,
 }
 
 struct RuntimeComponents {
@@ -73,7 +83,40 @@ impl ProductionComposition {
                 .map_err(|error| anyhow!(error.summary))
                 .context("configure Windows observation")?,
         );
+        #[cfg(feature = "production-edge-producer")]
+        let browser_producer = {
+            let expected = stein_broker_windows::ExpectedPackageIdentity::new(
+                owner_sid.clone(),
+                env!("STEIN_EMBEDDED_PACKAGE_FAMILY_NAME"),
+                env!("STEIN_EMBEDDED_BROWSER_PRODUCER_AUMID"),
+            )
+            .map_err(|_| anyhow!("the Edge producer package identity is invalid"))?;
+            let listener = stein_platform_windows::BrowserProducerListener::new(
+                expected,
+                *Uuid::now_v7().as_bytes(),
+            )
+            .map_err(|error| anyhow!(error.summary))
+            .context("configure the package-admitted Edge producer endpoint")?;
+            Arc::new(WindowsBrowserProducerPort::new(
+                listener,
+                repository.clone(),
+                owner,
+                env!("STEIN_EMBEDDED_EDGE_EXTENSION_ID"),
+                env!("STEIN_EMBEDDED_EDGE_EXTENSION_VERSION"),
+            ))
+        };
+        #[cfg(feature = "production-edge-producer")]
+        let observation_stack = Arc::new(WindowsObservationWithBrowser::new(
+            windows_observation,
+            browser_producer.clone(),
+        ));
+        #[cfg(feature = "production-edge-producer")]
+        let observation: Arc<dyn ObservationPort> = observation_stack.clone();
+        #[cfg(feature = "production-edge-producer")]
+        let resource_selection: Arc<dyn ResourceSelectionPort> = observation_stack;
+        #[cfg(not(feature = "production-edge-producer"))]
         let observation: Arc<dyn ObservationPort> = windows_observation.clone();
+        #[cfg(not(feature = "production-edge-producer"))]
         let resource_selection: Arc<dyn ResourceSelectionPort> = windows_observation;
         let model = Arc::new(
             OpenAiResponsesGateway::new(Arc::clone(&secret_store))
@@ -126,6 +169,8 @@ impl ProductionComposition {
             core,
             owner,
             toast_registration_verified,
+            #[cfg(feature = "production-edge-producer")]
+            browser_producer,
         })
     }
 }
@@ -134,6 +179,12 @@ pub async fn recover_authorized_workflows(
     core: &CoreApplication,
     owner: ActorId,
 ) -> Result<RecoverySummary> {
+    let cleanup = core
+        .second_mind()
+        .recover_cleanup_obligations(owner)
+        .await
+        .map_err(|error| anyhow!(error.summary))
+        .context("retry durable platform cleanup after daemon restart")?;
     let recovered = core
         .second_mind()
         .recover_owner(owner)
@@ -143,6 +194,18 @@ pub async fn recover_authorized_workflows(
         .iter()
         .filter(|session| session.state == FocusSessionState::Ended)
         .count();
+    let mut resumed_stopping_cleanup = 0;
+    for session in recovered
+        .iter()
+        .filter(|session| session.state == FocusSessionState::Stopping)
+    {
+        core.second_mind()
+            .finish_end_focus_session(owner, session.id, session.revision)
+            .await
+            .map_err(|error| anyhow!(error.summary))
+            .context("resume bounded adapter and native-status cleanup for a stopping session")?;
+        resumed_stopping_cleanup += 1;
+    }
     let mut reactivated_with_fresh_sources = 0;
     for session in recovered
         .iter()
@@ -158,6 +221,11 @@ pub async fn recover_authorized_workflows(
     Ok(RecoverySummary {
         reactivated_with_fresh_sources,
         ended_without_restart_authority,
+        resumed_stopping_cleanup,
+        native_cleanups_completed: cleanup.native_resource_completed,
+        native_cleanups_pending: cleanup.native_resource_pending,
+        secret_cleanups_completed: cleanup.secret_deletion_completed,
+        secret_cleanups_pending: cleanup.secret_deletion_pending,
     })
 }
 
@@ -211,14 +279,18 @@ fn stable_owner_actor(owner_sid: &str) -> ActorId {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use stein_core::{
-        CapabilityState, CreateGoal, IdempotencyKey, MemoryRepository,
-        UnavailableEmergencyControlPort, UnavailableModelGateway, UnavailableNativeStatusPort,
-        UnavailableNotificationPort, UnavailableObservationPort, UnavailableResourceSelectionPort,
-        UnavailableSecretStore,
+        CapabilityState, CreateGoal, FocusSession, FocusSessionId, GoalId, IdempotencyKey,
+        MemoryRepository, ModelRouteApprovalId, NativeStatusAcknowledgement, NativeStatusError,
+        PortFuture, UnavailableEmergencyControlPort, UnavailableModelGateway,
+        UnavailableNativeStatusPort, UnavailableNotificationPort, UnavailableObservationPort,
+        UnavailableResourceSelectionPort, UnavailableSecretStore,
     };
+    use time::OffsetDateTime;
 
     use super::*;
 
@@ -236,6 +308,124 @@ mod tests {
     fn windows_observation_receives_the_exact_input_inactivity_threshold() {
         let supplied = build_windows_observation(Ok::<Duration, ()>).unwrap();
         assert_eq!(supplied, Duration::from_secs(60));
+    }
+
+    #[derive(Default)]
+    struct ControllableNativeStatus {
+        clear_calls: Mutex<Vec<(FocusSessionId, u64)>>,
+        fail_clear: AtomicBool,
+    }
+
+    impl NativeStatusPort for ControllableNativeStatus {
+        fn availability(&self) -> PlatformPortAvailability {
+            PlatformPortAvailability::Available
+        }
+
+        fn clear<'a>(
+            &'a self,
+            session_id: FocusSessionId,
+            revision: u64,
+        ) -> PortFuture<'a, std::result::Result<NativeStatusAcknowledgement, NativeStatusError>>
+        {
+            self.clear_calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((session_id, revision));
+            let fail = self.fail_clear.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if fail {
+                    Err(NativeStatusError {
+                        summary: "Synthetic clear failure.",
+                        retryable: true,
+                    })
+                } else {
+                    let acknowledged_at = OffsetDateTime::now_utc();
+                    Ok(NativeStatusAcknowledgement {
+                        session_id,
+                        revision,
+                        acknowledged_at,
+                        heartbeat_deadline: acknowledged_at + time::Duration::seconds(10),
+                    })
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_startup_resumes_stopping_cleanup_and_ends_fail_closed() {
+        let repository = Arc::new(MemoryRepository::default());
+        let owner = ActorId::new_v7();
+        let session_id = FocusSessionId::new_v7();
+        let now = OffsetDateTime::now_utc();
+        let stopping = FocusSession {
+            id: session_id,
+            revision: 4,
+            owner,
+            goal_id: GoalId::from_uuid(Uuid::now_v7()),
+            goal_revision: 1,
+            state: FocusSessionState::Stopping,
+            muted: false,
+            source_degraded: false,
+            client_disconnect_allowed: true,
+            daemon_restart_allowed: false,
+            permission_grant_ids: BTreeSet::new(),
+            selected_resource_ids: BTreeSet::new(),
+            model_route_approval_id: ModelRouteApprovalId::new_v7(),
+            requested_at: now,
+            started_at: Some(now),
+            ended_at: None,
+            updated_at: now,
+            failure_reason: Some("ending_user_request".to_owned()),
+        };
+        repository.save_focus_session(&stopping, None).unwrap();
+        let native_status = Arc::new(ControllableNativeStatus::default());
+        native_status.fail_clear.store(true, Ordering::SeqCst);
+        let repository_port: Arc<dyn DurableRepository> = repository.clone();
+        let native_status_port: Arc<dyn NativeStatusPort> = native_status.clone();
+        let core = assemble_application(
+            "synthetic",
+            RuntimeComponents {
+                repository: repository_port,
+                durable_persistence: PlatformPortAvailability::Available,
+                clock: Arc::new(SystemClock::default()),
+                secret_store: Arc::new(UnavailableSecretStore::default()),
+                observation: Arc::new(UnavailableObservationPort),
+                resource_selection: Arc::new(UnavailableResourceSelectionPort),
+                model: Arc::new(UnavailableModelGateway),
+                notification: Arc::new(UnavailableNotificationPort),
+                native_status: native_status_port,
+                emergency_control: Arc::new(UnavailableEmergencyControlPort),
+            },
+        )
+        .unwrap();
+
+        let summary = recover_authorized_workflows(&core, owner).await.unwrap();
+
+        assert_eq!(summary.resumed_stopping_cleanup, 1);
+        assert_eq!(
+            *native_status
+                .clear_calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![(session_id, stopping.revision)]
+        );
+        let ended = repository.find_focus_session(session_id).unwrap().unwrap();
+        assert_eq!(ended.state, FocusSessionState::Ended);
+        assert!(ended.source_degraded);
+        assert_eq!(
+            ended.failure_reason.as_deref(),
+            Some("ended_cleanup_incomplete")
+        );
+        assert!(
+            repository
+                .load_audit(owner, OffsetDateTime::UNIX_EPOCH, 10)
+                .unwrap()
+                .iter()
+                .any(|record| record
+                    .reason_codes
+                    .iter()
+                    .any(|reason| reason == "focus_session_ended_cleanup_incomplete"))
+        );
     }
 
     #[test]

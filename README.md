@@ -52,13 +52,22 @@ the daemon-owned goal after reopening. The retained proof is summarized in the
 [dated Windows evidence record](docs/evidence/phase-1-windows-20260819.md) and
 indexed in the [Phase 1 verification runbook](docs/phase-1-runbook.md).
 
-Two disruptive environment checks remain explicitly unclaimed: signing out and
-back in, and attempting the first user's pipe from a real second Windows SID.
+Two disruptive Phase 1 environment checks remain explicitly unclaimed: signing
+out and back in, and attempting the first user's pipe from a real second Windows
+SID.
 The logon trigger, current-user-only DACL, and mutual process-token SID checks
 are implemented; those two host fixtures are follow-up validation, not hidden
 passes. Linux and macOS (Darwin) are the next platform ports. Future
 expensive-to-reverse changes still require accepted architecture decision
 records.
+
+The Windows Phase 2 implementation is under active verification and is not yet
+claimed complete. Its [acceptance runbook](docs/phase-2-runbook.md) preserves a
+32-row fail-closed ledger. The read-only
+[`Verify-Installed.cmd`](scripts/windows/phase2/Verify-Installed.cmd) collector
+can bind a signed release to the exact installed package and status evidence,
+but it deliberately leaves unexecuted interactive, native, adversarial, and
+external gates as `not_run` or `blocked` rather than manufacturing passes.
 
 ## Design principles
 
@@ -82,6 +91,7 @@ docs/
 |-- roadmap.md             Staged outcomes and exit criteria
 |-- phase-0/               First-slice discovery contracts and trust rules
 |-- phase-1-runbook.md     Windows build, install, and completion verification
+|-- phase-2-runbook.md     Windows Phase 2 fail-closed acceptance ledger
 `-- decisions/             Architecture decision records
 ```
 

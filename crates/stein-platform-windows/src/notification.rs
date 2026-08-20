@@ -1,6 +1,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU8, Ordering},
+    mpsc,
+};
 use std::thread::{self, JoinHandle};
 
 use stein_core::{
@@ -146,7 +150,46 @@ impl fmt::Debug for ToastPayload {
 struct ToastJob {
     payload: ToastPayload,
     cancellation: CancellationToken,
+    claim: Arc<DeliveryClaim>,
     response: oneshot::Sender<Result<ChannelAcknowledgement, NotificationPortError>>,
+}
+
+const DELIVERY_PENDING: u8 = 0;
+const DELIVERY_CLAIMED: u8 = 1;
+const DELIVERY_CANCELLED: u8 = 2;
+
+/// Linearizes cancellation against the native worker taking ownership of a
+/// delivery. Cancellation is definite only while the job remains pending. Once
+/// the worker claims it, the caller must wait for the native outcome because a
+/// synchronous `Show` may already be in progress and cannot be recalled.
+struct DeliveryClaim(AtomicU8);
+
+impl DeliveryClaim {
+    const fn pending() -> Self {
+        Self(AtomicU8::new(DELIVERY_PENDING))
+    }
+
+    fn cancel_pending(&self) -> bool {
+        self.0
+            .compare_exchange(
+                DELIVERY_PENDING,
+                DELIVERY_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn claim_pending(&self) -> bool {
+        self.0
+            .compare_exchange(
+                DELIVERY_PENDING,
+                DELIVERY_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
 }
 
 enum WorkerMessage {
@@ -246,6 +289,7 @@ impl NotificationRuntime {
         }
 
         let wait_cancellation = cancellation.clone();
+        let claim = Arc::new(DeliveryClaim::pending());
         let (response, receiver) = oneshot::channel();
         self.sender
             .as_ref()
@@ -253,6 +297,7 @@ impl NotificationRuntime {
             .try_send(WorkerMessage::Deliver(ToastJob {
                 payload,
                 cancellation,
+                claim: Arc::clone(&claim),
                 response,
             }))
             .map_err(|error| {
@@ -265,18 +310,31 @@ impl NotificationRuntime {
                 }
             })?;
 
+        let mut receiver = receiver;
         tokio::select! {
-            () = wait_cancellation.cancelled() => Err(notification_error(
-                "The Windows notification delivery was cancelled.",
-                false,
-            )),
-            result = receiver => result.unwrap_or_else(|_| {
+            result = &mut receiver => result.unwrap_or_else(|_| {
                 set_health(&self.health, WorkerHealth::Stopped);
                 Err(notification_error(
                     "The Windows notification result is unknown because its worker stopped.",
                     false,
                 ))
             }),
+            () = wait_cancellation.cancelled() => {
+                if claim.cancel_pending() {
+                    Err(notification_error(
+                        "The Windows notification delivery was cancelled.",
+                        false,
+                    ))
+                } else {
+                    receiver.await.unwrap_or_else(|_| {
+                        set_health(&self.health, WorkerHealth::Stopped);
+                        Err(notification_error(
+                            "The Windows notification result is unknown because its worker stopped.",
+                            false,
+                        ))
+                    })
+                }
+            },
         }
     }
 
@@ -398,6 +456,7 @@ fn process_job(
     outcome_order: &mut VecDeque<Uuid>,
 ) -> Result<ChannelAcknowledgement, NotificationPortError> {
     if job.cancellation.is_cancelled() {
+        let _ = job.claim.cancel_pending();
         return Err(notification_error(
             "The Windows notification delivery was cancelled.",
             false,
@@ -416,7 +475,25 @@ fn process_job(
         ));
     }
     if let Some(outcome) = outcomes.get(&job.payload.deduplication_key) {
+        if !job.claim.claim_pending() {
+            return Err(notification_error(
+                "The Windows notification delivery was cancelled.",
+                false,
+            ));
+        }
         return Ok(*outcome);
+    }
+    if job.cancellation.is_cancelled() && job.claim.cancel_pending() {
+        return Err(notification_error(
+            "The Windows notification delivery was cancelled.",
+            false,
+        ));
+    }
+    if !job.claim.claim_pending() {
+        return Err(notification_error(
+            "The Windows notification delivery was cancelled.",
+            false,
+        ));
     }
     let submission =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| native.show(&job.payload)))
@@ -614,6 +691,12 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct BlockingNative {
+        entered: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+        calls: Arc<AtomicUsize>,
+    }
+
     impl ToastNative for ScriptedNative {
         fn initialize(&mut self, _aumid: &str) -> NativeInitialization {
             self.initialization
@@ -622,6 +705,19 @@ mod tests {
         fn show(&mut self, _payload: &ToastPayload) -> ToastSubmission {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.outcome
+        }
+    }
+
+    impl ToastNative for BlockingNative {
+        fn initialize(&mut self, _aumid: &str) -> NativeInitialization {
+            NativeInitialization::Ready
+        }
+
+        fn show(&mut self, _payload: &ToastPayload) -> ToastSubmission {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
+            ToastSubmission::Accepted
         }
     }
 
@@ -759,6 +855,53 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_after_worker_claim_waits_for_the_native_outcome() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let runtime = Arc::new(
+            NotificationRuntime::start(
+                config(WindowsToastRegistrationHealth::VerifiedByInstaller),
+                Box::new(BlockingNative {
+                    entered: entered_sender,
+                    release: release_receiver,
+                    calls: Arc::clone(&calls),
+                }),
+                Arc::new(StaticPresence(PresenceState::Active)),
+            )
+            .unwrap(),
+        );
+        let cancellation = CancellationToken::new();
+        let delivery = delivery();
+        let mut attempt = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            let cancellation = cancellation.clone();
+            async move { runtime.deliver(&delivery, cancellation).await }
+        });
+
+        tokio::task::spawn_blocking(move || entered_receiver.recv_timeout(Duration::from_secs(1)))
+            .await
+            .unwrap()
+            .unwrap();
+        cancellation.cancel();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut attempt)
+                .await
+                .is_err(),
+            "a claimed native delivery was misreported as definitely cancelled"
+        );
+        release_sender.send(()).unwrap();
+        let acknowledgement = tokio::time::timeout(Duration::from_secs(1), attempt)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(acknowledgement, ChannelAcknowledgement::AcceptedByChannel);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn definite_and_ambiguous_native_outcomes_remain_distinct() {
         for (native, expected) in [
@@ -851,6 +994,7 @@ mod tests {
             WorkerMessage::Deliver(ToastJob {
                 payload: prepare_payload(&delivery(), OffsetDateTime::now_utc()).unwrap(),
                 cancellation: CancellationToken::new(),
+                claim: Arc::new(DeliveryClaim::pending()),
                 response,
             })
         };

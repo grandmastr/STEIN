@@ -9,14 +9,16 @@ use serde_json::Value as JsonValue;
 use stein_core::{
     ActorId, AuditKind, AuditRecord, AuditRecordId, CandidateId, ClientId, DataCategory, DeviceId,
     DurableRepository, EvidenceRole, EvidenceSummary, ExplicitPreferences, FocusSession,
-    FocusSessionId, FocusSessionState, Goal, GoalCreateReceipt, GoalId, GoalState, GrantState,
-    IdempotencyKey, Intervention, InterventionDecisionWrite, InterventionId, InterventionOutcome,
-    InterventionState, InterventionTone, ModelHandlingProfile, ModelPlacement, ModelRouteApproval,
+    FocusSessionId, FocusSessionLifecycleWrite, FocusSessionState, Goal, GoalCreateReceipt, GoalId,
+    GoalState, GrantState, IdempotencyKey, Intervention, InterventionDecisionWrite, InterventionId,
+    InterventionOutcome, InterventionState, InterventionTone, InterventionTransitionWrite,
+    MemoryRepository, ModelHandlingProfile, ModelPlacement, ModelRouteApproval,
     ModelRouteApprovalId, NativeResourceCleanup, OperationKind, OperationReceipt, OutboxEntryId,
-    OutboxState, PendingInterventionDelivery, PermissionGrant, PermissionGrantId, PermissionScope,
-    PolicyDecision, PolicyDecisionId, PolicyOutcome, ProviderRetentionPolicy, ProviderTrainingUse,
-    RepositoryErrorKind, ResourceBinding, ResourceId, ResourceKind, Revision, SecretKey,
-    SteinIdentity, USER_PREFERENCES_SCHEMA_V1, Urgency,
+    OutboxState, PendingDeliveryTransition, PendingInterventionDelivery, PermissionGrant,
+    PermissionGrantId, PermissionGrantRevocationWrite, PermissionScope, PolicyDecision,
+    PolicyDecisionId, PolicyOutcome, PolicyTrace, ProviderRetentionPolicy, ProviderTrainingUse,
+    RepositoryErrorKind, ResourceBinding, ResourceId, ResourceKind, Revision,
+    SecretDeletionCleanup, SteinIdentity, USER_PREFERENCES_SCHEMA_V1, Urgency,
 };
 use stein_store_sqlite::SqliteRepository;
 use tempfile::tempdir;
@@ -31,6 +33,15 @@ fn uuid(offset: u128) -> Uuid {
 
 fn actor() -> ActorId {
     ActorId::from_uuid(uuid(0x101))
+}
+
+fn policy_trace(seed: u8) -> PolicyTrace {
+    PolicyTrace {
+        policy_profile_id: "phase2-focus-v1".to_owned(),
+        user_preferences_revision: 1,
+        proposed_input_schema_version: PolicyTrace::INPUT_SCHEMA_V1,
+        proposed_input_digest: [seed.max(1); 32],
+    }
 }
 
 fn other_actor() -> ActorId {
@@ -91,6 +102,7 @@ fn creation_audit(
         evidence_categories: BTreeSet::new(),
         evidence_age_ms: None,
         confidence_basis_points: None,
+        policy_trace: None,
         occurred_at: now(),
         expires_at: now() + Duration::days(30),
     }
@@ -150,7 +162,7 @@ fn synthetic_graph(owner: ActorId, offset: u128) -> SyntheticGraph {
         provider: "synthetic-provider".to_owned(),
         account_profile: "synthetic-account".to_owned(),
         model: "synthetic-model".to_owned(),
-        secret_ref: SecretKey::new("synthetic-provider-reference"),
+        secret_ref: ModelRouteApproval::approval_scoped_secret_ref(route_id),
         placement: ModelPlacement::Remote,
         allowed_categories: BTreeSet::from([
             DataCategory::Goal,
@@ -252,6 +264,7 @@ fn synthetic_graph(owner: ActorId, offset: u128) -> SyntheticGraph {
         updated_at: now() + Duration::seconds(1),
         failure_reason: None,
     };
+    let decision_policy_trace = policy_trace(0x44);
     let policy = PolicyDecision {
         id: policy_id,
         candidate_id,
@@ -267,6 +280,7 @@ fn synthetic_graph(owner: ActorId, offset: u128) -> SyntheticGraph {
         model_route_revision: route.revision,
         channel: "windows.native_notification".to_owned(),
         policy_version: "phase2-focus-v1".to_owned(),
+        policy_trace: decision_policy_trace.clone(),
         issued_at: now() + Duration::seconds(2),
         expires_at: now() + Duration::seconds(32),
     };
@@ -368,6 +382,7 @@ fn synthetic_graph(owner: ActorId, offset: u128) -> SyntheticGraph {
         evidence_categories: BTreeSet::from([DataCategory::EvidenceAggregates]),
         evidence_age_ms: Some(1_000),
         confidence_basis_points: Some(8_000),
+        policy_trace: Some(decision_policy_trace),
         occurred_at: policy.issued_at,
         expires_at: now() + Duration::days(30),
     };
@@ -489,6 +504,7 @@ fn append_graph_audit(repository: &SqliteRepository, graph: &SyntheticGraph) {
                 evidence_categories: BTreeSet::from([DataCategory::EvidenceAggregates]),
                 evidence_age_ms: Some(1_000),
                 confidence_basis_points: Some(8_000),
+                policy_trace: Some(policy_trace(u8::try_from(index + 1).unwrap_or(u8::MAX))),
                 occurred_at: now() + Duration::seconds(index as i64),
                 expires_at: now() + Duration::days(30),
             })
@@ -548,13 +564,15 @@ fn downgrade_current_database_to_v1(path: &std::path::Path) {
              DROP TABLE goal_deletion_tombstones;
              DROP TABLE resource_deletion_tombstones;
              DROP TABLE native_resource_cleanup_records;
+             DROP TABLE secret_deletion_cleanup_records;
              DELETE FROM schema_migrations
              WHERE migration_id IN (
                  'identity-permissions-v2-goal-links',
                  'intervention-v2-workflow-links',
                  'application-v3-operation-receipts',
                  'identity-permissions-v4-explicit-preferences-v1',
-                 'identity-permissions-v5-private-product-contracts'
+                 'identity-permissions-v5-private-product-contracts',
+                 'identity-permissions-v6-secret-deletion-cleanup'
              );
              PRAGMA user_version=1;
              COMMIT;
@@ -573,10 +591,12 @@ fn downgrade_current_database_to_v2(path: &std::path::Path) {
              DROP TABLE goal_deletion_tombstones;
              DROP TABLE resource_deletion_tombstones;
              DROP TABLE native_resource_cleanup_records;
+             DROP TABLE secret_deletion_cleanup_records;
              DELETE FROM schema_migrations WHERE migration_id IN (
                  'application-v3-operation-receipts',
                  'identity-permissions-v4-explicit-preferences-v1',
-                 'identity-permissions-v5-private-product-contracts'
+                 'identity-permissions-v5-private-product-contracts',
+                 'identity-permissions-v6-secret-deletion-cleanup'
              );
              PRAGMA user_version=2;
              COMMIT;",
@@ -602,12 +622,28 @@ fn downgrade_current_database_to_v3(path: &std::path::Path) {
              DROP TABLE goal_deletion_tombstones;
              DROP TABLE resource_deletion_tombstones;
              DROP TABLE native_resource_cleanup_records;
+             DROP TABLE secret_deletion_cleanup_records;
              DELETE FROM schema_migrations
              WHERE migration_id IN (
                  'identity-permissions-v4-explicit-preferences-v1',
-                 'identity-permissions-v5-private-product-contracts'
+                 'identity-permissions-v5-private-product-contracts',
+                 'identity-permissions-v6-secret-deletion-cleanup'
              );
              PRAGMA user_version=3;
+             COMMIT;",
+        )
+        .unwrap();
+}
+
+fn downgrade_current_database_to_v5(path: &std::path::Path) {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            "BEGIN EXCLUSIVE;
+             DROP TABLE secret_deletion_cleanup_records;
+             DELETE FROM schema_migrations
+             WHERE migration_id='identity-permissions-v6-secret-deletion-cleanup';
+             PRAGMA user_version=5;
              COMMIT;",
         )
         .unwrap();
@@ -620,7 +656,7 @@ fn state_and_atomic_owner_snapshot_survive_repository_restart() {
     let graph = synthetic_graph(actor(), 0x200);
     {
         let repository = SqliteRepository::open(&path).unwrap();
-        assert_eq!(repository.schema_version().unwrap(), 5);
+        assert_eq!(repository.schema_version().unwrap(), 6);
         install_graph(&repository, &graph, true, false);
         repository.health().unwrap();
     }
@@ -775,6 +811,303 @@ fn aggregate_receipt_and_audit_creation_is_atomic() {
 }
 
 #[test]
+fn model_route_creation_rejects_a_shared_secret_reference_without_partial_state() {
+    let directory = tempdir().unwrap();
+    let repository =
+        SqliteRepository::open(directory.path().join("approval-scoped-secret-ref.db")).unwrap();
+    let mut graph = synthetic_graph(actor(), 0x4b0);
+    graph.route.secret_ref = stein_core::SecretRef::new("shared-provider-route-name");
+
+    let error = repository
+        .create_model_route(&graph.route, &graph.route_receipt, &graph.route_audit)
+        .unwrap_err();
+
+    assert_eq!(error.kind, RepositoryErrorKind::Corrupt);
+    assert!(repository.load_model_routes(actor()).unwrap().is_empty());
+    assert!(
+        repository
+            .find_operation_receipt(
+                actor(),
+                OperationKind::ApproveModelRoute,
+                graph.route_receipt.idempotency_key,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repository
+            .load_audit(actor(), OffsetDateTime::UNIX_EPOCH, 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn memory_focus_lifecycle_transition_commits_session_and_audit_together() {
+    let repository = MemoryRepository::default();
+    let graph = synthetic_graph(actor(), 0x4c0);
+    repository.save_focus_session(&graph.session, None).unwrap();
+    let mut stopping = graph.session.clone();
+    stopping.state = FocusSessionState::Stopping;
+    stopping.revision += 1;
+    stopping.updated_at += Duration::seconds(1);
+    let mut audit = creation_audit(
+        actor(),
+        0x4d0,
+        AuditKind::FocusSessionStateChanged,
+        stopping.id.as_uuid(),
+    );
+    audit.reason_codes = vec!["focus_session_stopping".to_owned()];
+    let write = FocusSessionLifecycleWrite {
+        session: stopping.clone(),
+        expected_revision: graph.session.revision,
+        audit: audit.clone(),
+    };
+
+    repository.save_focus_session_transition(&write).unwrap();
+
+    assert_eq!(
+        repository.find_focus_session(stopping.id).unwrap(),
+        Some(stopping)
+    );
+    assert!(
+        repository
+            .load_audit(actor(), OffsetDateTime::UNIX_EPOCH, 100)
+            .unwrap()
+            .contains(&audit)
+    );
+}
+
+#[test]
+fn sqlite_focus_lifecycle_transition_rolls_back_when_audit_conflicts() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("atomic-focus-lifecycle.db");
+    let graph = synthetic_graph(actor(), 0x520);
+    let repository = SqliteRepository::open(&path).unwrap();
+    install_graph_foundation(&repository, &graph);
+    let original = graph.session.clone();
+    let mut stopping = original.clone();
+    stopping.state = FocusSessionState::Stopping;
+    stopping.revision += 1;
+    stopping.updated_at += Duration::seconds(1);
+    let mut audit = creation_audit(
+        actor(),
+        0x5f0,
+        AuditKind::FocusSessionStateChanged,
+        stopping.id.as_uuid(),
+    );
+    audit.reason_codes = vec!["focus_session_stopping".to_owned()];
+    let write = FocusSessionLifecycleWrite {
+        session: stopping.clone(),
+        expected_revision: original.revision,
+        audit: audit.clone(),
+    };
+
+    repository.save_focus_session_transition(&write).unwrap();
+    drop(repository);
+
+    let repository = SqliteRepository::open(&path).unwrap();
+    assert_eq!(
+        repository.find_focus_session(stopping.id).unwrap(),
+        Some(stopping.clone())
+    );
+    assert!(
+        repository
+            .load_audit(actor(), OffsetDateTime::UNIX_EPOCH, 100)
+            .unwrap()
+            .contains(&audit)
+    );
+
+    let mut ended = stopping.clone();
+    ended.state = FocusSessionState::Ended;
+    ended.revision += 1;
+    ended.ended_at = Some(now() + Duration::seconds(3));
+    ended.updated_at = now() + Duration::seconds(3);
+    let conflicting = FocusSessionLifecycleWrite {
+        session: ended,
+        expected_revision: stopping.revision,
+        audit,
+    };
+    let error = repository
+        .save_focus_session_transition(&conflicting)
+        .unwrap_err();
+    assert_eq!(error.kind, RepositoryErrorKind::Conflict);
+    assert_eq!(
+        repository.find_focus_session(stopping.id).unwrap(),
+        Some(stopping)
+    );
+}
+
+#[test]
+fn memory_permission_and_intervention_transitions_commit_with_their_audits() {
+    let repository = MemoryRepository::default();
+    let graph = synthetic_graph(actor(), 0x620);
+    let original_grant = graph.bound_grants[0].clone();
+    repository.save_grant(&original_grant, None).unwrap();
+    let mut revoked = original_grant.clone();
+    revoked.revision += 1;
+    revoked.state = GrantState::Revoked;
+    revoked.revoked_at = Some(now() + Duration::seconds(3));
+    revoked.revocation_reason = Some("synthetic_revocation".to_owned());
+    let permission_audit = creation_audit(
+        actor(),
+        0x680,
+        AuditKind::PermissionRevoked,
+        revoked.id.as_uuid(),
+    );
+    repository
+        .save_permission_grant_revocation(&PermissionGrantRevocationWrite {
+            grant: revoked.clone(),
+            expected_revision: original_grant.revision,
+            audit: permission_audit.clone(),
+        })
+        .unwrap();
+
+    repository
+        .save_intervention(&graph.intervention, None)
+        .unwrap();
+    let mut delivered = graph.intervention.clone();
+    delivered.revision += 1;
+    delivered.state = InterventionState::AcceptedByChannel;
+    delivered.delivered_at = Some(now() + Duration::seconds(4));
+    delivered.updated_at = now() + Duration::seconds(4);
+    let mut delivery_audit = creation_audit(
+        actor(),
+        0x690,
+        AuditKind::InterventionDelivery,
+        delivered.id.as_uuid(),
+    );
+    delivery_audit.policy_trace = Some(graph.policy.policy_trace.clone());
+    repository
+        .save_intervention_transition(&InterventionTransitionWrite {
+            intervention: delivered.clone(),
+            expected_revision: graph.intervention.revision,
+            audit: delivery_audit.clone(),
+            delivery: None,
+        })
+        .unwrap();
+
+    assert_eq!(repository.load_grants(actor()).unwrap(), vec![revoked]);
+    assert_eq!(
+        repository.load_interventions(actor()).unwrap(),
+        vec![delivered]
+    );
+    let audit = repository
+        .load_audit(actor(), OffsetDateTime::UNIX_EPOCH, 100)
+        .unwrap();
+    assert!(audit.contains(&permission_audit));
+    assert!(audit.contains(&delivery_audit));
+}
+
+#[test]
+fn sqlite_permission_revocation_rolls_back_when_its_audit_conflicts() {
+    let directory = tempdir().unwrap();
+    let repository =
+        SqliteRepository::open(directory.path().join("permission-revocation-atomic.db")).unwrap();
+    let graph = synthetic_graph(actor(), 0x6a0);
+    install_graph_foundation(&repository, &graph);
+    let original = graph.bound_grants[0].clone();
+    let mut revoked = original.clone();
+    revoked.revision += 1;
+    revoked.state = GrantState::Revoked;
+    revoked.revoked_at = Some(now() + Duration::seconds(3));
+    revoked.revocation_reason = Some("synthetic_revocation".to_owned());
+    let mut audit = creation_audit(
+        actor(),
+        0x6f0,
+        AuditKind::PermissionRevoked,
+        revoked.id.as_uuid(),
+    );
+    audit.id = graph.route_audit.id;
+
+    let error = repository
+        .save_permission_grant_revocation(&PermissionGrantRevocationWrite {
+            grant: revoked,
+            expected_revision: original.revision,
+            audit,
+        })
+        .unwrap_err();
+
+    assert_eq!(error.kind, RepositoryErrorKind::Conflict);
+    assert_eq!(
+        repository
+            .load_grants(actor())
+            .unwrap()
+            .into_iter()
+            .find(|grant| grant.id == original.id),
+        Some(original)
+    );
+}
+
+#[test]
+fn sqlite_intervention_delivery_and_feedback_roll_back_on_audit_conflict() {
+    let directory = tempdir().unwrap();
+    let repository =
+        SqliteRepository::open(directory.path().join("intervention-transition-atomic.db")).unwrap();
+    let graph = synthetic_graph(actor(), 0x720);
+    install_graph(&repository, &graph, false, false);
+
+    let mut queued = graph.intervention.clone();
+    queued.revision += 1;
+    queued.state = InterventionState::Queued;
+    queued.updated_at = now() + Duration::seconds(3);
+    let mut delivery_audit = creation_audit(
+        actor(),
+        0x780,
+        AuditKind::InterventionDelivery,
+        queued.id.as_uuid(),
+    );
+    delivery_audit.id = graph.route_audit.id;
+    delivery_audit.policy_trace = Some(graph.policy.policy_trace.clone());
+    let error = repository
+        .save_intervention_transition(&InterventionTransitionWrite {
+            intervention: queued,
+            expected_revision: graph.intervention.revision,
+            audit: delivery_audit,
+            delivery: Some(PendingDeliveryTransition::Enqueue(graph.delivery.clone())),
+        })
+        .unwrap_err();
+    assert_eq!(error.kind, RepositoryErrorKind::Conflict);
+    assert_eq!(
+        repository.load_interventions(actor()).unwrap(),
+        vec![graph.intervention.clone()]
+    );
+    assert!(
+        repository
+            .load_pending_deliveries(actor())
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut accepted = graph.intervention.clone();
+    accepted.revision += 1;
+    accepted.outcome = InterventionOutcome::Accepted;
+    accepted.outcome_at = Some(now() + Duration::seconds(4));
+    accepted.updated_at = now() + Duration::seconds(4);
+    let mut outcome_audit = creation_audit(
+        actor(),
+        0x790,
+        AuditKind::InterventionOutcome,
+        accepted.id.as_uuid(),
+    );
+    outcome_audit.id = graph.route_audit.id;
+    outcome_audit.policy_trace = Some(graph.policy.policy_trace.clone());
+    let error = repository
+        .save_intervention_transition(&InterventionTransitionWrite {
+            intervention: accepted,
+            expected_revision: graph.intervention.revision,
+            audit: outcome_audit,
+            delivery: None,
+        })
+        .unwrap_err();
+    assert_eq!(error.kind, RepositoryErrorKind::Conflict);
+    assert_eq!(
+        repository.load_interventions(actor()).unwrap(),
+        vec![graph.intervention]
+    );
+}
+
+#[test]
 fn intervention_decision_commit_survives_restart_and_audit_is_privacy_bounded() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("atomic-decision.db");
@@ -821,6 +1154,23 @@ fn intervention_decision_commit_survives_restart_and_audit_is_privacy_bounded() 
 }
 
 #[test]
+fn standalone_policy_audit_without_a_complete_trace_is_rejected() {
+    let directory = tempdir().unwrap();
+    let repository =
+        SqliteRepository::open(directory.path().join("incomplete-policy-audit.db")).unwrap();
+    let audit = creation_audit(actor(), 0x51a, AuditKind::SignificanceDecision, uuid(0x51b));
+
+    let error = repository.append_audit(&audit).unwrap_err();
+    assert_eq!(error.kind, RepositoryErrorKind::Corrupt);
+    assert!(
+        repository
+            .load_audit(actor(), OffsetDateTime::UNIX_EPOCH, 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn conflicting_decision_audit_rolls_back_deliverable_intervention() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("decision-audit-conflict.db");
@@ -861,6 +1211,111 @@ fn conflicting_decision_audit_rolls_back_deliverable_intervention() {
             .count(),
         1
     );
+}
+
+#[test]
+fn mismatched_policy_trace_rolls_back_decision_audit_and_intervention() {
+    let directory = tempdir().unwrap();
+    let repository =
+        SqliteRepository::open(directory.path().join("decision-policy-trace-conflict.db")).unwrap();
+    let graph = synthetic_graph(actor(), 0x548);
+    install_graph_foundation(&repository, &graph);
+    let mut write = allow_decision_write(&graph);
+    write.audit.policy_trace = Some(policy_trace(0x55));
+
+    let error = run_repository_future(repository.commit_intervention_decision(&write)).unwrap_err();
+    assert_eq!(error.kind, RepositoryErrorKind::Corrupt);
+    assert!(
+        repository
+            .find_policy_decision(graph.policy.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(repository.load_interventions(actor()).unwrap().is_empty());
+    assert!(
+        repository
+            .load_audit(actor(), OffsetDateTime::UNIX_EPOCH, 100)
+            .unwrap()
+            .iter()
+            .all(|record| record.id != graph.decision_audit.id)
+    );
+}
+
+#[test]
+fn legacy_policy_and_audit_payloads_decode_without_becoming_authoritative() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("legacy-policy-trace.db");
+    let graph = synthetic_graph(actor(), 0x558);
+    {
+        let repository = SqliteRepository::open(&path).unwrap();
+        install_graph_foundation(&repository, &graph);
+        run_repository_future(
+            repository.commit_intervention_decision(&allow_decision_write(&graph)),
+        )
+        .unwrap();
+    }
+    {
+        let connection = Connection::open(&path).unwrap();
+        let policy_payload: String = connection
+            .query_row(
+                "SELECT payload FROM policy_records WHERE id=?1",
+                [graph.policy.id.as_uuid().as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut legacy_policy: JsonValue = serde_json::from_str(&policy_payload).unwrap();
+        legacy_policy
+            .as_object_mut()
+            .unwrap()
+            .remove("policy_trace");
+        connection
+            .execute(
+                "UPDATE policy_records SET payload=?1 WHERE id=?2",
+                params![
+                    serde_json::to_string(&legacy_policy).unwrap(),
+                    graph.policy.id.as_uuid().as_bytes().to_vec()
+                ],
+            )
+            .unwrap();
+
+        let audit_payload: String = connection
+            .query_row(
+                "SELECT payload FROM audit_records WHERE id=?1",
+                [graph.decision_audit.id.as_uuid().as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut legacy_audit: JsonValue = serde_json::from_str(&audit_payload).unwrap();
+        legacy_audit.as_object_mut().unwrap().remove("policy_trace");
+        connection
+            .execute(
+                "UPDATE audit_records SET payload=?1 WHERE id=?2",
+                params![
+                    serde_json::to_string(&legacy_audit).unwrap(),
+                    graph.decision_audit.id.as_uuid().as_bytes().to_vec()
+                ],
+            )
+            .unwrap();
+    }
+
+    let repository = SqliteRepository::open(&path).unwrap();
+    let legacy_decision = repository
+        .find_policy_decision(graph.policy.id)
+        .unwrap()
+        .unwrap();
+    assert!(!legacy_decision.policy_trace.is_complete());
+    assert!(
+        repository
+            .load_audit(actor(), OffsetDateTime::UNIX_EPOCH, 100)
+            .unwrap()
+            .iter()
+            .find(|record| record.id == graph.decision_audit.id)
+            .is_some_and(|record| record.policy_trace.is_none())
+    );
+    let mut replay_as_new = legacy_decision;
+    replay_as_new.id = PolicyDecisionId::from_uuid(uuid(0x559));
+    let error = repository.save_policy_decision(&replay_as_new).unwrap_err();
+    assert_eq!(error.kind, RepositoryErrorKind::Corrupt);
 }
 
 #[test]
@@ -1158,7 +1613,7 @@ fn v1_fixture_upgrades_once_and_preserves_linked_state() {
     downgrade_current_database_to_v1(&path);
 
     let repository = SqliteRepository::open(&path).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 5);
+    assert_eq!(repository.schema_version().unwrap(), 6);
     let snapshot = repository.load_owner_state(actor()).unwrap();
     assert_eq!(snapshot.focus_sessions, vec![graph.session.clone()]);
     assert_eq!(snapshot.grants, graph.bound_grants.clone());
@@ -1183,7 +1638,7 @@ fn v2_fixture_upgrades_without_mutating_aggregates() {
     downgrade_current_database_to_v2(&path);
 
     let repository = SqliteRepository::open(&path).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 5);
+    assert_eq!(repository.schema_version().unwrap(), 6);
     assert_eq!(repository.load_owner_state(actor()).unwrap(), expected);
     assert!(
         repository
@@ -1194,6 +1649,29 @@ fn v2_fixture_upgrades_without_mutating_aggregates() {
             )
             .unwrap()
             .is_none()
+    );
+}
+
+#[test]
+fn immediately_preceding_v5_adds_private_secret_cleanup_storage() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("upgrade-from-v5.db");
+    let graph = synthetic_graph(actor(), 0x6a0);
+    let expected = {
+        let repository = SqliteRepository::open(&path).unwrap();
+        install_graph(&repository, &graph, true, false);
+        repository.load_owner_state(actor()).unwrap()
+    };
+    downgrade_current_database_to_v5(&path);
+
+    let repository = SqliteRepository::open(&path).unwrap();
+    assert_eq!(repository.schema_version().unwrap(), 6);
+    assert_eq!(repository.load_owner_state(actor()).unwrap(), expected);
+    assert!(
+        repository
+            .load_secret_deletion_cleanups(actor())
+            .unwrap()
+            .is_empty()
     );
 }
 
@@ -1238,7 +1716,7 @@ fn immediately_preceding_v3_preferences_apply_defaults_and_canonicalize_once() {
     }
 
     let repository = SqliteRepository::open(&path).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 5);
+    assert_eq!(repository.schema_version().unwrap(), 6);
     assert_eq!(
         repository.load_preferences(actor()).unwrap(),
         Some(graph.preferences.clone())
@@ -1349,7 +1827,7 @@ fn rolled_back_partial_migration_retries_cleanly() {
     }
 
     let repository = SqliteRepository::open(&path).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 5);
+    assert_eq!(repository.schema_version().unwrap(), 6);
     repository.health().unwrap();
 }
 
@@ -1418,7 +1896,7 @@ fn migration_catalog_uses_full_checksums_and_mismatch_fails_closed() {
             .map(Result::unwrap)
             .collect()
     };
-    assert_eq!(migrations.len(), 10);
+    assert_eq!(migrations.len(), 11);
     for (_, _, checksum) in &migrations {
         assert_eq!(checksum.len(), "sha256:".len() + 64);
         assert!(checksum.starts_with("sha256:"));
@@ -1674,6 +2152,80 @@ fn selected_resource_removal_is_idempotent_and_retains_native_cleanup() {
             .load_native_resource_cleanups(actor())
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn revoked_route_and_secret_cleanup_are_atomic_and_survive_restart() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("secret-cleanup.db");
+    let graph = synthetic_graph(actor(), 0xdd0);
+    let revoked_at = now() + Duration::seconds(11);
+    let mut revoked = graph.route.clone();
+    let expected_revision = revoked.revision;
+    revoked.revision = revoked.revision.saturating_add(1);
+    revoked.revoked_at = Some(revoked_at);
+    let cleanup = SecretDeletionCleanup {
+        owner: actor(),
+        model_route_approval_id: revoked.id,
+        secret_ref: revoked.secret_ref.clone(),
+        created_at: revoked_at,
+    };
+    let audit = creation_audit(
+        actor(),
+        0xdf8,
+        AuditKind::ModelRouteRevoked,
+        revoked.id.as_uuid(),
+    );
+
+    {
+        let repository = SqliteRepository::open(&path).unwrap();
+        repository.save_model_route(&graph.route, None).unwrap();
+        repository
+            .save_revoked_model_route_with_cleanup(&revoked, expected_revision, &cleanup, &audit)
+            .unwrap();
+        assert_eq!(
+            repository.load_model_routes(actor()).unwrap(),
+            vec![revoked.clone()]
+        );
+        assert_eq!(
+            repository.load_secret_deletion_cleanups(actor()).unwrap(),
+            vec![cleanup.clone()]
+        );
+    }
+
+    let repository = SqliteRepository::open(&path).unwrap();
+    assert_eq!(
+        repository.load_model_routes(actor()).unwrap(),
+        vec![revoked]
+    );
+    assert_eq!(
+        repository.load_secret_deletion_cleanups(actor()).unwrap(),
+        vec![cleanup]
+    );
+    assert!(
+        repository
+            .load_audit(actor(), OffsetDateTime::UNIX_EPOCH, 100)
+            .unwrap()
+            .iter()
+            .any(|record| record.id == audit.id)
+    );
+    repository
+        .complete_secret_deletion_cleanup(actor(), graph.route.id)
+        .unwrap();
+    repository
+        .complete_secret_deletion_cleanup(actor(), graph.route.id)
+        .unwrap();
+    assert!(
+        repository
+            .load_secret_deletion_cleanups(actor())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        repository.load_model_routes(actor()).unwrap()[0]
+            .revoked_at
+            .is_some()
     );
 }
 

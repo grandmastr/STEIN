@@ -122,6 +122,14 @@ struct CurrentPackageIdentity {
     package_family_name: String,
 }
 
+pub(crate) fn current_desktop_aumid() -> Result<String, PrivateBrokerError> {
+    let identity = current_package_identity()?;
+    Ok(format!(
+        "{}!{}",
+        identity.package_family_name, DESKTOP_APPLICATION_ID
+    ))
+}
+
 fn current_package_identity() -> Result<CurrentPackageIdentity, PrivateBrokerError> {
     let token = current_process_token()?;
     if token_u32(token.0, TokenIsAppContainer)? != 0 {

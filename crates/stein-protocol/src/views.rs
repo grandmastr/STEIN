@@ -586,11 +586,23 @@ pub enum PolicyDecisionOutcome {
 pub struct PolicyDecisionView {
     pub policy_decision_id: PolicyDecisionId,
     pub policy_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_trace: Option<PolicyTraceView>,
     pub outcome: PolicyDecisionOutcome,
     pub reason_codes: Vec<InterventionReasonCode>,
     pub authority: Vec<AuthorityReference>,
     pub issued_at: UtcTimestamp,
     pub expires_at: UtcTimestamp,
+}
+
+/// Content-free provenance for one deterministic policy evaluation. Legacy
+/// decisions omit this additive field and are not delivery-authoritative.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PolicyTraceView {
+    pub policy_profile_id: String,
+    pub user_preferences_revision: u64,
+    pub proposed_input_schema_version: u16,
+    pub proposed_input_digest: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

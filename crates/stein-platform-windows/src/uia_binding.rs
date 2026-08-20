@@ -3,11 +3,15 @@ use std::fmt;
 use crate::WindowsApplicationBinding;
 
 const PREFIX: &str = "winuia:v1";
-const MAXIMUM_BINDING_BYTES: usize = 1_024;
+// CORE's selected-resource contract accepts at most 512 bytes. Keep the
+// adapter's canonical binding within that public boundary so a successful
+// native pick cannot later fail solely during registration.
+const MAXIMUM_BINDING_BYTES: usize = 512;
 
 /// Canonical, path- and content-free identity for one explicitly selected
-/// top-level Windows window. HWND/PID reuse is closed by the process creation
-/// timestamp and the independently stable application identity.
+/// top-level Windows window. The HWND is coupled to its owner process creation
+/// time and stable application identity so stale cross-process reuse fails
+/// closed during revalidation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WindowsUiaWindowBinding {
     window: usize,
@@ -43,20 +47,26 @@ impl WindowsUiaWindowBinding {
         Ok(value)
     }
 
-    #[cfg(test)]
     pub(crate) fn parse(value: &str) -> Result<Self, UiaWindowBindingError> {
         if value.is_empty() || value.len() > MAXIMUM_BINDING_BYTES {
             return Err(malformed());
         }
-        let parts: Vec<_> = value.split(':').collect();
-        let [
-            "winuia",
-            "v1",
-            window,
-            process_id,
-            created,
-            encoded_application,
-        ] = parts.as_slice()
+        let mut parts = value.splitn(6, ':');
+        let (
+            Some("winuia"),
+            Some("v1"),
+            Some(window),
+            Some(process_id),
+            Some(created),
+            Some(application),
+        ) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        )
         else {
             return Err(malformed());
         };
@@ -69,14 +79,12 @@ impl WindowsUiaWindowBinding {
         {
             return Err(malformed());
         }
-        let application =
-            String::from_utf8(decode_hex(encoded_application)?).map_err(|_| malformed())?;
         Self::new(
             usize::try_from(u64::from_str_radix(window, 16).map_err(|_| malformed())?)
                 .map_err(|_| malformed())?,
             u32::from_str_radix(process_id, 16).map_err(|_| malformed())?,
             u64::from_str_radix(created, 16).map_err(|_| malformed())?,
-            WindowsApplicationBinding::parse(&application).map_err(|_| malformed())?,
+            WindowsApplicationBinding::parse(application).map_err(|_| malformed())?,
         )
     }
 
@@ -102,46 +110,11 @@ impl fmt::Display for WindowsUiaWindowBinding {
         write!(
             formatter,
             "{PREFIX}:{:016x}:{:08x}:{:016x}:{}",
-            self.window,
-            self.process_id,
-            self.process_created_at_ticks,
-            encode_hex(self.application.to_string().as_bytes())
+            self.window, self.process_id, self.process_created_at_ticks, self.application
         )
     }
 }
 
-fn encode_hex(value: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(value.len() * 2);
-    for byte in value {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
-#[cfg(test)]
-fn decode_hex(value: &str) -> Result<Vec<u8>, UiaWindowBindingError> {
-    if value.is_empty() || !value.len().is_multiple_of(2) || !value.bytes().all(is_lower_hex) {
-        return Err(malformed());
-    }
-    value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| Ok((nibble(pair[0])? << 4) | nibble(pair[1])?))
-        .collect()
-}
-
-#[cfg(test)]
-fn nibble(value: u8) -> Result<u8, UiaWindowBindingError> {
-    match value {
-        b'0'..=b'9' => Ok(value - b'0'),
-        b'a'..=b'f' => Ok(value - b'a' + 10),
-        _ => Err(malformed()),
-    }
-}
-
-#[cfg(test)]
 fn is_lower_hex(value: u8) -> bool {
     value.is_ascii_digit() || (b'a'..=b'f').contains(&value)
 }
@@ -175,6 +148,23 @@ mod tests {
         assert!(!encoded.contains('/'));
         assert!(!encoded.contains("Notepad"));
         assert!(encoded.len() <= MAXIMUM_BINDING_BYTES);
+    }
+
+    #[test]
+    fn maximum_packaged_application_identity_stays_inside_core_resource_limit() {
+        let package_family = "p".repeat(63);
+        let application_id = format!("{package_family}!{}", "a".repeat(65));
+        let binding = WindowsUiaWindowBinding::new(
+            0x1234,
+            0x4567,
+            0x0102_0304_0506_0708,
+            WindowsApplicationBinding::packaged(package_family, application_id).unwrap(),
+        )
+        .unwrap();
+
+        let encoded = binding.to_string();
+        assert!(encoded.len() <= MAXIMUM_BINDING_BYTES);
+        assert_eq!(WindowsUiaWindowBinding::parse(&encoded).unwrap(), binding);
     }
 
     #[test]

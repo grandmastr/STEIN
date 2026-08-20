@@ -1,17 +1,32 @@
 //! Fail-closed native-messaging host primitives for the selected Edge surface.
 //!
-//! No CORE transport is implemented here yet. In particular, this crate has no
-//! raw named-pipe address or bearer credential. A future broker must supply a
-//! distinct OS-authenticated browser-producer connection before `read_message`
-//! is reachable in the production binary.
+//! The production transport is a distinct, one-way producer pipe. It can send
+//! only bounded native-messaging values and receive one typed capture plan; it
+//! has no CORE private-client protocol, bearer credential, or state-query API.
 
 use std::fmt;
 use std::io::{self, Read};
+#[cfg(windows)]
+use std::{os::windows::io::AsHandle, time::Duration};
 
+#[cfg(windows)]
+use stein_broker_windows::{ExpectedCoreServer, current_process_user_sid, verify_core_pipe_server};
 use stein_platform_windows::{
     BrowserObservationEnvelope, EDGE_BROWSER_MAXIMUM_NATIVE_MESSAGE_BYTES,
+    EDGE_BROWSER_PRODUCER_PIPE, EdgeBrowserCapturePlan, EdgeBrowserSelectionOffer,
+    EdgeBrowserSourceStatus,
 };
+#[cfg(windows)]
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::windows::named_pipe::{ClientOptions, NamedPipeClient},
+    time::sleep,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+#[cfg(test)]
 use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostErrorKind {
@@ -19,6 +34,7 @@ pub enum HostErrorKind {
     MalformedFrame,
     OversizeFrame,
     UnexpectedEnd,
+    WriteFailed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,9 +51,12 @@ impl fmt::Display for HostError {
     }
 }
 
-/// Non-forgeable in API shape: there is no public constructor, clone, byte
-/// accessor, or serializer. The missing broker will own construction later.
+/// Non-forgeable in API shape: there is no public constructor, clone, raw
+/// handle accessor, address override, or serializer.
 pub struct BrowserProducerConnection {
+    #[cfg(windows)]
+    pipe: Option<NamedPipeClient>,
+    #[cfg(not(windows))]
     _private: (),
 }
 
@@ -47,25 +66,150 @@ impl fmt::Debug for BrowserProducerConnection {
     }
 }
 
-/// Current production behavior. Launch evidence is intentionally insufficient
-/// to construct a browser-producer connection.
-pub fn connect_os_authenticated_core_ingress() -> Result<BrowserProducerConnection, HostError> {
-    Err(error(HostErrorKind::AdmissionUnavailable))
+/// Connects only to the fixed browser-producer endpoint and verifies the exact
+/// signed CORE image before a native-message byte is forwarded.
+#[cfg(windows)]
+pub async fn connect_os_authenticated_core_ingress(
+    core_executable_sha256: [u8; 32],
+) -> Result<BrowserProducerConnection, HostError> {
+    let owner_sid = current_process_user_sid().map_err(|_| admission_unavailable())?;
+    let expected = ExpectedCoreServer::new(owner_sid, core_executable_sha256)
+        .map_err(|_| admission_unavailable())?;
+    let started = tokio::time::Instant::now();
+    loop {
+        match ClientOptions::new().open(EDGE_BROWSER_PRODUCER_PIPE) {
+            Ok(pipe) => {
+                verify_core_pipe_server(pipe.as_handle(), &expected)
+                    .map_err(|_| admission_unavailable())?;
+                return Ok(BrowserProducerConnection { pipe: Some(pipe) });
+            }
+            Err(source)
+                if transient_connect_error(&source)
+                    && started.elapsed() < Duration::from_secs(3) =>
+            {
+                sleep(Duration::from_millis(75)).await;
+            }
+            Err(_) => return Err(admission_unavailable()),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub async fn connect_os_authenticated_core_ingress(
+    _core_executable_sha256: [u8; 32],
+) -> Result<BrowserProducerConnection, HostError> {
+    Err(admission_unavailable())
+}
+
+/// Runs the narrow native-messaging bridge. The only CORE-to-extension value
+/// is one validated capture plan; all subsequent traffic is producer-to-CORE.
+#[cfg(windows)]
+pub async fn run_producer_bridge(
+    connection: &mut BrowserProducerConnection,
+    reader: &mut impl Read,
+    writer: &mut impl io::Write,
+    expected_extension_id: &str,
+    expected_extension_version: &str,
+) -> Result<(), HostError> {
+    let pipe = connection.pipe.as_mut().ok_or_else(admission_unavailable)?;
+    let offer_payload = read_frame(reader)?;
+    let offer: EdgeBrowserSelectionOffer =
+        serde_json::from_slice(&offer_payload).map_err(|_| error(HostErrorKind::MalformedFrame))?;
+    offer
+        .into_initial_location_binding(expected_extension_id, expected_extension_version)
+        .map_err(|_| error(HostErrorKind::MalformedFrame))?;
+    write_pipe_frame(pipe, &offer_payload).await?;
+
+    let plan_payload = read_pipe_frame(pipe).await?;
+    let plan: EdgeBrowserCapturePlan =
+        serde_json::from_slice(&plan_payload).map_err(|_| error(HostErrorKind::MalformedFrame))?;
+    plan.validate_for_release(expected_extension_id, expected_extension_version)
+        .map_err(|_| error(HostErrorKind::MalformedFrame))?;
+    write_frame(writer, &plan_payload)?;
+
+    loop {
+        let Some(payload) = read_optional_frame(reader)? else {
+            return Ok(());
+        };
+        if !strict_producer_value(&payload) {
+            return Err(error(HostErrorKind::MalformedFrame));
+        }
+        write_pipe_frame(pipe, &payload).await?;
+    }
 }
 
 pub fn read_message(
     _connection: &BrowserProducerConnection,
     reader: &mut impl Read,
 ) -> Result<BrowserObservationEnvelope, HostError> {
+    let payload = read_frame(reader)?;
+    decode_payload(&payload)
+}
+
+fn read_frame(reader: &mut impl Read) -> Result<Zeroizing<Vec<u8>>, HostError> {
     let length = read_length(reader)?;
-    let mut payload = vec![0_u8; length];
+    let mut payload = Zeroizing::new(vec![0_u8; length]);
     if let Err(source) = reader.read_exact(&mut payload) {
-        payload.zeroize();
         return Err(map_read_error(source));
     }
-    let message = decode_payload(&payload);
-    payload.zeroize();
-    message
+    Ok(payload)
+}
+
+fn read_optional_frame(reader: &mut impl Read) -> Result<Option<Zeroizing<Vec<u8>>>, HostError> {
+    let mut prefix = [0_u8; 4];
+    match reader.read(&mut prefix[..1]) {
+        Ok(0) => return Ok(None),
+        Ok(1) => {}
+        Ok(_) => unreachable!("the requested read is one byte"),
+        Err(source) => return Err(map_read_error(source)),
+    }
+    reader
+        .read_exact(&mut prefix[1..])
+        .map_err(map_read_error)?;
+    let length = bounded_prefix(prefix)?;
+    let mut payload = Zeroizing::new(vec![0_u8; length]);
+    reader.read_exact(&mut payload).map_err(map_read_error)?;
+    Ok(Some(payload))
+}
+
+fn write_frame(writer: &mut impl io::Write, payload: &[u8]) -> Result<(), HostError> {
+    let length = bounded_length(payload)?;
+    writer
+        .write_all(&length.to_le_bytes())
+        .and_then(|()| writer.write_all(payload))
+        .and_then(|()| writer.flush())
+        .map_err(|_| error(HostErrorKind::WriteFailed))
+}
+
+#[cfg(windows)]
+async fn read_pipe_frame(pipe: &mut NamedPipeClient) -> Result<Zeroizing<Vec<u8>>, HostError> {
+    let mut prefix = [0_u8; 4];
+    pipe.read_exact(&mut prefix)
+        .await
+        .map_err(|_| admission_unavailable())?;
+    let length = bounded_prefix(prefix)?;
+    let mut payload = Zeroizing::new(vec![0_u8; length]);
+    pipe.read_exact(&mut payload)
+        .await
+        .map_err(|_| admission_unavailable())?;
+    Ok(payload)
+}
+
+#[cfg(windows)]
+async fn write_pipe_frame(pipe: &mut NamedPipeClient, payload: &[u8]) -> Result<(), HostError> {
+    let length = bounded_length(payload)?;
+    pipe.write_all(&length.to_le_bytes())
+        .await
+        .map_err(|_| admission_unavailable())?;
+    pipe.write_all(payload)
+        .await
+        .map_err(|_| admission_unavailable())?;
+    pipe.flush().await.map_err(|_| admission_unavailable())
+}
+
+fn strict_producer_value(payload: &[u8]) -> bool {
+    serde_json::from_slice::<BrowserObservationEnvelope>(payload).is_ok()
+        || serde_json::from_slice::<EdgeBrowserSourceStatus>(payload).is_ok()
 }
 
 fn decode_payload(payload: &[u8]) -> Result<BrowserObservationEnvelope, HostError> {
@@ -75,6 +219,10 @@ fn decode_payload(payload: &[u8]) -> Result<BrowserObservationEnvelope, HostErro
 fn read_length(reader: &mut impl Read) -> Result<usize, HostError> {
     let mut prefix = [0_u8; 4];
     reader.read_exact(&mut prefix).map_err(map_read_error)?;
+    bounded_prefix(prefix)
+}
+
+fn bounded_prefix(prefix: [u8; 4]) -> Result<usize, HostError> {
     let length = u32::from_le_bytes(prefix) as usize;
     if length == 0 {
         return Err(error(HostErrorKind::MalformedFrame));
@@ -83,6 +231,15 @@ fn read_length(reader: &mut impl Read) -> Result<usize, HostError> {
         return Err(error(HostErrorKind::OversizeFrame));
     }
     Ok(length)
+}
+
+fn bounded_length(payload: &[u8]) -> Result<u32, HostError> {
+    u32::try_from(payload.len())
+        .ok()
+        .filter(|length| {
+            *length > 0 && *length as usize <= EDGE_BROWSER_MAXIMUM_NATIVE_MESSAGE_BYTES
+        })
+        .ok_or_else(|| error(HostErrorKind::OversizeFrame))
 }
 
 fn map_read_error(source: io::Error) -> HostError {
@@ -98,6 +255,18 @@ const fn error(kind: HostErrorKind) -> HostError {
         kind,
         summary: "The Edge native-messaging host rejected the input.",
     }
+}
+
+const fn admission_unavailable() -> HostError {
+    error(HostErrorKind::AdmissionUnavailable)
+}
+
+#[cfg(windows)]
+fn transient_connect_error(source: &io::Error) -> bool {
+    matches!(
+        source.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+    ) || source.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
 }
 
 #[cfg(test)]
@@ -131,14 +300,19 @@ mod tests {
     }
 
     fn fixture_connection() -> BrowserProducerConnection {
-        BrowserProducerConnection { _private: () }
+        BrowserProducerConnection {
+            #[cfg(windows)]
+            pipe: None,
+            #[cfg(not(windows))]
+            _private: (),
+        }
     }
 
     #[test]
-    fn production_core_ingress_is_explicitly_unavailable() {
+    fn connection_debug_is_content_free() {
         assert_eq!(
-            connect_os_authenticated_core_ingress().unwrap_err().kind,
-            HostErrorKind::AdmissionUnavailable
+            format!("{:?}", fixture_connection()),
+            "BrowserProducerConnection([redacted])"
         );
     }
 
@@ -179,6 +353,48 @@ mod tests {
         let error = read_message(&fixture_connection(), &mut Cursor::new(unknown)).unwrap_err();
         assert_eq!(error.kind, HostErrorKind::MalformedFrame);
         assert!(!format!("{error:?}").contains("synthetic-secret"));
+    }
+
+    #[test]
+    fn producer_stream_accepts_only_clean_boundary_eof() {
+        assert!(
+            read_optional_frame(&mut Cursor::new(Vec::<u8>::new()))
+                .unwrap()
+                .is_none()
+        );
+
+        let partial_prefix = vec![1_u8, 0];
+        assert_eq!(
+            read_optional_frame(&mut Cursor::new(partial_prefix))
+                .unwrap_err()
+                .kind,
+            HostErrorKind::UnexpectedEnd
+        );
+
+        let mut partial_payload = 10_u32.to_le_bytes().to_vec();
+        partial_payload.extend_from_slice(b"{}");
+        assert_eq!(
+            read_optional_frame(&mut Cursor::new(partial_payload))
+                .unwrap_err()
+                .kind,
+            HostErrorKind::UnexpectedEnd
+        );
+    }
+
+    #[test]
+    fn producer_role_rejects_unknown_private_commands() {
+        let private_command = br#"{"kind":"query_owner_state","private_value":"synthetic-secret"}"#;
+        assert!(!strict_producer_value(private_command));
+
+        let status = br#"{
+            "protocol_version":1,
+            "kind":"source_status",
+            "authority_epoch":9,
+            "selection_id":"33333333333333333333333333333333",
+            "state":"paused",
+            "reason":"paused_background"
+        }"#;
+        assert!(strict_producer_value(status));
     }
 
     #[test]

@@ -6,6 +6,9 @@ import {
 } from "./policy.js";
 
 const SESSION_KEY = "active_selected_surface";
+const EXTENSION_VERSION = chrome.runtime.getManifest().version;
+const browserSessionId = randomHex(16);
+const profileBindingPromise = randomProfileBinding();
 
 let active = null;
 let generation = 0;
@@ -66,7 +69,17 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
 
 async function beginSelection(tab) {
   await clearSelection();
-  const offer = await buildSelectionOffer(tab, chrome.runtime.id, EXPECTED_EXTENSION_ID);
+  const offer = await buildSelectionOffer(
+    tab,
+    chrome.runtime.id,
+    EXPECTED_EXTENSION_ID,
+    EXTENSION_VERSION,
+    {
+      profile_binding_sha256: await profileBindingPromise,
+      browser_session_id: browserSessionId,
+      selection_id: randomHex(16),
+    },
+  );
   if (!offer) {
     return;
   }
@@ -103,7 +116,13 @@ async function receiveNativeMessage(candidate, message) {
     await clearSelection();
     return;
   }
-  const plan = validateCapturePlan(message, candidate.offer, chrome.runtime.id, EXPECTED_EXTENSION_ID);
+  const plan = validateCapturePlan(
+    message,
+    candidate.offer,
+    chrome.runtime.id,
+    EXPECTED_EXTENSION_ID,
+    EXTENSION_VERSION,
+  );
   candidate.offer = null;
   if (!plan) {
     await clearSelection();
@@ -165,7 +184,7 @@ async function collect(tab) {
     return;
   }
 
-  let visibleText = null;
+  let visibleDocument = null;
   if (snapshot.plan.scope === "visible_text") {
     try {
       const results = await chrome.scripting.executeScript({
@@ -173,7 +192,7 @@ async function collect(tab) {
         func: extractVisibleText,
         args: [snapshot.plan.maximum_payload_bytes],
       });
-      visibleText = results.length === 1 ? results[0].result : null;
+      visibleDocument = results.length === 1 ? results[0].result : null;
     } catch {
       sendContentFreeStatus("paused_protected");
       return;
@@ -184,11 +203,11 @@ async function collect(tab) {
     snapshot.plan,
     tab,
     focusedWindowId === snapshot.plan.window_id,
-    visibleText,
+    visibleDocument,
     sequence,
     now,
   );
-  visibleText = null;
+  visibleDocument = null;
   tab = null;
   if (!observation || active !== snapshot || snapshot.generation !== generation) {
     observation = null;
@@ -207,7 +226,7 @@ function extractVisibleText(maximumBytes) {
     !Number.isSafeInteger(maximumBytes) ||
     maximumBytes <= 0
   ) {
-    return "";
+    return null;
   }
   const blocked = [
     "input",
@@ -252,9 +271,13 @@ function extractVisibleText(maximumBytes) {
   }
   const value = parts.join(" ");
   parts.length = 0;
-  return value
-    .replace(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/gu, "[redacted-email]")
-    .replace(/\b(password|passwd|secret|api_key|apikey|authorization|token)\s*[:=]\s*\S+/giu, "$1=[redacted]");
+  return {
+    text: value
+      .replace(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/gu, "[redacted-email]")
+      .replace(/\b(password|passwd|secret|api_key|apikey|authorization|token)\s*[:=]\s*\S+/giu, "$1=[redacted]"),
+    origin: location.origin,
+    site: location.hostname,
+  };
 }
 
 function sendContentFreeStatus(reason) {
@@ -291,4 +314,21 @@ async function clearSelection() {
     previous.offer = null;
     previous.plan = null;
   }
+}
+
+function randomHex(bytes) {
+  if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > 32) {
+    return "";
+  }
+  const value = new Uint8Array(bytes);
+  crypto.getRandomValues(value);
+  return Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function randomProfileBinding() {
+  const nonce = new Uint8Array(32);
+  crypto.getRandomValues(nonce);
+  const digest = await crypto.subtle.digest("SHA-256", nonce);
+  nonce.fill(0);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }

@@ -32,7 +32,6 @@ export function FocusPanel({ disabled, goals, routes, grants, resources, session
   const [goalId, setGoalId] = useState("");
   const [routeId, setRouteId] = useState("");
   const [grantIds, setGrantIds] = useState<string[]>([]);
-  const [resourceIds, setResourceIds] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const commandIdentity = useRef<{ fingerprint: string; key: string } | null>(null);
@@ -40,6 +39,14 @@ export function FocusPanel({ disabled, goals, routes, grants, resources, session
   const eligibleGrants = useMemo(
     () => grants.filter((grant) => grant.state === "active" && (!goalId || grant.goalId === goalId)),
     [goalId, grants],
+  );
+  const derivedResourceIds = useMemo(
+    () => Array.from(new Set(
+      grantIds
+        .map((grantId) => grants.find((grant) => grant.id === grantId)?.selectedResourceId)
+        .filter((resourceId): resourceId is string => resourceId !== undefined),
+    )),
+    [grantIds, grants],
   );
 
   function toggle(value: string, values: string[], update: (next: string[]) => void) {
@@ -56,7 +63,7 @@ export function FocusPanel({ disabled, goals, routes, grants, resources, session
     const command = {
       goalId: selectedGoal.id,
       goalRevision: selectedGoal.revision,
-      selectedResourceIds: resourceIds,
+      selectedResourceIds: derivedResourceIds,
       permissionGrantIds: grantIds,
       modelRouteApprovalId: routeId,
     };
@@ -105,12 +112,21 @@ export function FocusPanel({ disabled, goals, routes, grants, resources, session
               <label key={grant.id}><input checked={grantIds.includes(grant.id)} disabled={disabled || submitting} type="checkbox" onChange={() => toggle(grant.id, grantIds, setGrantIds)} /> <span>{grant.scope}<small>{grant.selectedResourceId ?? "No resource"}</small></span></label>
             ))}
           </fieldset>
-          <fieldset className="selection-list">
-            <legend>Exact selected-resource set</legend>
-            {resources.length === 0 ? <p>No native-selected binding is available. Protocol 1.2 registration is exposed through the bridge; the desktop picker control remains to be designed.</p> : resources.map((resource) => (
-              <label key={resource.id}><input checked={resourceIds.includes(resource.id)} disabled={disabled || submitting} type="checkbox" onChange={() => toggle(resource.id, resourceIds, setResourceIds)} /> <span>{resource.displayName}<small>{resource.kind}</small></span></label>
-            ))}
-          </fieldset>
+          <div className="selection-list" aria-label="Derived selected-resource set">
+            <strong>Exact selected-resource set</strong>
+            {derivedResourceIds.length === 0 ? (
+              <p>The chosen grants do not reference a selected resource.</p>
+            ) : derivedResourceIds.map((resourceId) => {
+              const resource = resources.find((candidate) => candidate.id === resourceId);
+              return (
+                <p key={resourceId}>
+                  {resource?.displayName ?? "Selected resource"}
+                  <small>{resource ? resource.kind : resourceId}</small>
+                </p>
+              );
+            })}
+            <small>This read-only set is derived exactly from the chosen grants.</small>
+          </div>
           <div className="disclosure">
             <strong>What continues without this window</strong>
             <p>CORE owns the session. The selected grants decide whether observation continues after desktop disconnect and whether it recovers after daemon restart. Native status and emergency stop remain the independent control path. Mute stops proactive delivery, not observation.</p>

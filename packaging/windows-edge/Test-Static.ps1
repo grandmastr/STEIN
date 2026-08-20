@@ -40,34 +40,89 @@ foreach ($Mutation in @('Set-ItemProperty', 'New-ItemProperty', 'Remove-ItemProp
     }
 }
 
+$InstallScriptPath = Join-Path $ScriptRoot 'Install-EdgeArtifacts.ps1'
+$UninstallScriptPath = Join-Path $ScriptRoot 'Uninstall-EdgeArtifacts.ps1'
+foreach ($ScriptPath in @($InstallScriptPath, $UninstallScriptPath)) {
+    $Tokens = $null
+    $ParseErrors = $null
+    $null = [Management.Automation.Language.Parser]::ParseFile(
+        $ScriptPath,
+        [ref]$Tokens,
+        [ref]$ParseErrors)
+    if (@($ParseErrors).Count -ne 0) {
+        throw 'An Edge lifecycle script does not parse.'
+    }
+}
+$InstallScriptText = Get-Content -LiteralPath $InstallScriptPath -Raw
+$UninstallScriptText = Get-Content -LiteralPath $UninstallScriptPath -Raw
+foreach ($Required in @(
+    'Get-AppxPackage',
+    'Get-AppxPackageManifest',
+    'BrowserObservationProducer',
+    'Get-AuthenticodeSignature',
+    'runtime_package_identity_admission',
+    'not_run_requires_direct_edge_launch_fixture',
+    'HKCU:\SOFTWARE\Microsoft\Edge\NativeMessagingHosts'
+)) {
+    if ($InstallScriptText.IndexOf($Required, [StringComparison]::Ordinal) -lt 0) {
+        throw 'The Edge installer is missing an exact installed-identity or runtime-residual check.'
+    }
+}
+foreach ($Required in @(
+    "DeleteValue('', `$false)",
+    'ReparsePoint',
+    'Remove-Item -LiteralPath $OwnedRoot -Recurse -Force'
+)) {
+    if ($UninstallScriptText.IndexOf($Required, [StringComparison]::Ordinal) -lt 0) {
+        throw 'The Edge uninstaller is missing an exact-value or owned-boundary invariant.'
+    }
+}
+foreach ($Forbidden in @('Add-AppxPackage', 'Start-Process', 'Remove-AppxPackage')) {
+    if ($InstallScriptText.Contains($Forbidden) -or $UninstallScriptText.Contains($Forbidden)) {
+        throw "The Edge lifecycle scripts unexpectedly manage package/launch state through $Forbidden."
+    }
+}
+
 $TemporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("stein-edge-static-" + [Guid]::NewGuid().ToString('N'))
 try {
     $ExtensionId = 'abcdefghijklmnopabcdefghijklmnop'
-    $HostPath = Join-Path $env:LOCALAPPDATA 'STEIN\browser-host\current\stein-edge-native-host.exe'
+    $HostPath = Join-Path $TemporaryRoot 'installed-package\bin\stein-edge-native-host.exe'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $HostPath) -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $env:WINDIR 'System32\where.exe') -Destination $HostPath
+    $HostSha256 = (Get-FileHash -LiteralPath $HostPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $PackageFamilyName = 'STEIN.PersonalIntelligence_qrfd6g9swygw6'
+    $ArtifactRoot = Join-Path $TemporaryRoot 'artifacts'
     & (Join-Path $ScriptRoot 'Build-EdgeArtifacts.ps1') `
         -ExtensionId $ExtensionId `
         -PublishedExtensionVersion $Manifest.version `
         -EdgePublisherSha256 ('1' * 64 -join '') `
         -HostPublisherSha256 ('2' * 64 -join '') `
+        -PackageFamilyName $PackageFamilyName `
+        -PackageVersion '0.1.0.0' `
+        -HostSha256 $HostSha256 `
         -InstalledHostPath $HostPath `
-        -OutputDirectory $TemporaryRoot | Out-Null
+        -OutputDirectory $ArtifactRoot | Out-Null
 
-    $HostManifest = Get-Content -LiteralPath (Join-Path $TemporaryRoot 'native-host\com.stein.personal_intelligence.browser.json') -Raw | ConvertFrom-Json
+    $HostManifest = Get-Content -LiteralPath (Join-Path $ArtifactRoot 'native-host\com.stein.personal_intelligence.browser.json') -Raw | ConvertFrom-Json
     if ($HostManifest.allowed_origins.Count -ne 1 -or $HostManifest.allowed_origins[0] -ne "chrome-extension://$ExtensionId/") {
         throw 'The generated host manifest origin is not exact.'
     }
     if ([IO.Path]::GetFullPath($HostManifest.path) -ne [IO.Path]::GetFullPath($HostPath)) {
         throw 'The generated native-host path is not the selected stable path.'
     }
-    $ReleaseConfig = Get-Content -LiteralPath (Join-Path $TemporaryRoot 'extension\extension-config.js') -Raw
+    $ReleaseConfig = Get-Content -LiteralPath (Join-Path $ArtifactRoot 'extension\extension-config.js') -Raw
     if (!$ReleaseConfig.Contains($ExtensionId) -or $ReleaseConfig.Contains('__STEIN_EDGE_EXTENSION_ID__')) {
         throw 'The generated extension does not pin the exact release identity.'
     }
-    $Identity = Get-Content -LiteralPath (Join-Path $TemporaryRoot 'release-identity.json') -Raw | ConvertFrom-Json
+    $Identity = Get-Content -LiteralPath (Join-Path $ArtifactRoot 'release-identity.json') -Raw | ConvertFrom-Json
     if ($Identity.provenance_state -ne 'blocked_pending_edge_addons_publication_and_native_launch_fixture') {
         throw 'Static packaging must not claim live release provenance.'
     }
-    $ContentManifest = Get-Content -LiteralPath (Join-Path $TemporaryRoot 'extension-content-manifest.json') -Raw | ConvertFrom-Json
+    if ($Identity.browser_producer_aumid -cne "$PackageFamilyName!BrowserObservationProducer" -or
+        $Identity.native_host_sha256 -cne $HostSha256) {
+        throw 'Static packaging did not bind the exact package host identity.'
+    }
+    $ContentManifest = Get-Content -LiteralPath (Join-Path $ArtifactRoot 'extension-content-manifest.json') -Raw | ConvertFrom-Json
     if ((@($ContentManifest.path) | Sort-Object) -join ',' -ne 'extension-config.js,manifest.json,policy.js,service-worker.js') {
         throw 'The extension content manifest is not exact.'
     }

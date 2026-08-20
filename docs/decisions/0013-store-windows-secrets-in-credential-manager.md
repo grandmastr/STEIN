@@ -62,7 +62,7 @@ health.
 The adapter uses `CredWriteW`, `CredReadW`, and `CredDeleteW` with
 `CRED_TYPE_GENERIC` and per-user `CRED_PERSIST_LOCAL_MACHINE` persistence. Target
 names are deterministic, non-secret identifiers under a STEIN namespace such as
-`STEIN/<owner-sid-hash>/<secret-kind>/<profile-id>`. They do not contain the
+`STEIN/<owner-sid-hash>/<secret-kind>/<model-route-approval-id>`. They do not contain the
 credential, provider account name, goal text, resource path, or other personal
 content.
 
@@ -74,6 +74,14 @@ Route and approval records hold only an opaque `SecretRef`. The secret store
 resolves that reference only inside the daemon's model-adapter boundary for the
 duration of one authorized request. Protocol clients can query whether a required
 secret is configured and healthy, but cannot read the value.
+
+For every newly created model-route approval, `SecretRef` is the canonical UUID
+of that approval—not the provider's reusable route/model name. CORE rejects a
+new approval whose reference is not scoped this way. The native setup transaction
+therefore writes the collected credential under the approval ID returned by
+CORE. Each approval owns one credential target, so revoking or compensating one
+approval cannot delete or replace a credential used by a sibling approval for
+the same provider route.
 
 ### Entry and handling
 
@@ -89,12 +97,40 @@ into long-lived configuration. Errors contain only the secret reference, native
 error category, correlation identifier, and retryability; they never include a
 credential prefix, suffix, hash, or byte count that is unnecessary for recovery.
 
-Writing an existing reference is an explicit atomic replacement. Deleting a
-secret makes later reads fail immediately, cancels in-flight model work when the
-associated route is revoked, and sets route capability health to unavailable.
+Desktop route setup is one native Tauri transaction, not separate renderer
+secret-write and approval calls. Rust validates and builds the closed approval
+request before opening the native prompt--including the exact
+`openai-responses-default-2026-08` profile, required `goal` category, and no
+data-residency claim--retains the collected credential only
+in zeroizing native memory, submits the approval through the capability-bound
+private client, and writes Credential Manager only after approval succeeds.
+The provider route ID remains prompt/display metadata; the credential target is
+the canonical approval UUID returned by CORE.
+Prompt cancellation or approval failure therefore never creates a new target or
+changes an existing target. If the final atomic credential write fails, the
+desktop best-effort revokes the approval it just received, deleting only that
+approval-scoped target while leaving prior approval targets untouched, and returns one
+content-free setup error; a retry uses a new approval idempotency key after that
+rollback boundary. No standalone renderer-callable credential mutation exists.
+
+Writing an existing approval-scoped reference is an explicit atomic rotation for
+that approval. Deleting a secret makes later reads fail immediately, cancels
+in-flight model work when the associated route is revoked, and sets route
+capability health to unavailable.
 Deleting the secret does not silently delete the route approval or audit record;
 those owners report the missing dependency and are changed through their own
 commands.
+
+Route revocation, its minimal audit fact, and a private credential-deletion
+obligation are committed atomically before the fallible Credential Manager call.
+The obligation contains only owner, route identifier, the bounded opaque
+`SecretRef`, and creation time--never secret bytes or provider content. A failed
+delete therefore cannot restore route authority or lose cleanup work. Startup
+and the bounded maintenance sweep retry at most three obligations per owner per
+pass; `delete` reporting an already-missing target is successful idempotent
+cleanup. Individual native failures remain pending and surface only as
+content-free counts. Repository corruption or an obligation not fenced by its
+revoked route fails maintenance closed.
 
 ### Threat boundary
 
@@ -123,9 +159,12 @@ semantics before their model adapters are called supported.
 - A locked, damaged, denied, or unavailable credential store degrades model
   capability truthfully; CORE does not fall back to an environment variable,
   file, another provider, or embedded key.
-- Credential rotation is a write to the same opaque reference followed by a
-  health check; route approval is re-reviewed if provider/account/handling
+- Credential rotation is a write to the same approval-scoped reference followed
+  by a health check; route approval is re-reviewed if provider/account/handling
   meaning changes.
+- Failed route-credential deletion survives daemon restart in the private SQLite
+  cleanup table while the revoked route remains unusable. Successful retry
+  removes only the obligation, not the revocation or its audit history.
 
 ## Validation
 
@@ -141,6 +180,14 @@ semantics before their model adapters are called supported.
   secret or derived fingerprint.
 - Revoking the route and deleting its secret cancels in-flight work and prevents
   new requests without changing historical audit facts.
+- Two approvals for the same provider route receive distinct approval-scoped
+  targets; revoking one leaves the other's credential byte-for-byte unchanged.
+  Re-revoking an already revoked approval changes no revision/audit/cleanup and
+  makes no additional native delete attempt.
+- A forced delete failure proves the route, revocation audit, and cleanup
+  obligation commit together; restart and periodic maintenance retry deletion
+  without reissuing authority, and an already-absent credential completes the
+  obligation idempotently.
 - Normal uninstall preserves the credential; explicit remove-data deletes only
   the validated STEIN namespace for the current user and reports each outcome.
 - Fake secret-store adapters never fabricate a value or healthy status.

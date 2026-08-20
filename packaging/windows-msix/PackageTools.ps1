@@ -3,10 +3,14 @@ Set-StrictMode -Version Latest
 $script:FoundationNamespace = "http://schemas.microsoft.com/appx/manifest/foundation/windows10"
 $script:UapNamespace = "http://schemas.microsoft.com/appx/manifest/uap/windows10"
 $script:Uap10Namespace = "http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+$script:ComNamespace = "http://schemas.microsoft.com/appx/manifest/com/windows10"
+$script:DesktopNamespace = "http://schemas.microsoft.com/appx/manifest/desktop/windows10"
 $script:RestrictedCapabilityNamespace = "http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
 $script:ProductionPackageName = "STEIN.PersonalIntelligence"
 $script:DesktopApplicationId = "Desktop"
 $script:BrokerApplicationId = "PrivateBroker"
+$script:BrowserProducerApplicationId = "BrowserObservationProducer"
+$script:ToastActivatorClsid = "3DB3B5B0-1BA5-49D1-A8F0-CF2B3EA6D781"
 
 function ConvertTo-SteinCertificateThumbprint {
     param([Parameter(Mandatory = $true)][string] $Thumbprint)
@@ -25,24 +29,93 @@ function Resolve-WindowsSdkTool {
         [string] $Name
     )
 
-    $command = Get-Command $Name -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -ne $command) {
-        return $command.Source
-    }
-
-    $kitsRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"
-    if (-not (Test-Path -LiteralPath $kitsRoot -PathType Container)) {
+    $installedRoots = Get-ItemProperty `
+        -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" `
+        -ErrorAction Stop
+    $kitsRootValue = [string]$installedRoots.KitsRoot10
+    if ([string]::IsNullOrWhiteSpace($kitsRootValue)) {
         throw "Windows SDK tool directory is unavailable."
     }
-    $candidate = Get-ChildItem -LiteralPath $kitsRoot -Directory |
-        Sort-Object Name -Descending |
-        ForEach-Object { Join-Path $_.FullName "x64\$Name" } |
-        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
-        Select-Object -First 1
-    if ([string]::IsNullOrWhiteSpace($candidate)) {
+    $kitsRoot = [IO.Path]::GetFullPath($kitsRootValue).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar)
+    $binRoot = [IO.Path]::GetFullPath((Join-Path $kitsRoot "bin")).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar)
+    $kitsPrefix = "$kitsRoot$([IO.Path]::DirectorySeparatorChar)"
+    if (-not $binRoot.StartsWith($kitsPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Windows SDK tool directory is unavailable."
+    }
+
+    $volumeRoot = [IO.Path]::GetPathRoot($kitsRoot)
+    $probe = $binRoot
+    while ($probe.Length -ge $volumeRoot.Length) {
+        $directory = Get-Item -LiteralPath $probe -Force -ErrorAction Stop
+        if (-not $directory.PSIsContainer -or
+            (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            throw "Windows SDK tool directory is unavailable."
+        }
+        if ([string]::Equals($probe, $volumeRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $parent = Split-Path -Parent $probe
+        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -ceq $probe) {
+            throw "Windows SDK tool directory is unavailable."
+        }
+        $probe = $parent
+    }
+
+    $candidates = New-Object Collections.Generic.List[object]
+    foreach ($versionDirectory in @(
+            Get-ChildItem -LiteralPath $binRoot -Directory -Force -ErrorAction Stop)) {
+        $sdkVersion = $null
+        if ($versionDirectory.Name -notmatch "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$" -or
+            -not [version]::TryParse($versionDirectory.Name, [ref]$sdkVersion)) {
+            continue
+        }
+        if (($versionDirectory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Windows SDK tool directory is unavailable."
+        }
+        $architectureRoot = [IO.Path]::GetFullPath(
+            (Join-Path $versionDirectory.FullName "x64"))
+        $architectureItem = Get-Item `
+            -LiteralPath $architectureRoot `
+            -Force `
+            -ErrorAction SilentlyContinue
+        if ($null -eq $architectureItem) {
+            continue
+        }
+        if (-not $architectureItem.PSIsContainer -or
+            (($architectureItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            throw "Windows SDK tool directory is unavailable."
+        }
+        $candidatePath = [IO.Path]::GetFullPath((Join-Path $architectureRoot $Name))
+        $binPrefix = "$binRoot$([IO.Path]::DirectorySeparatorChar)"
+        if (-not $candidatePath.StartsWith($binPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Windows SDK tool directory is unavailable."
+        }
+        $candidateItem = Get-Item `
+            -LiteralPath $candidatePath `
+            -Force `
+            -ErrorAction SilentlyContinue
+        if ($null -eq $candidateItem) {
+            continue
+        }
+        if ($candidateItem.PSIsContainer -or
+            (($candidateItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            $candidateItem.Length -le 0) {
+            throw "Required Windows SDK tool is unavailable."
+        }
+        $candidates.Add([pscustomobject]@{
+            version = $sdkVersion
+            path = $candidateItem.FullName
+        })
+    }
+    $candidate = @($candidates | Sort-Object version -Descending | Select-Object -First 1)
+    if ($candidate.Count -ne 1) {
         throw "Required Windows SDK tool is unavailable."
     }
-    return $candidate
+    return [string]$candidate[0].path
 }
 
 function Get-ExactSigningCertificate {
@@ -100,7 +173,7 @@ function Assert-SteinExactAuthenticodeSignature {
 
     $normalized = ConvertTo-SteinCertificateThumbprint -Thumbprint $CertificateThumbprint
     $signTool = Resolve-WindowsSdkTool -Name "signtool.exe"
-    & $signTool verify /pa /all /v $resolved | Out-Host
+    & $signTool verify /pa /all /v $resolved *> $null
     Assert-NativeCommandSucceeded -Operation "Authenticode trust verification"
 
     $signature = Get-AuthenticodeSignature -LiteralPath $resolved
@@ -156,6 +229,57 @@ function Test-SteinCoreBindingContract {
         throw "The signed package CORE binding does not match the broker-pinned executable."
     }
     return [string]$binding.core_executable_sha256
+}
+
+function Get-SteinFixedApplicationPayloadRelativePaths {
+    return @(
+        "AppxManifest.xml",
+        "Assets\Square150x150Logo.png",
+        "Assets\Square44x44Logo.png",
+        "Assets\StoreLogo.png",
+        "Metadata\CoreBinding.json",
+        "bin\stein-desktop.exe",
+        "bin\stein-edge-native-host.exe",
+        "bin\stein-private-broker.exe"
+    )
+}
+
+function Assert-SteinClosedUnpackedPackageLayout {
+    param([Parameter(Mandatory = $true)][string] $PackageRoot)
+
+    $root = [IO.Path]::GetFullPath($PackageRoot).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar)
+    $rootItem = Get-Item -LiteralPath $root -Force -ErrorAction Stop
+    if (-not $rootItem.PSIsContainer -or
+        (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "The unpacked package root is not a regular directory."
+    }
+    $required = @(Get-SteinFixedApplicationPayloadRelativePaths) + @("AppxBlockMap.xml")
+    $required = @($required | Sort-Object)
+    $optional = @(
+        "[Content_Types].xml",
+        "AppxMetadata\CodeIntegrity.cat",
+        "AppxSignature.p7x"
+    )
+    $items = @(Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction Stop)
+    foreach ($item in $items) {
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "The unpacked package contains a reparse point."
+        }
+    }
+    $actual = @(
+        $items |
+            Where-Object { -not $_.PSIsContainer } |
+            ForEach-Object { $_.FullName.Substring($root.Length + 1) } |
+            Sort-Object
+    )
+    $unexpected = @($actual | Where-Object { $_ -cnotin $required -and $_ -cnotin $optional })
+    $missing = @($required | Where-Object { $_ -cnotin $actual })
+    if ($unexpected.Count -ne 0 -or $missing.Count -ne 0) {
+        throw "The MSIX does not contain the exact closed production file layout."
+    }
+    return $actual
 }
 
 function Initialize-PackageIdentityNativeApi {
@@ -234,10 +358,12 @@ function Test-SteinManifestContract {
     $namespaces.AddNamespace("f", $script:FoundationNamespace)
     $namespaces.AddNamespace("uap", $script:UapNamespace)
     $namespaces.AddNamespace("uap10", $script:Uap10Namespace)
+    $namespaces.AddNamespace("com", $script:ComNamespace)
+    $namespaces.AddNamespace("desktop", $script:DesktopNamespace)
     $namespaces.AddNamespace("rescap", $script:RestrictedCapabilityNamespace)
 
     $package = $manifest.SelectSingleNode("/f:Package", $namespaces)
-    if ($null -eq $package -or $package.IgnorableNamespaces -cne "uap uap10 rescap") {
+    if ($null -eq $package -or $package.IgnorableNamespaces -cne "uap uap10 com desktop rescap") {
         throw "Manifest namespaces are not the pinned production set."
     }
     $identity = $manifest.SelectSingleNode("/f:Package/f:Identity", $namespaces)
@@ -265,8 +391,8 @@ function Test-SteinManifestContract {
     }
 
     $applications = @($manifest.SelectNodes("/f:Package/f:Applications/f:Application", $namespaces))
-    if ($applications.Count -ne 2) {
-        throw "Manifest must contain exactly the desktop and private broker applications."
+    if ($applications.Count -ne 3) {
+        throw "Manifest must contain exactly the desktop, private broker, and browser producer applications."
     }
     $expectedApplications = @{
         Desktop = @{
@@ -279,6 +405,12 @@ function Test-SteinManifestContract {
             Executable = "bin\stein-private-broker.exe"
             RuntimeBehavior = "packagedClassicApp"
             TrustLevel = "appContainer"
+            AppListEntry = "none"
+        }
+        BrowserObservationProducer = @{
+            Executable = "bin\stein-edge-native-host.exe"
+            RuntimeBehavior = "packagedClassicApp"
+            TrustLevel = "mediumIL"
             AppListEntry = "none"
         }
     }
@@ -295,6 +427,46 @@ function Test-SteinManifestContract {
             $null -eq $visual -or
             $visual.AppListEntry -cne $expected.AppListEntry) {
             throw "Manifest application execution identity is not the pinned profile."
+        }
+        $extensions = @($application.SelectNodes("f:Extensions/*", $namespaces))
+        if ($application.Id -ceq $script:DesktopApplicationId) {
+            if ($extensions.Count -ne 2) {
+                throw "The desktop must declare exactly the toast COM server and activation extension."
+            }
+            $comExtension = $application.SelectSingleNode(
+                "f:Extensions/com:Extension[@Category='windows.comServer']",
+                $namespaces)
+            $desktopExtension = $application.SelectSingleNode(
+                "f:Extensions/desktop:Extension[@Category='windows.toastNotificationActivation']",
+                $namespaces)
+            $exeServer = if ($null -ne $comExtension) {
+                $comExtension.SelectSingleNode("com:ComServer/com:ExeServer", $namespaces)
+            }
+            $comClass = if ($null -ne $exeServer) {
+                $exeServer.SelectSingleNode("com:Class", $namespaces)
+            }
+            $toastActivation = if ($null -ne $desktopExtension) {
+                $desktopExtension.SelectSingleNode(
+                    "desktop:ToastNotificationActivation",
+                    $namespaces)
+            }
+            if ($null -eq $comExtension -or
+                $null -eq $desktopExtension -or
+                $null -eq $exeServer -or
+                $null -eq $comClass -or
+                $null -eq $toastActivation -or
+                $exeServer.Executable -cne "bin\stein-desktop.exe" -or
+                $exeServer.Arguments -cne "-ToastActivated" -or
+                $exeServer.DisplayName -cne "STEIN toast activator" -or
+                @($exeServer.SelectNodes("com:Class", $namespaces)).Count -ne 1 -or
+                $comClass.Id -cne $script:ToastActivatorClsid -or
+                $comClass.DisplayName -cne "STEIN toast activator" -or
+                $toastActivation.ToastActivatorCLSID -cne $script:ToastActivatorClsid) {
+                throw "Manifest toast activation identity is not the pinned profile."
+            }
+        }
+        elseif ($extensions.Count -ne 0) {
+            throw "Non-desktop package applications must not declare activation extensions."
         }
     }
 
@@ -313,6 +485,7 @@ function Test-SteinManifestContract {
         $requiredFiles = @(
             "bin\stein-desktop.exe",
             "bin\stein-private-broker.exe",
+            "bin\stein-edge-native-host.exe",
             "Metadata\CoreBinding.json",
             "Assets\StoreLogo.png",
             "Assets\Square44x44Logo.png",
@@ -335,5 +508,6 @@ function Test-SteinManifestContract {
         Version = $identity.Version
         DesktopApplicationId = $script:DesktopApplicationId
         BrokerApplicationId = $script:BrokerApplicationId
+        BrowserProducerApplicationId = $script:BrowserProducerApplicationId
     }
 }

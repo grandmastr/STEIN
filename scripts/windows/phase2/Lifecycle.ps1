@@ -211,6 +211,7 @@ function Install-SteinPhase2Fresh {
             package_family_name = $bundle.PackageFamilyName
             desktop_aumid = $bundle.DesktopAumid
             broker_aumid = $bundle.BrokerAumid
+            browser_producer_aumid = $bundle.BrowserProducerAumid
             version = $bundle.Version
             task_name = Get-SteinPhase2TaskName
             core = $runtime
@@ -655,6 +656,7 @@ function Upgrade-SteinPhase2 {
             package_family_name = $bundle.PackageFamilyName
             desktop_aumid = $bundle.DesktopAumid
             broker_aumid = $bundle.BrokerAumid
+            browser_producer_aumid = $bundle.BrowserProducerAumid
             version = $bundle.Version
             task_name = Get-SteinPhase2TaskName
             core = $runtime

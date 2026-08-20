@@ -10,6 +10,7 @@ import type {
   GoalRevisionInput,
   GrantPermissionInput,
   InterventionFeedbackInput,
+  InterventionExplanationView,
   InterventionHistoryInput,
   PublicErrorView,
   RegisterSelectedResourceInput,
@@ -17,7 +18,6 @@ import type {
   RevokePermissionInput,
   SetMutedInput,
   StartFocusSessionInput,
-  StoreModelSecretInput,
   UpdateGoalInput,
   UpdateUserPreferencesInput,
 } from "../protocol";
@@ -28,6 +28,7 @@ const EVENT_LIMIT = 30;
 
 interface DashboardState {
   snapshot: DashboardSnapshot | null;
+  latestToastActivation: InterventionExplanationView | null;
   error: PublicErrorView | null;
   loading: boolean;
   refreshing: boolean;
@@ -36,6 +37,15 @@ interface DashboardState {
 
 function throwablePublicError(publicError: PublicErrorView): Error & PublicErrorView {
   return Object.assign(new Error(publicError.summary), publicError);
+}
+
+function hasPrivateConnectedSnapshot(snapshot: DashboardSnapshot | null): snapshot is DashboardSnapshot {
+  return Boolean(
+    snapshot &&
+    snapshot.connection.phase === "connected" &&
+    snapshot.access.assurance === "private_capability_bound" &&
+    snapshot.access.privateProtocolAvailable,
+  );
 }
 
 function applyBridgeEvent(
@@ -72,9 +82,13 @@ function applyBridgeEventToState(
   current: DashboardState,
   event: DesktopBridgeEvent,
 ): DashboardState {
+  const snapshot = applyBridgeEvent(current.snapshot, event);
   return {
     ...current,
-    snapshot: applyBridgeEvent(current.snapshot, event),
+    snapshot,
+    latestToastActivation: hasPrivateConnectedSnapshot(snapshot)
+      ? current.latestToastActivation
+      : null,
     error:
       event.type === "connectionChanged" && event.connection.error
         ? event.connection.error
@@ -85,6 +99,7 @@ function applyBridgeEventToState(
 export function useCoreDashboard(client: CoreRendererClient = core) {
   const [state, setState] = useState<DashboardState>({
     snapshot: null,
+    latestToastActivation: null,
     error: null,
     loading: true,
     refreshing: false,
@@ -96,30 +111,54 @@ export function useCoreDashboard(client: CoreRendererClient = core) {
     setState((current) => applyBridgeEventToState(current, event));
   }, []);
 
+  const handleToastActivation = useCallback((activation: InterventionExplanationView) => {
+    setState((current) => hasPrivateConnectedSnapshot(current.snapshot)
+      ? { ...current, latestToastActivation: activation }
+      : { ...current, latestToastActivation: null });
+  }, []);
+
   useEffect(() => {
     mounted.current = true;
-    let unlisten: (() => void) | undefined;
+    let bridgeUnlisten: (() => void) | undefined;
+    let toastUnlisten: (() => void) | undefined;
+    let cancelled = false;
     let bootstrapSettled = false;
     const pendingEvents: DesktopBridgeEvent[] = [];
+    let pendingActivation: InterventionExplanationView | null = null;
 
     const receiveDuringBootstrap = (event: DesktopBridgeEvent) => {
       if (bootstrapSettled) handleBridgeEvent(event);
       else pendingEvents.push(event);
     };
 
+    const receiveToastDuringBootstrap = (activation: InterventionExplanationView) => {
+      if (bootstrapSettled) handleToastActivation(activation);
+      else pendingActivation = activation;
+    };
+
     void (async () => {
       try {
-        const stopListening = await client.subscribe(receiveDuringBootstrap);
-        if (!mounted.current) {
-          stopListening();
+        const stopToastListening = await client.subscribeToastActivation(receiveToastDuringBootstrap);
+        if (cancelled) {
+          stopToastListening();
           return;
         }
-        unlisten = stopListening;
+        toastUnlisten = stopToastListening;
+
+        const stopBridgeListening = await client.subscribe(receiveDuringBootstrap);
+        if (cancelled) {
+          stopBridgeListening();
+          toastUnlisten?.();
+          toastUnlisten = undefined;
+          return;
+        }
+        bridgeUnlisten = stopBridgeListening;
 
         const snapshot = await client.bootstrap();
-        if (!mounted.current) return;
+        if (cancelled || !mounted.current) return;
         let initial: DashboardState = {
           snapshot,
+          latestToastActivation: null,
           error: null,
           loading: false,
           refreshing: false,
@@ -127,13 +166,22 @@ export function useCoreDashboard(client: CoreRendererClient = core) {
         };
         for (const event of pendingEvents) initial = applyBridgeEventToState(initial, event);
         pendingEvents.length = 0;
+        if (pendingActivation && hasPrivateConnectedSnapshot(initial.snapshot)) {
+          initial.latestToastActivation = pendingActivation;
+        }
+        pendingActivation = null;
         bootstrapSettled = true;
         setState(initial);
       } catch (error: unknown) {
-        if (!mounted.current) return;
+        bridgeUnlisten?.();
+        bridgeUnlisten = undefined;
+        toastUnlisten?.();
+        toastUnlisten = undefined;
+        if (cancelled || !mounted.current) return;
         bootstrapSettled = true;
         setState({
           snapshot: null,
+          latestToastActivation: null,
           error: publicErrorFromUnknown(error),
           loading: false,
           refreshing: false,
@@ -143,10 +191,12 @@ export function useCoreDashboard(client: CoreRendererClient = core) {
     })();
 
     return () => {
+      cancelled = true;
       mounted.current = false;
-      unlisten?.();
+      bridgeUnlisten?.();
+      toastUnlisten?.();
     };
-  }, [client, handleBridgeEvent]);
+  }, [client, handleBridgeEvent, handleToastActivation]);
 
   const runSnapshotAction = useCallback(
     async (action: () => Promise<DashboardSnapshot>) => {
@@ -157,6 +207,9 @@ export function useCoreDashboard(client: CoreRendererClient = core) {
           setState((current) => ({
             ...current,
             snapshot,
+            latestToastActivation: hasPrivateConnectedSnapshot(snapshot)
+              ? current.latestToastActivation
+              : null,
             error: null,
             loading: false,
             refreshing: false,
@@ -226,12 +279,8 @@ export function useCoreDashboard(client: CoreRendererClient = core) {
       (input: GoalRevisionInput) => runCommand(() => client.deleteGoal(input)),
       [client, runCommand],
     ),
-    storeModelSecret: useCallback(
-      (input: StoreModelSecretInput) => runCommand(() => client.storeModelSecret(input)),
-      [client, runCommand],
-    ),
-    approveModelRoute: useCallback(
-      (input: ApproveModelRouteInput) => runCommand(() => client.approveModelRoute(input)),
+    setupModelRoute: useCallback(
+      (input: ApproveModelRouteInput) => runCommand(() => client.setupModelRoute(input)),
       [client, runCommand],
     ),
     grantPermission: useCallback(

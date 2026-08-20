@@ -1,11 +1,41 @@
 //! Windows-native credential collection for the desktop bridge.
 //!
 //! Secret text never crosses the Tauri invoke boundary. CredUI writes into a
-//! native UTF-16 buffer owned by this module; the module immediately converts
-//! it into CORE's non-serializable `SecretValue`, writes it to Credential
-//! Manager, and wipes the native buffer on every return path.
+//! native UTF-16 buffer owned by this module and converts it into a
+//! non-serializable `NativeSecret`. The caller keeps that zeroizing value only
+//! long enough to approve the exact route, then asks this module to write it to
+//! Credential Manager under the returned approval identity. The native UTF-16
+//! buffer is wiped on every return path.
 
-use stein_core::SecretStoreError;
+use stein_core::{SecretStoreError, SecretValue};
+use zeroize::Zeroizing;
+
+const MAX_ROUTE_ID_BYTES: usize = 128;
+
+/// Native-only credential bytes. The type has no formatting or serialization
+/// implementation and uses `zeroize`'s compiler-fenced drop behavior while the
+/// daemon approval is in flight.
+pub(crate) struct NativeSecret(Zeroizing<Vec<u8>>);
+
+impl NativeSecret {
+    fn new(value: Vec<u8>) -> Self {
+        Self(Zeroizing::new(value))
+    }
+
+    fn into_secret_value(mut self) -> SecretValue {
+        SecretValue::new(std::mem::take(&mut *self.0))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(value: Vec<u8>) -> Self {
+        Self::new(value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expose_for_test(&self) -> &[u8] {
+        &self.0
+    }
+}
 
 #[derive(Debug)]
 pub enum NativeCredentialPromptError {
@@ -17,19 +47,58 @@ pub enum NativeCredentialPromptError {
 }
 
 #[cfg(windows)]
-pub fn prompt_and_store(
+pub fn prompt_for_secret(
     route_id: String,
     parent_window: isize,
-) -> Result<(), NativeCredentialPromptError> {
-    windows::prompt_and_store(route_id, parent_window)
+) -> Result<NativeSecret, NativeCredentialPromptError> {
+    windows::prompt_for_secret(route_id, parent_window)
 }
 
 #[cfg(not(windows))]
-pub fn prompt_and_store(
+pub fn prompt_for_secret(
     _route_id: String,
     _parent_window: isize,
+) -> Result<NativeSecret, NativeCredentialPromptError> {
+    Err(NativeCredentialPromptError::Unavailable)
+}
+
+#[cfg(windows)]
+pub fn store_secret(
+    approval_id: String,
+    secret: NativeSecret,
+) -> Result<(), NativeCredentialPromptError> {
+    windows::store_secret(approval_id, secret)
+}
+
+#[cfg(not(windows))]
+pub fn store_secret(
+    _approval_id: String,
+    _secret: NativeSecret,
 ) -> Result<(), NativeCredentialPromptError> {
     Err(NativeCredentialPromptError::Unavailable)
+}
+
+pub fn validate_approval_id(approval_id: &str) -> Result<(), NativeCredentialPromptError> {
+    let parsed = uuid::Uuid::parse_str(approval_id)
+        .map_err(|_| NativeCredentialPromptError::InvalidReference)?;
+    if parsed.hyphenated().to_string() == approval_id {
+        Ok(())
+    } else {
+        Err(NativeCredentialPromptError::InvalidReference)
+    }
+}
+
+pub fn validate_route_id(route_id: &str) -> Result<(), NativeCredentialPromptError> {
+    if !route_id.is_empty()
+        && route_id.len() <= MAX_ROUTE_ID_BYTES
+        && route_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        Ok(())
+    } else {
+        Err(NativeCredentialPromptError::InvalidReference)
+    }
 }
 
 #[cfg(windows)]
@@ -41,7 +110,7 @@ mod windows {
         sync::atomic::{Ordering, compiler_fence},
     };
 
-    use stein_core::{SecretKey, SecretStore, SecretValue};
+    use stein_core::{SecretKey, SecretStore};
     use stein_platform_windows::WindowsCredentialSecretStore;
     use windows_sys::Win32::{
         Foundation::{ERROR_CANCELLED, ERROR_SUCCESS},
@@ -52,9 +121,8 @@ mod windows {
         },
     };
 
-    use super::NativeCredentialPromptError;
+    use super::{NativeCredentialPromptError, NativeSecret};
 
-    const MAX_ROUTE_ID_BYTES: usize = 128;
     const CREDUI_PASSWORD_CODE_UNITS: usize = 257;
     const CREDUI_USERNAME_CODE_UNITS: usize = 513;
 
@@ -94,13 +162,11 @@ mod windows {
         }
     }
 
-    pub(super) fn prompt_and_store(
+    pub(super) fn prompt_for_secret(
         route_id: String,
         parent_window: isize,
-    ) -> Result<(), NativeCredentialPromptError> {
-        if !valid_route_id(&route_id) {
-            return Err(NativeCredentialPromptError::InvalidReference);
-        }
+    ) -> Result<NativeSecret, NativeCredentialPromptError> {
+        super::validate_route_id(&route_id)?;
 
         let target = wide_null(&format!("STEIN:model-route:{route_id}"));
         let caption = wide_null("Store provider credential");
@@ -146,18 +212,18 @@ mod windows {
             return Err(NativeCredentialPromptError::Unavailable);
         }
 
-        let secret = SecretValue::new(password.secret_bytes()?);
-        WindowsCredentialSecretStore::new()
-            .write(&SecretKey::new(route_id), &secret)
-            .map_err(NativeCredentialPromptError::Store)
+        Ok(NativeSecret::new(password.secret_bytes()?))
     }
 
-    fn valid_route_id(route_id: &str) -> bool {
-        !route_id.is_empty()
-            && route_id.len() <= MAX_ROUTE_ID_BYTES
-            && route_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    pub(super) fn store_secret(
+        approval_id: String,
+        secret: NativeSecret,
+    ) -> Result<(), NativeCredentialPromptError> {
+        super::validate_approval_id(&approval_id)?;
+        let secret = secret.into_secret_value();
+        WindowsCredentialSecretStore::new()
+            .write(&SecretKey::new(approval_id), &secret)
+            .map_err(NativeCredentialPromptError::Store)
     }
 
     fn wide_null(value: &str) -> Vec<u16> {
@@ -179,14 +245,23 @@ mod windows {
 
     #[cfg(test)]
     mod tests {
-        use super::{secure_zero_wide, valid_route_id};
+        use super::secure_zero_wide;
+        use crate::native_credential_prompt::{validate_approval_id, validate_route_id};
 
         #[test]
         fn route_reference_accepts_only_credential_store_safe_identifiers() {
-            assert!(valid_route_id("gpt-5.4_exact.route"));
-            assert!(!valid_route_id(""));
-            assert!(!valid_route_id("route/with/path"));
-            assert!(!valid_route_id(&"x".repeat(129)));
+            assert!(validate_route_id("gpt-5.4_exact.route").is_ok());
+            assert!(validate_route_id("").is_err());
+            assert!(validate_route_id("route/with/path").is_err());
+            assert!(validate_route_id(&"x".repeat(129)).is_err());
+        }
+
+        #[test]
+        fn credential_target_requires_a_canonically_formatted_approval_uuid() {
+            assert!(validate_approval_id("0198c083-f38b-7000-8000-000000000020").is_ok());
+            assert!(validate_approval_id("exact-model").is_err());
+            assert!(validate_approval_id("0198C083-F38B-7000-8000-000000000020").is_err());
+            assert!(validate_approval_id("{0198c083-f38b-7000-8000-000000000020}").is_err());
         }
 
         #[test]

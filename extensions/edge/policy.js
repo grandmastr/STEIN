@@ -36,9 +36,19 @@ export function standardWebLocation(rawUrl) {
   };
 }
 
-export async function buildSelectionOffer(tab, runtimeExtensionId, expectedExtensionId) {
+export async function buildSelectionOffer(
+  tab,
+  runtimeExtensionId,
+  expectedExtensionId,
+  runtimeExtensionVersion,
+  selectionIdentity,
+) {
   if (
     !isExactReleaseExtensionId(runtimeExtensionId, expectedExtensionId) ||
+    !/^[0-9]+(?:\.[0-9]+){0,3}$/u.test(runtimeExtensionVersion ?? "") ||
+    !HEX_64.test(selectionIdentity?.profile_binding_sha256 ?? "") ||
+    !HEX_32.test(selectionIdentity?.browser_session_id ?? "") ||
+    !HEX_32.test(selectionIdentity?.selection_id ?? "") ||
     !Number.isInteger(tab?.id) ||
     tab.id <= 0 ||
     !Number.isInteger(tab?.windowId) ||
@@ -56,6 +66,10 @@ export async function buildSelectionOffer(tab, runtimeExtensionId, expectedExten
     protocol_version: 1,
     kind: "selection_offer",
     extension_id: runtimeExtensionId,
+    extension_version: runtimeExtensionVersion,
+    profile_binding_sha256: selectionIdentity.profile_binding_sha256,
+    browser_session_id: selectionIdentity.browser_session_id,
+    selection_id: selectionIdentity.selection_id,
     tab_id: tab.id,
     window_id: tab.windowId,
     active: true,
@@ -68,7 +82,13 @@ export async function buildSelectionOffer(tab, runtimeExtensionId, expectedExten
   };
 }
 
-export function validateCapturePlan(plan, offer, runtimeExtensionId, expectedExtensionId) {
+export function validateCapturePlan(
+  plan,
+  offer,
+  runtimeExtensionId,
+  expectedExtensionId,
+  runtimeExtensionVersion,
+) {
   if (
     !isExactReleaseExtensionId(runtimeExtensionId, expectedExtensionId) ||
     offer?.protocol_version !== 1 ||
@@ -80,12 +100,14 @@ export function validateCapturePlan(plan, offer, runtimeExtensionId, expectedExt
     plan?.protocol_version !== 1 ||
     plan?.kind !== "capture_plan" ||
     plan?.extension_id !== expectedExtensionId ||
+    plan?.extension_version !== runtimeExtensionVersion ||
+    offer?.extension_version !== runtimeExtensionVersion ||
     !["location", "visible_text"].includes(plan?.scope) ||
     !Number.isSafeInteger(plan?.authority_epoch) ||
     plan.authority_epoch <= 0 ||
-    !HEX_64.test(plan?.profile_binding_sha256 ?? "") ||
-    !HEX_32.test(plan?.browser_session_id ?? "") ||
-    !HEX_32.test(plan?.selection_id ?? "") ||
+    plan?.profile_binding_sha256 !== offer?.profile_binding_sha256 ||
+    plan?.browser_session_id !== offer?.browser_session_id ||
+    plan?.selection_id !== offer?.selection_id ||
     plan?.tab_id !== offer?.tab_id ||
     plan?.window_id !== offer?.window_id ||
     plan?.site_sha256 !== offer?.site_sha256 ||
@@ -141,7 +163,7 @@ export function validateCapturePlan(plan, offer, runtimeExtensionId, expectedExt
   });
 }
 
-export async function buildObservation(plan, tab, windowFocused, visibleText, sequence, now) {
+export async function buildObservation(plan, tab, windowFocused, visibleDocument, sequence, now) {
   if (
     !plan ||
     !Number.isSafeInteger(sequence) ||
@@ -155,16 +177,6 @@ export async function buildObservation(plan, tab, windowFocused, visibleText, se
   ) {
     return null;
   }
-  const current = standardWebLocation(tab.url);
-  if (!current) {
-    return null;
-  }
-  const siteDigest = await sha256Hex(current.site);
-  const originDigest = await sha256Hex(current.origin);
-  if (siteDigest !== plan.site_sha256 || originDigest !== plan.origin_sha256) {
-    return null;
-  }
-
   const envelope = {
     protocol_version: 1,
     authority_epoch: plan.authority_epoch,
@@ -179,13 +191,22 @@ export async function buildObservation(plan, tab, windowFocused, visibleText, se
     incognito: false,
     top_frame: true,
     page_kind: "standard_web_page",
-    site_sha256: siteDigest,
-    origin_sha256: originDigest,
+    site_sha256: plan.site_sha256,
+    origin_sha256: plan.origin_sha256,
     location: null,
     visible_text: null,
     observed_at_unix_ms: now,
   };
   if (plan.scope === "location") {
+    const current = standardWebLocation(tab.url);
+    if (!current) {
+      return null;
+    }
+    const siteDigest = await sha256Hex(current.site);
+    const originDigest = await sha256Hex(current.origin);
+    if (siteDigest !== plan.site_sha256 || originDigest !== plan.origin_sha256) {
+      return null;
+    }
     envelope.location = {
       origin: plan.granularity.origin ? current.origin : null,
       path: plan.granularity.path ? current.path : null,
@@ -193,7 +214,28 @@ export async function buildObservation(plan, tab, windowFocused, visibleText, se
       fragment: plan.granularity.fragment && current.fragment !== "" ? current.fragment : null,
     };
   } else if (plan.scope === "visible_text") {
-    envelope.visible_text = boundUtf8(localRedact(visibleText), plan.maximum_payload_bytes);
+    if (
+      typeof visibleDocument?.text !== "string" ||
+      typeof visibleDocument?.origin !== "string" ||
+      typeof visibleDocument?.site !== "string" ||
+      Object.keys(visibleDocument).length !== 3
+    ) {
+      return null;
+    }
+    const exactDocument = standardWebLocation(visibleDocument.origin);
+    if (
+      !exactDocument ||
+      exactDocument.origin !== visibleDocument.origin ||
+      exactDocument.site !== visibleDocument.site ||
+      (await sha256Hex(exactDocument.site)) !== plan.site_sha256 ||
+      (await sha256Hex(exactDocument.origin)) !== plan.origin_sha256
+    ) {
+      return null;
+    }
+    envelope.visible_text = boundUtf8(
+      localRedact(visibleDocument.text),
+      plan.maximum_payload_bytes,
+    );
     if (envelope.visible_text === "") {
       return null;
     }

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { isInterventionExplanationView } from "../protocol";
 import type {
   AbandonGoalInput,
   ApproveModelRouteInput,
@@ -24,13 +25,11 @@ import type {
   RemoveSelectedResourceInput,
   ResourceView,
   RevokePermissionInput,
-  SecretMutationView,
   SelectedResourceDeletionView,
   SessionGrantView,
   SetMutedInput,
   StartFocusSessionInput,
   SteinIdentityView,
-  StoreModelSecretInput,
   UpdateGoalInput,
   UpdateUserPreferencesInput,
   UserPreferencesUpdateView,
@@ -38,8 +37,9 @@ import type {
 } from "../protocol";
 
 export const DESKTOP_BRIDGE_EVENT = "stein://desktop-bridge";
+export const TOAST_ACTIVATION_EVENT = "stein://toast-activation";
 
-/** The renderer's complete, closed API to CORE and the native secret write. */
+/** The renderer's complete, closed API to CORE and native setup transactions. */
 export const core = {
   bootstrap: (): Promise<DashboardSnapshot> =>
     invoke<DashboardSnapshot>("desktop_bootstrap"),
@@ -57,10 +57,8 @@ export const core = {
     invoke<GoalView>("desktop_abandon_goal", { input }),
   deleteGoal: (input: GoalRevisionInput): Promise<GoalDeletionView> =>
     invoke<GoalDeletionView>("desktop_delete_goal", { input }),
-  storeModelSecret: ({ routeId }: StoreModelSecretInput): Promise<SecretMutationView> =>
-    invoke<SecretMutationView>("desktop_store_model_secret", { input: { routeId } }),
-  approveModelRoute: (input: ApproveModelRouteInput): Promise<ModelRouteView> =>
-    invoke<ModelRouteView>("desktop_approve_model_route", { input }),
+  setupModelRoute: (input: ApproveModelRouteInput): Promise<ModelRouteView> =>
+    invoke<ModelRouteView>("desktop_setup_model_route", { input }),
   grantPermission: (input: GrantPermissionInput): Promise<SessionGrantView> =>
     invoke<SessionGrantView>("desktop_grant_permission", { input }),
   revokePermission: (input: RevokePermissionInput): Promise<void> =>
@@ -103,6 +101,12 @@ export const core = {
     invoke<InterventionHistoryView>("desktop_get_intervention_history", { input }),
   subscribe: (onEvent: (event: DesktopBridgeEvent) => void): Promise<UnlistenFn> =>
     listen<DesktopBridgeEvent>(DESKTOP_BRIDGE_EVENT, ({ payload }) => onEvent(payload)),
+  subscribeToastActivation: (
+    onActivation: (explanation: InterventionExplanationView) => void,
+  ): Promise<UnlistenFn> =>
+    listen<unknown>(TOAST_ACTIVATION_EVENT, ({ payload }) => {
+      if (isInterventionExplanationView(payload)) onActivation(payload);
+    }),
 };
 
 export type CoreRendererClient = typeof core;

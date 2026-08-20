@@ -95,7 +95,7 @@ prompts/responses, file data, or chain of thought in the outbox.
 When a channel becomes available, CORE re-evaluates:
 
 - current goal/session state and candidate relevance;
-- permission and policy revisions;
+- permission, model-route, policy-profile, and exact user-preference revisions;
 - expiry, novelty, urgency, cooldown, and recent intervention load;
 - user presence, lock state, and channel suitability; and
 - deduplication and prior delivery acknowledgements.
@@ -104,6 +104,13 @@ If still valid, CORE delivers the item. If no longer valid, it marks it expired 
 cancelled and includes a non-interruptive missed-intervention entry in the next
 authorized history/snapshot view. A stale focus warning is not replayed as a
 current notification merely to satisfy “eventual delivery.”
+
+The queued decision's content-free policy trace must be complete and must match
+the current profile and preference revision before its cached proposal can be
+reconsidered. A preference revision change invalidates the cached proposal even
+when the new preference would otherwise be equally permissive, because the
+stored text was proposed under different exact inputs. A successful recovery
+evaluation writes a fresh trace/digest and correlated audit before delivery.
 
 For deadline-sensitive focus interventions, expiry cannot exceed the focus
 session or the point at which the proposed advice stops being actionable. Policy
@@ -123,9 +130,12 @@ queued -> delivering -> accepted_by_channel
 request. It does not mean displayed or seen. Retries after ambiguous delivery
 require a new policy decision and must not create notification spam.
 
-Revocation, session end, goal deletion, or user mute cancels affected queued
-items immediately. Private outbox content expires with the item and follows user
-deletion commands.
+Revocation, session end, goal deletion, global proactive disable/mute, or
+session mute cancels affected queued items immediately. The same direct-user
+transition cancels the separate proactive model/delivery token before the
+durable revision changes; it does not cancel the session's observation token.
+Private outbox and intervention text is scrubbed before the command returns and
+follows user deletion commands.
 
 ## Consequences
 

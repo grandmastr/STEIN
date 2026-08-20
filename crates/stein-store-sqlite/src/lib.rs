@@ -17,19 +17,20 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use stein_core::{
     ActorId, AuditKind, AuditRecord, DeletionSummary, DeviceId, DeviceRegistration,
-    DurableRepository, ExplicitPreferences, FocusSession, Goal, GoalCreateReceipt,
-    GoalDeletionResult, GoalDeletionTombstone, GoalId, IdempotencyKey, Intervention,
-    InterventionDecisionWrite, InterventionState, ModelRouteApproval, NativeResourceCleanup,
-    OperationKind, OperationReceipt, OutboxState, OwnerStateSnapshot, PendingInterventionDelivery,
-    PermissionGrant, PolicyDecision, PolicyOutcome, PortFuture, RecordProvenance,
+    DurableRepository, ExplicitPreferences, FocusSession, FocusSessionLifecycleWrite, Goal,
+    GoalCreateReceipt, GoalDeletionResult, GoalDeletionTombstone, GoalId, IdempotencyKey,
+    Intervention, InterventionDecisionWrite, InterventionState, InterventionTransitionWrite,
+    ModelRouteApproval, NativeResourceCleanup, OperationKind, OperationReceipt, OutboxState,
+    OwnerStateSnapshot, PendingDeliveryTransition, PendingInterventionDelivery, PermissionGrant,
+    PermissionGrantRevocationWrite, PolicyDecision, PolicyOutcome, PortFuture, RecordProvenance,
     RecordProvenanceSource, RepositoryError, RepositoryErrorKind, ResourceBinding, ResourceId,
-    SelectedResourceDeletionResult, SelectedResourceDeletionTombstone, SteinIdentity,
-    USER_PREFERENCES_SCHEMA_V1,
+    SecretDeletionCleanup, SelectedResourceDeletionResult, SelectedResourceDeletionTombstone,
+    SteinIdentity, USER_PREFERENCES_SCHEMA_V1,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
 const OUTBOX_CAPACITY_PER_OWNER: i64 = 20;
@@ -300,6 +301,16 @@ CREATE INDEX operation_receipts_result_idx
 
 const IDENTITY_PREFERENCES_V5_CANONICALIZATION: &str = "decode typed v4 JSON; replace identity with shipped SteinIdentityV1 invariants and product-migration provenance; disable ambient proactive enablement, remote processing, and restart continuity while preserving explicit global mute and bounded presentation preferences; canonical JSON re-encode; v2";
 
+const SECRET_DELETION_CLEANUP_V6_SQL: &str = "
+CREATE TABLE secret_deletion_cleanup_records (
+    route_id BLOB PRIMARY KEY NOT NULL CHECK(length(route_id) = 16),
+    owner BLOB NOT NULL CHECK(length(owner) = 16),
+    created_at TEXT NOT NULL,
+    payload TEXT NOT NULL CHECK(length(payload) <= 1024)
+);
+CREATE INDEX secret_deletion_cleanup_owner_idx
+    ON secret_deletion_cleanup_records(owner);";
+
 struct MigrationDefinition {
     schema_version: i64,
     owner: &'static str,
@@ -383,6 +394,12 @@ const MIGRATIONS: &[MigrationDefinition] = &[
             IDENTITY_PREFERENCES_V5_CANONICALIZATION,
             IDENTITY_PREFERENCES_DEVICE_DELETIONS_V5_FINISH_SQL,
         ],
+    },
+    MigrationDefinition {
+        schema_version: 6,
+        owner: "identity_permissions",
+        migration_id: "identity-permissions-v6-secret-deletion-cleanup",
+        checksum_material: &[SECRET_DELETION_CLEANUP_V6_SQL],
     },
 ];
 
@@ -567,6 +584,7 @@ fn initialize(connection: &mut Connection) -> Result<(), RepositoryError> {
             migrate_v3(connection)?;
             migrate_v4(connection)?;
             migrate_v5(connection)?;
+            migrate_v6(connection)?;
         }
         1 => {
             verify_migration_catalog(connection, 1)?;
@@ -574,21 +592,29 @@ fn initialize(connection: &mut Connection) -> Result<(), RepositoryError> {
             migrate_v3(connection)?;
             migrate_v4(connection)?;
             migrate_v5(connection)?;
+            migrate_v6(connection)?;
         }
         2 => {
             verify_migration_catalog(connection, 2)?;
             migrate_v3(connection)?;
             migrate_v4(connection)?;
             migrate_v5(connection)?;
+            migrate_v6(connection)?;
         }
         3 => {
             verify_migration_catalog(connection, 3)?;
             migrate_v4(connection)?;
             migrate_v5(connection)?;
+            migrate_v6(connection)?;
         }
         4 => {
             verify_migration_catalog(connection, 4)?;
             migrate_v5(connection)?;
+            migrate_v6(connection)?;
+        }
+        5 => {
+            verify_migration_catalog(connection, 5)?;
+            migrate_v6(connection)?;
         }
         SCHEMA_VERSION => verify_migration_catalog(connection, SCHEMA_VERSION)?,
         _ => {
@@ -710,6 +736,20 @@ fn migrate_v5(connection: &mut Connection) -> Result<(), RepositoryError> {
     record_migrations(&transaction, 5)?;
     transaction
         .pragma_update(None, "user_version", 5_i64)
+        .map_err(sql_error)?;
+    transaction.commit().map_err(sql_error)
+}
+
+fn migrate_v6(connection: &mut Connection) -> Result<(), RepositoryError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Exclusive)
+        .map_err(sql_error)?;
+    transaction
+        .execute_batch(SECRET_DELETION_CLEANUP_V6_SQL)
+        .map_err(sql_error)?;
+    record_migrations(&transaction, 6)?;
+    transaction
+        .pragma_update(None, "user_version", 6_i64)
         .map_err(sql_error)?;
     transaction.commit().map_err(sql_error)
 }
@@ -1174,6 +1214,7 @@ fn verify_logical_integrity(connection: &Connection) -> Result<(), RepositoryErr
     verify_owned_record_table::<ResourceBinding>(connection, "resource_records")?;
     verify_resource_binding_privacy(connection)?;
     verify_native_resource_cleanups(connection)?;
+    verify_secret_deletion_cleanups(connection)?;
     verify_owned_record_table::<PermissionGrant>(connection, "permission_records")?;
     verify_owned_record_table::<ModelRouteApproval>(connection, "route_records")?;
     verify_owned_record_table::<FocusSession>(connection, "focus_records")?;
@@ -1249,6 +1290,65 @@ fn verify_native_resource_cleanups(connection: &Connection) -> Result<(), Reposi
             return Err(relational_payload_mismatch());
         }
         validate_opaque_resource_reference(&value.opaque_reference)?;
+    }
+    Ok(())
+}
+
+fn validate_secret_reference(value: &str) -> Result<(), RepositoryError> {
+    if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+        return Err(RepositoryError {
+            kind: RepositoryErrorKind::Corrupt,
+            summary: "A secret cleanup reference is not a bounded opaque token.",
+        });
+    }
+    Ok(())
+}
+
+fn verify_secret_deletion_cleanups(connection: &Connection) -> Result<(), RepositoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT route_id,owner,created_at,payload
+             FROM secret_deletion_cleanup_records",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    for row in rows {
+        let (route_blob, owner_blob, created_at, payload) = row.map_err(sql_error)?;
+        let owner = actor_from_blob(&owner_blob)?;
+        let value: SecretDeletionCleanup = decode_owned(payload, owner)?;
+        if id(value.model_route_approval_id.as_uuid()) != route_blob
+            || value.created_at.to_string() != created_at
+        {
+            return Err(relational_payload_mismatch());
+        }
+        validate_secret_reference(value.secret_ref.as_str())?;
+        let route_payload: Option<String> = connection
+            .query_row(
+                "SELECT payload FROM route_records WHERE id=?1 AND owner=?2",
+                params![
+                    id(value.model_route_approval_id.as_uuid()),
+                    id(owner.as_uuid())
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let Some(route_payload) = route_payload else {
+            return Err(relational_payload_mismatch());
+        };
+        let route: ModelRouteApproval = decode_owned(route_payload, owner)?;
+        if route.revoked_at.is_none() || route.secret_ref != value.secret_ref {
+            return Err(relational_payload_mismatch());
+        }
     }
     Ok(())
 }
@@ -1870,6 +1970,9 @@ fn validate_delivery_update(
     expected
         .user_visible_text
         .clone_from(&next.user_visible_text);
+    if current.state == OutboxState::Queued && next.state != OutboxState::Queued {
+        expected.policy_decision_id = next.policy_decision_id;
+    }
     if transition_allowed && attempt_metadata_valid && terminal_text_valid && expected == *next {
         Ok(())
     } else {
@@ -2123,6 +2226,9 @@ fn validate_intervention_decision_write(
         || value.audit.kind != AuditKind::InterventionDecision
         || value.audit.subject_id != decision.candidate_id.as_uuid()
         || value.audit.reason_codes != decision.reason_codes
+        || !decision.policy_trace.is_complete()
+        || decision.policy_version != decision.policy_trace.policy_profile_id
+        || value.audit.policy_trace.as_ref() != Some(&decision.policy_trace)
     {
         return Err(RepositoryError {
             kind: RepositoryErrorKind::Corrupt,
@@ -2204,7 +2310,75 @@ fn insert_native_resource_cleanup(
     Ok(())
 }
 
+fn insert_secret_deletion_cleanup(
+    connection: &Connection,
+    cleanup: &SecretDeletionCleanup,
+) -> Result<(), RepositoryError> {
+    validate_secret_reference(cleanup.secret_ref.as_str())?;
+    let changed = connection
+        .execute(
+            "INSERT INTO secret_deletion_cleanup_records(
+                 route_id,owner,created_at,payload
+             ) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(route_id) DO NOTHING",
+            params![
+                id(cleanup.model_route_approval_id.as_uuid()),
+                id(cleanup.owner.as_uuid()),
+                cleanup.created_at.to_string(),
+                encode(cleanup)?,
+            ],
+        )
+        .map_err(sql_error)?;
+    if changed == 0 {
+        let payload: String = connection
+            .query_row(
+                "SELECT payload FROM secret_deletion_cleanup_records
+                 WHERE route_id=?1 AND owner=?2",
+                params![
+                    id(cleanup.model_route_approval_id.as_uuid()),
+                    id(cleanup.owner.as_uuid()),
+                ],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        let existing: SecretDeletionCleanup = decode_owned(payload, cleanup.owner)?;
+        if existing != *cleanup {
+            return Err(RepositoryError {
+                kind: RepositoryErrorKind::Corrupt,
+                summary: "A secret-deletion cleanup obligation changed unexpectedly.",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_model_route_secret_reference(
+    route: &ModelRouteApproval,
+) -> Result<(), RepositoryError> {
+    if route.has_approval_scoped_secret_ref() {
+        Ok(())
+    } else {
+        Err(RepositoryError {
+            kind: RepositoryErrorKind::Corrupt,
+            summary: "A model-route secret reference is not scoped to its approval.",
+        })
+    }
+}
+
 fn insert_audit(connection: &Connection, value: &AuditRecord) -> Result<(), RepositoryError> {
+    if matches!(
+        value.kind,
+        AuditKind::SignificanceDecision | AuditKind::InterventionDecision
+    ) && !value
+        .policy_trace
+        .as_ref()
+        .is_some_and(stein_core::PolicyTrace::is_complete)
+    {
+        return Err(RepositoryError {
+            kind: RepositoryErrorKind::Corrupt,
+            summary: "A policy audit has incomplete trace provenance.",
+        });
+    }
     connection
         .execute(
             "INSERT INTO audit_records(
@@ -2221,6 +2395,130 @@ fn insert_audit(connection: &Connection, value: &AuditRecord) -> Result<(), Repo
         )
         .map_err(sql_error)?;
     Ok(())
+}
+
+fn insert_pending_delivery(
+    connection: &Connection,
+    value: &PendingInterventionDelivery,
+) -> Result<(), RepositoryError> {
+    if value.state != OutboxState::Queued
+        || value.attempt_count != 0
+        || value.last_attempt_at.is_some()
+        || value.user_visible_text.chars().count() > MAX_OUTBOX_TEXT_SCALARS
+        || value.created_at > value.not_before
+        || value.not_before >= value.expires_at
+    {
+        return Err(RepositoryError {
+            kind: RepositoryErrorKind::Conflict,
+            summary: "The pending delivery does not satisfy the bounded queue contract.",
+        });
+    }
+    let session_id: Vec<u8> = connection
+        .query_row(
+            "SELECT session_id FROM intervention_records
+             WHERE id=?1 AND owner=?2",
+            params![
+                id(value.intervention_id.as_uuid()),
+                id(value.owner.as_uuid())
+            ],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    let policy_matches: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM policy_records
+                 WHERE id=?1 AND owner=?2 AND session_id=?3
+             )",
+            params![
+                id(value.policy_decision_id.as_uuid()),
+                id(value.owner.as_uuid()),
+                session_id.clone(),
+            ],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if !policy_matches {
+        return Err(RepositoryError {
+            kind: RepositoryErrorKind::NotFound,
+            summary: "The pending delivery policy decision was not found.",
+        });
+    }
+    let total_queued: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM outbox_records WHERE owner=?1 AND state='queued'",
+            [id(value.owner.as_uuid())],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    let session_queued: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM outbox_records
+             WHERE session_id=?1 AND state='queued'",
+            [session_id.clone()],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if total_queued >= OUTBOX_CAPACITY_PER_OWNER || session_queued >= OUTBOX_CAPACITY_PER_SESSION {
+        return Err(RepositoryError {
+            kind: RepositoryErrorKind::Conflict,
+            summary: "The bounded pending-delivery queue is full.",
+        });
+    }
+    connection
+        .execute(
+            "INSERT INTO outbox_records(
+                 id,owner,intervention_id,session_id,deduplication_key,state,expires_at,payload
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                id(value.id.as_uuid()),
+                id(value.owner.as_uuid()),
+                id(value.intervention_id.as_uuid()),
+                session_id,
+                id(value.deduplication_key),
+                outbox_state_wire(value.state),
+                value.expires_at.to_string(),
+                encode(value)?
+            ],
+        )
+        .map_err(sql_error)?;
+    Ok(())
+}
+
+fn update_pending_delivery(
+    connection: &Connection,
+    value: &PendingInterventionDelivery,
+) -> Result<(), RepositoryError> {
+    let mut value = value.clone();
+    if !outbox_state_retains_private_text(value.state) {
+        value.user_visible_text.clear();
+    }
+    let current_payload: String = connection
+        .query_row(
+            "SELECT payload FROM outbox_records WHERE id=?1 AND owner=?2",
+            params![id(value.id.as_uuid()), id(value.owner.as_uuid())],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .ok_or(RepositoryError {
+            kind: RepositoryErrorKind::NotFound,
+            summary: "The pending delivery was not found.",
+        })?;
+    let current: PendingInterventionDelivery = decode(current_payload)?;
+    validate_delivery_update(&current, &value)?;
+    let changed = connection
+        .execute(
+            "UPDATE outbox_records SET state=?1,payload=?2 WHERE id=?3 AND owner=?4",
+            params![
+                outbox_state_wire(value.state),
+                encode(&value)?,
+                id(value.id.as_uuid()),
+                id(value.owner.as_uuid())
+            ],
+        )
+        .map_err(sql_error)?;
+    ensure_one_row_changed(changed, "The pending delivery changed concurrently.")
 }
 
 impl DurableRepository for SqliteRepository {
@@ -3025,6 +3323,105 @@ impl DurableRepository for SqliteRepository {
         })
     }
 
+    fn save_revoked_model_route_with_cleanup(
+        &self,
+        value: &ModelRouteApproval,
+        expected_revision: u64,
+        cleanup: &SecretDeletionCleanup,
+        audit: &AuditRecord,
+    ) -> Result<(), RepositoryError> {
+        validate_model_route_secret_reference(value)?;
+        if value.revoked_at.is_none()
+            || value.owner != cleanup.owner
+            || value.id != cleanup.model_route_approval_id
+            || value.secret_ref != cleanup.secret_ref
+        {
+            return Err(RepositoryError {
+                kind: RepositoryErrorKind::Corrupt,
+                summary: "A secret-deletion cleanup obligation does not match its revoked route.",
+            });
+        }
+        if audit.owner != value.owner
+            || audit.kind != AuditKind::ModelRouteRevoked
+            || audit.subject_id != value.id.as_uuid()
+        {
+            return Err(RepositoryError {
+                kind: RepositoryErrorKind::Corrupt,
+                summary: "A model-route revocation audit does not match its aggregate.",
+            });
+        }
+        let value = value.clone();
+        let cleanup = cleanup.clone();
+        let audit = audit.clone();
+        self.call(move |connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            check_expected_revision(
+                &transaction,
+                "route_records",
+                "id",
+                id(value.id.as_uuid()),
+                Some(expected_revision),
+            )?;
+            let changed = transaction
+                .execute(
+                    "UPDATE route_records SET revision=?1,payload=?2
+                     WHERE id=?3 AND owner=?4",
+                    params![
+                        sql_u64(value.revision)?,
+                        encode(&value)?,
+                        id(value.id.as_uuid()),
+                        id(value.owner.as_uuid()),
+                    ],
+                )
+                .map_err(sql_error)?;
+            ensure_one_row_changed(changed, "The model route belongs to another owner.")?;
+            insert_secret_deletion_cleanup(&transaction, &cleanup)?;
+            insert_audit(&transaction, &audit)?;
+            transaction.commit().map_err(sql_error)
+        })
+    }
+
+    fn load_secret_deletion_cleanups(
+        &self,
+        owner: ActorId,
+    ) -> Result<Vec<SecretDeletionCleanup>, RepositoryError> {
+        self.call(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT payload FROM secret_deletion_cleanup_records
+                     WHERE owner=?1 ORDER BY route_id",
+                )
+                .map_err(sql_error)?;
+            let rows = statement
+                .query_map([id(owner.as_uuid())], |row| row.get::<_, String>(0))
+                .map_err(sql_error)?;
+            rows.map(|row| {
+                row.map_err(sql_error)
+                    .and_then(|payload| decode_owned(payload, owner))
+            })
+            .collect()
+        })
+    }
+
+    fn complete_secret_deletion_cleanup(
+        &self,
+        owner: ActorId,
+        model_route_approval_id: stein_core::ModelRouteApprovalId,
+    ) -> Result<(), RepositoryError> {
+        self.call(move |connection| {
+            connection
+                .execute(
+                    "DELETE FROM secret_deletion_cleanup_records
+                     WHERE route_id=?1 AND owner=?2",
+                    params![id(model_route_approval_id.as_uuid()), id(owner.as_uuid())],
+                )
+                .map_err(sql_error)?;
+            Ok(())
+        })
+    }
+
     fn load_grants(&self, owner: ActorId) -> Result<Vec<PermissionGrant>, RepositoryError> {
         self.call(move |connection| load_owner_records(connection, "permission_records", owner))
     }
@@ -3094,6 +3491,52 @@ impl DurableRepository for SqliteRepository {
                 )
                 .map_err(sql_error)?;
             ensure_one_row_changed(changed, "The permission grant belongs to another owner.")?;
+            transaction.commit().map_err(sql_error)
+        })
+    }
+
+    fn save_permission_grant_revocation(
+        &self,
+        value: &PermissionGrantRevocationWrite,
+    ) -> Result<(), RepositoryError> {
+        value.validate()?;
+        let value = value.clone();
+        self.call(move |connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let current_payload: Option<String> = transaction
+                .query_row(
+                    "SELECT payload FROM permission_records WHERE id=?1 AND owner=?2",
+                    params![
+                        id(value.grant.id.as_uuid()),
+                        id(value.grant.owner.as_uuid())
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            let current_payload = current_payload.ok_or(RepositoryError {
+                kind: RepositoryErrorKind::NotFound,
+                summary: "The durable permission grant was not found.",
+            })?;
+            let current: PermissionGrant = decode_owned(current_payload, value.grant.owner)?;
+            value.validate_against(&current)?;
+            let changed = transaction
+                .execute(
+                    "UPDATE permission_records SET revision=?1,payload=?2
+                     WHERE id=?3 AND owner=?4 AND revision=?5",
+                    params![
+                        sql_u64(value.grant.revision)?,
+                        encode(&value.grant)?,
+                        id(value.grant.id.as_uuid()),
+                        id(value.grant.owner.as_uuid()),
+                        sql_u64(value.expected_revision)?
+                    ],
+                )
+                .map_err(sql_error)?;
+            ensure_one_row_changed(changed, "The permission-grant revision changed.")?;
+            insert_audit(&transaction, &value.audit)?;
             transaction.commit().map_err(sql_error)
         })
     }
@@ -3176,6 +3619,7 @@ impl DurableRepository for SqliteRepository {
         value: &ModelRouteApproval,
         expected_revision: Option<u64>,
     ) -> Result<(), RepositoryError> {
+        validate_model_route_secret_reference(value)?;
         let value = value.clone();
         self.call(move |connection| {
             let transaction = connection.transaction().map_err(sql_error)?;
@@ -3210,6 +3654,7 @@ impl DurableRepository for SqliteRepository {
         receipt: &OperationReceipt,
         audit: &AuditRecord,
     ) -> Result<(), RepositoryError> {
+        validate_model_route_secret_reference(value)?;
         validate_operation_receipt(
             receipt,
             OperationKind::ApproveModelRoute,
@@ -3399,6 +3844,60 @@ impl DurableRepository for SqliteRepository {
         })
     }
 
+    fn save_focus_session_transition(
+        &self,
+        value: &FocusSessionLifecycleWrite,
+    ) -> Result<(), RepositoryError> {
+        value.validate()?;
+        let value = value.clone();
+        self.call(move |connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let current_payload: Option<String> = transaction
+                .query_row(
+                    "SELECT payload FROM focus_records WHERE id=?1 AND owner=?2",
+                    params![
+                        id(value.session.id.as_uuid()),
+                        id(value.session.owner.as_uuid())
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            let current_payload = current_payload.ok_or(RepositoryError {
+                kind: RepositoryErrorKind::NotFound,
+                summary: "The durable focus session was not found.",
+            })?;
+            let current: FocusSession = decode_owned(current_payload, value.session.owner)?;
+            value.validate_against(&current)?;
+            require_owned_reference(
+                &transaction,
+                "goals_records",
+                id(value.session.goal_id.as_uuid()),
+                value.session.owner,
+            )?;
+            let changed = transaction
+                .execute(
+                    "UPDATE focus_records
+                     SET goal_id=?1,revision=?2,payload=?3
+                     WHERE id=?4 AND owner=?5 AND revision=?6",
+                    params![
+                        id(value.session.goal_id.as_uuid()),
+                        sql_u64(value.session.revision)?,
+                        encode(&value.session)?,
+                        id(value.session.id.as_uuid()),
+                        id(value.session.owner.as_uuid()),
+                        sql_u64(value.expected_revision)?
+                    ],
+                )
+                .map_err(sql_error)?;
+            ensure_one_row_changed(changed, "The focus-session revision changed.")?;
+            insert_audit(&transaction, &value.audit)?;
+            transaction.commit().map_err(sql_error)
+        })
+    }
+
     fn load_interventions(&self, owner: ActorId) -> Result<Vec<Intervention>, RepositoryError> {
         self.call(move |connection| load_owner_records(connection, "intervention_records", owner))
     }
@@ -3439,7 +3938,98 @@ impl DurableRepository for SqliteRepository {
         })
     }
 
+    fn save_intervention_transition(
+        &self,
+        value: &InterventionTransitionWrite,
+    ) -> Result<(), RepositoryError> {
+        value.validate()?;
+        let value = value.clone();
+        self.call(move |connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let current_payload: Option<String> = transaction
+                .query_row(
+                    "SELECT payload FROM intervention_records WHERE id=?1 AND owner=?2",
+                    params![
+                        id(value.intervention.id.as_uuid()),
+                        id(value.intervention.owner.as_uuid())
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            let current_payload = current_payload.ok_or(RepositoryError {
+                kind: RepositoryErrorKind::NotFound,
+                summary: "The durable intervention was not found.",
+            })?;
+            let current: Intervention = decode_owned(current_payload, value.intervention.owner)?;
+            value.validate_against(&current)?;
+            require_owned_reference(
+                &transaction,
+                "goals_records",
+                id(value.intervention.goal_id.as_uuid()),
+                value.intervention.owner,
+            )?;
+            require_owned_reference(
+                &transaction,
+                "focus_records",
+                id(value.intervention.focus_session_id.as_uuid()),
+                value.intervention.owner,
+            )?;
+            if let Some(delivery_transition) = &value.delivery {
+                let delivery = delivery_transition.delivery();
+                let current_delivery = transaction
+                    .query_row(
+                        "SELECT payload FROM outbox_records WHERE id=?1 AND owner=?2",
+                        params![id(delivery.id.as_uuid()), id(delivery.owner.as_uuid())],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(sql_error)?
+                    .map(decode)
+                    .transpose()?;
+                delivery_transition.validate_against(current_delivery.as_ref())?;
+                match delivery_transition {
+                    PendingDeliveryTransition::Enqueue(delivery) => {
+                        insert_pending_delivery(&transaction, delivery)?;
+                    }
+                    PendingDeliveryTransition::Update { delivery, .. } => {
+                        update_pending_delivery(&transaction, delivery)?;
+                    }
+                }
+            }
+            let changed = transaction
+                .execute(
+                    "UPDATE intervention_records
+                     SET goal_id=?1,session_id=?2,revision=?3,payload=?4
+                     WHERE id=?5 AND owner=?6 AND revision=?7",
+                    params![
+                        id(value.intervention.goal_id.as_uuid()),
+                        id(value.intervention.focus_session_id.as_uuid()),
+                        sql_u64(value.intervention.revision)?,
+                        encode(&value.intervention)?,
+                        id(value.intervention.id.as_uuid()),
+                        id(value.intervention.owner.as_uuid()),
+                        sql_u64(value.expected_revision)?
+                    ],
+                )
+                .map_err(sql_error)?;
+            ensure_one_row_changed(changed, "The intervention revision changed.")?;
+            insert_audit(&transaction, &value.audit)?;
+            transaction.commit().map_err(sql_error)
+        })
+    }
+
     fn save_policy_decision(&self, value: &PolicyDecision) -> Result<(), RepositoryError> {
+        if !value.policy_trace.is_complete()
+            || value.policy_version != value.policy_trace.policy_profile_id
+        {
+            return Err(RepositoryError {
+                kind: RepositoryErrorKind::Corrupt,
+                summary: "A policy decision has incomplete trace provenance.",
+            });
+        }
         let value = value.clone();
         self.call(move |connection| {
             require_owned_reference(
@@ -3620,129 +4210,17 @@ impl DurableRepository for SqliteRepository {
     }
 
     fn enqueue_delivery(&self, value: &PendingInterventionDelivery) -> Result<(), RepositoryError> {
-        if value.state != OutboxState::Queued
-            || value.attempt_count != 0
-            || value.last_attempt_at.is_some()
-            || value.user_visible_text.chars().count() > MAX_OUTBOX_TEXT_SCALARS
-            || value.created_at > value.not_before
-            || value.not_before >= value.expires_at
-        {
-            return Err(RepositoryError {
-                kind: RepositoryErrorKind::Conflict,
-                summary: "The pending delivery does not satisfy the bounded queue contract.",
-            });
-        }
         let value = value.clone();
         self.call(move |connection| {
             let transaction = connection.transaction().map_err(sql_error)?;
-            let session_id: Vec<u8> = transaction
-                .query_row(
-                    "SELECT session_id FROM intervention_records
-                     WHERE id=?1 AND owner=?2",
-                    params![
-                        id(value.intervention_id.as_uuid()),
-                        id(value.owner.as_uuid())
-                    ],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error)?;
-            let policy_matches: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM policy_records
-                         WHERE id=?1 AND owner=?2 AND session_id=?3
-                     )",
-                    params![
-                        id(value.policy_decision_id.as_uuid()),
-                        id(value.owner.as_uuid()),
-                        session_id.clone(),
-                    ],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error)?;
-            if !policy_matches {
-                return Err(RepositoryError {
-                    kind: RepositoryErrorKind::NotFound,
-                    summary: "The pending delivery policy decision was not found.",
-                });
-            }
-            let total_queued: i64 = transaction
-                .query_row(
-                    "SELECT count(*) FROM outbox_records WHERE owner=?1 AND state='queued'",
-                    [id(value.owner.as_uuid())],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error)?;
-            let session_queued: i64 = transaction
-                .query_row(
-                    "SELECT count(*) FROM outbox_records
-                     WHERE session_id=?1 AND state='queued'",
-                    [session_id.clone()],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error)?;
-            if total_queued >= OUTBOX_CAPACITY_PER_OWNER
-                || session_queued >= OUTBOX_CAPACITY_PER_SESSION
-            {
-                return Err(RepositoryError {
-                    kind: RepositoryErrorKind::Conflict,
-                    summary: "The bounded pending-delivery queue is full.",
-                });
-            }
-            transaction
-                .execute(
-                    "INSERT INTO outbox_records(
-                     id,owner,intervention_id,session_id,deduplication_key,state,expires_at,payload
-                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                    params![
-                        id(value.id.as_uuid()),
-                        id(value.owner.as_uuid()),
-                        id(value.intervention_id.as_uuid()),
-                        session_id,
-                        id(value.deduplication_key),
-                        outbox_state_wire(value.state),
-                        value.expires_at.to_string(),
-                        encode(&value)?
-                    ],
-                )
-                .map_err(sql_error)?;
+            insert_pending_delivery(&transaction, &value)?;
             transaction.commit().map_err(sql_error)
         })
     }
 
     fn save_delivery(&self, value: &PendingInterventionDelivery) -> Result<(), RepositoryError> {
-        let mut value = value.clone();
-        if !outbox_state_retains_private_text(value.state) {
-            value.user_visible_text.clear();
-        }
-        self.call(move |connection| {
-            let current_payload: String = connection
-                .query_row(
-                    "SELECT payload FROM outbox_records WHERE id=?1 AND owner=?2",
-                    params![id(value.id.as_uuid()), id(value.owner.as_uuid())],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(sql_error)?
-                .ok_or(RepositoryError {
-                    kind: RepositoryErrorKind::NotFound,
-                    summary: "The pending delivery was not found.",
-                })?;
-            let current: PendingInterventionDelivery = decode(current_payload)?;
-            validate_delivery_update(&current, &value)?;
-            let changed = connection
-                .execute(
-                    "UPDATE outbox_records SET state=?1,payload=?2 WHERE id=?3 AND owner=?4",
-                    params![
-                        outbox_state_wire(value.state),
-                        encode(&value)?,
-                        id(value.id.as_uuid()),
-                        id(value.owner.as_uuid())
-                    ],
-                )
-                .map_err(sql_error)?;
-            ensure_one_row_changed(changed, "The pending delivery changed concurrently.")
-        })
+        let value = value.clone();
+        self.call(move |connection| update_pending_delivery(connection, &value))
     }
 
     fn load_pending_deliveries(

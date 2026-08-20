@@ -478,6 +478,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "stein-broker-windows"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "thiserror",
+ "windows-sys",
+]
+
+[[package]]
 name = "stein-core"
 version = "0.1.0"
 dependencies = [
@@ -497,7 +506,10 @@ name = "stein-edge-native-host"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "stein-broker-windows",
  "stein-platform-windows",
+ "tokio",
+ "windows-sys",
  "zeroize",
 ]
 
@@ -506,7 +518,9 @@ name = "stein-platform-windows"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "sha2",
+ "stein-broker-windows",
  "stein-core",
  "time",
  "tokio",

@@ -16,7 +16,11 @@ param(
 
     [Parameter(Mandatory = $true)]
     [ValidatePattern("^[0-9a-f]{64}$")]
-    [string] $ExpectedCoreSha256
+    [string] $ExpectedCoreSha256,
+
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern("^[0-9a-f]{64}$")]
+    [string] $ExpectedHostSha256
 )
 
 $ErrorActionPreference = "Stop"
@@ -37,7 +41,7 @@ try {
         -CertificateThumbprint $normalizedThumbprint `
         -Publisher $Publisher
 
-    & $makeAppx unpack /p $resolvedPackage /d $unpackRoot /o | Out-Host
+    & $makeAppx unpack /p $resolvedPackage /d $unpackRoot /o *> $null
     Assert-NativeCommandSucceeded -Operation "MakeAppx package unpack"
     $manifestPath = Join-Path $unpackRoot "AppxManifest.xml"
     $contract = Test-SteinManifestContract `
@@ -48,26 +52,33 @@ try {
     $brokerPinnedCoreSha256 = Test-SteinCoreBindingContract `
         -BindingPath (Join-Path $unpackRoot "Metadata\CoreBinding.json") `
         -ExpectedCoreSha256 $ExpectedCoreSha256
+    $hostPath = Join-Path $unpackRoot "bin\stein-edge-native-host.exe"
+    $hostSha256 = (Get-FileHash -LiteralPath $hostPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($hostSha256 -cne $ExpectedHostSha256) {
+        throw "The packaged Edge native host does not match the release-bound bytes."
+    }
+    $null = Assert-SteinExactAuthenticodeSignature `
+        -Path $hostPath `
+        -CertificateThumbprint $normalizedThumbprint `
+        -Publisher $Publisher
 
-    $allowedFiles = @(
-        "AppxManifest.xml",
-        "AppxBlockMap.xml",
-        "AppxSignature.p7x",
-        "[Content_Types].xml",
-        "bin\stein-desktop.exe",
-        "bin\stein-private-broker.exe",
-        "Metadata\CoreBinding.json",
-        "Assets\StoreLogo.png",
-        "Assets\Square44x44Logo.png",
-        "Assets\Square150x150Logo.png"
+    $null = Assert-SteinClosedUnpackedPackageLayout -PackageRoot $unpackRoot
+
+    $installedPayloadFiles = @(
+        foreach ($relativePath in @(Get-SteinFixedApplicationPayloadRelativePaths | Sort-Object)) {
+            $payloadPath = Join-Path $unpackRoot $relativePath
+            $payload = Get-Item -LiteralPath $payloadPath -Force -ErrorAction Stop
+            if (($payload.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                $payload.PSIsContainer) {
+                throw "A fixed installed payload entry is not a regular file."
+            }
+            [pscustomobject]@{
+                relative_path = $relativePath
+                size = [long]$payload.Length
+                sha256 = (Get-FileHash -LiteralPath $payload.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+        }
     )
-    $unexpected = Get-ChildItem -LiteralPath $unpackRoot -Recurse -File | Where-Object {
-        $relative = $_.FullName.Substring($unpackRoot.Length).TrimStart("\")
-        $relative -notin $allowedFiles -and -not $relative.StartsWith("AppxMetadata\", [StringComparison]::Ordinal)
-    }
-    if ($unexpected) {
-        throw "MSIX contains a file outside the closed package layout."
-    }
 
     $packageFamilyName = Get-ExactPackageFamilyName `
         -PackageName $contract.PackageName `
@@ -81,7 +92,10 @@ try {
         PackageFamilyName = $packageFamilyName
         DesktopAumid = "$packageFamilyName!$script:DesktopApplicationId"
         BrokerAumid = "$packageFamilyName!$script:BrokerApplicationId"
+        BrowserProducerAumid = "$packageFamilyName!$script:BrowserProducerApplicationId"
         BrokerPinnedCoreSha256 = $brokerPinnedCoreSha256
+        BrowserHostSha256 = $hostSha256
+        InstalledPayloadFiles = $installedPayloadFiles
         Sha256 = (Get-FileHash -LiteralPath $resolvedPackage -Algorithm SHA256).Hash.ToLowerInvariant()
     }
 }

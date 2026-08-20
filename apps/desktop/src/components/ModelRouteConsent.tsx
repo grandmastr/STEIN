@@ -6,12 +6,10 @@ import type {
   ModelRouteView,
   PublicErrorView,
   RevokePermissionInput,
-  SecretMutationView,
-  StoreModelSecretInput,
 } from "../protocol";
 
 const CATEGORIES: Array<{ id: ModelDataCategory; label: string; detail: string }> = [
-  { id: "goal", label: "Goal", detail: "Title, success statement, deadline, and revision." },
+  { id: "goal", label: "Goal · required", detail: "Title, success statement, deadline, and revision." },
   { id: "focus_session", label: "Focus session", detail: "Session identity and elapsed state." },
   { id: "evidence_aggregates", label: "Evidence aggregates", detail: "Content-free freshness and progress summaries." },
   { id: "window_metadata", label: "Window metadata", detail: "Approved bounded titles and metadata." },
@@ -26,8 +24,7 @@ const CATEGORIES: Array<{ id: ModelDataCategory; label: string; detail: string }
 interface Props {
   disabled: boolean;
   routes: ModelRouteView[];
-  onStoreSecret: (input: StoreModelSecretInput) => Promise<SecretMutationView>;
-  onApprove: (input: ApproveModelRouteInput) => Promise<ModelRouteView>;
+  onSetup: (input: ApproveModelRouteInput) => Promise<ModelRouteView>;
   onRevoke: (input: RevokePermissionInput) => Promise<void>;
 }
 
@@ -37,7 +34,7 @@ function localDate(days: number): string {
   return new Date(value.getTime() - offset).toISOString().slice(0, 16);
 }
 
-export function ModelRouteConsent({ disabled, routes, onStoreSecret, onApprove, onRevoke }: Props) {
+export function ModelRouteConsent({ disabled, routes, onSetup, onRevoke }: Props) {
   const [routeId, setRouteId] = useState("");
   const [accountProfile, setAccountProfile] = useState("default");
   const [expiresAt, setExpiresAt] = useState(localDate(30));
@@ -54,6 +51,7 @@ export function ModelRouteConsent({ disabled, routes, onStoreSecret, onApprove, 
   const activeRoutes = useMemo(() => routes.filter((route) => route.state === "active"), [routes]);
 
   function toggleCategory(category: ModelDataCategory) {
+    if (category === "goal") return;
     setCategories((current) =>
       current.includes(category)
         ? current.filter((item) => item !== category)
@@ -80,7 +78,7 @@ export function ModelRouteConsent({ disabled, routes, onStoreSecret, onApprove, 
       retentionKind: "bounded" as const,
       retentionMaximumSeconds: 2_592_000,
       trainingUse: "excluded" as const,
-      handlingProfileVersion: "openai-default-abuse-monitoring-v1",
+      handlingProfileVersion: "openai-responses-default-2026-08",
       purpose: "reason.focus_context",
       maximumRequestTokens: 8_000,
       ...(expiresAt ? { expiresAt: new Date(expiresAt).toISOString() } : {}),
@@ -93,15 +91,20 @@ export function ModelRouteConsent({ disabled, routes, onStoreSecret, onApprove, 
 
     setSubmitting(true);
     try {
-      // This invoke carries only the route identifier. Rust opens Windows
-      // CredUI and writes its private native buffer directly to Credential
-      // Manager; no credential value exists in the DOM or renderer DTO.
-      await onStoreSecret({ routeId: normalizedRoute });
-      const route = await onApprove({ ...approval, idempotencyKey: commandIdentity.current.key });
+      // One invoke carries reviewed route metadata only. Rust validates it,
+      // collects the credential through CredUI into zeroizing native memory,
+      // approves the route, and only then writes Credential Manager under the
+      // returned approval identity. No credential value exists in the DOM or
+      // renderer DTO.
+      const route = await onSetup({ ...approval, idempotencyKey: commandIdentity.current.key });
       commandIdentity.current = null;
       setResult(`Approved ${route.providerId}/${route.routeId}. The credential remains native-only.`);
     } catch (caught) {
-      setError((caught as PublicErrorView).summary ?? "CORE could not configure this route.");
+      const failure = caught as PublicErrorView;
+      // A post-approval store failure revokes that approval best-effort. Its
+      // idempotency key must not replay the revoked result on the next attempt.
+      if (failure.code === "model_route_setup_store_failed") commandIdentity.current = null;
+      setError(failure.summary ?? "CORE could not configure this route.");
     } finally {
       setSubmitting(false);
     }
@@ -161,7 +164,7 @@ export function ModelRouteConsent({ disabled, routes, onStoreSecret, onApprove, 
               <label key={category.id} className="check-card">
                 <input
                   checked={categories.includes(category.id)}
-                  disabled={disabled || submitting}
+                  disabled={disabled || submitting || category.id === "goal"}
                   type="checkbox"
                   onChange={() => toggleCategory(category.id)}
                 />

@@ -17,6 +17,18 @@ param(
     [string]$HostPublisherSha256,
 
     [Parameter(Mandatory = $true)]
+    [ValidatePattern('^STEIN\.PersonalIntelligence_[a-hj-km-np-tv-z0-9]{13}$')]
+    [string]$PackageFamilyName,
+
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')]
+    [string]$PackageVersion,
+
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-f]{64}$')]
+    [string]$HostSha256,
+
+    [Parameter(Mandatory = $true)]
     [string]$InstalledHostPath,
 
     [Parameter(Mandatory = $true)]
@@ -33,12 +45,19 @@ $OutputRoot = [IO.Path]::GetFullPath($OutputDirectory)
 $ReleaseExtension = Join-Path $OutputRoot 'extension'
 $ReleaseHost = Join-Path $OutputRoot 'native-host'
 $HostPath = [IO.Path]::GetFullPath($InstalledHostPath)
+$ExpectedHostName = 'stein-edge-native-host.exe'
 
 if ($ExtensionId -eq ('a' * 32 -join '')) {
     throw 'A placeholder Edge extension ID is not a release identity.'
 }
 if ($EdgePublisherSha256 -eq ('0' * 64 -join '') -or $HostPublisherSha256 -eq ('0' * 64 -join '')) {
     throw 'Publisher certificate digests must be nonzero release values.'
+}
+if ($HostSha256 -eq ('0' * 64 -join '') -or
+    (Split-Path -Leaf $HostPath) -cne $ExpectedHostName -or
+    -not (Test-Path -LiteralPath $HostPath -PathType Leaf) -or
+    (Get-FileHash -LiteralPath $HostPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $HostSha256) {
+    throw 'The native host path and digest must identify the exact installed package-owned host.'
 }
 
 $SourceManifestPath = Join-Path $ExtensionSource 'manifest.json'
@@ -104,8 +123,12 @@ $ReleaseIdentity = [ordered]@{
     host_publisher_sha256 = $HostPublisherSha256
     native_host_name = 'com.stein.personal_intelligence.browser'
     native_host_path = $HostPath
+    native_host_sha256 = $HostSha256
     native_host_registry_key = 'HKCU\SOFTWARE\Microsoft\Edge\NativeMessagingHosts\com.stein.personal_intelligence.browser'
+    package_family_name = $PackageFamilyName
+    package_version = $PackageVersion
     manifest_application_id = 'BrowserObservationProducer'
+    browser_producer_aumid = "$PackageFamilyName!BrowserObservationProducer"
     provenance_state = 'blocked_pending_edge_addons_publication_and_native_launch_fixture'
 }
 $ReleaseIdentityText = $ReleaseIdentity | ConvertTo-Json -Depth 4
