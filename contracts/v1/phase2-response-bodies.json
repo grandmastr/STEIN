@@ -1,0 +1,682 @@
+[
+  {
+    "response_type": "update_goal",
+    "payload": {
+      "goal": {
+        "goal_id": "018f0000-0000-7000-8000-000000000101",
+        "revision": 2,
+        "owner_id": "018f0000-0000-7000-8000-000000000001",
+        "title": "Synthetic Atlas brief",
+        "success_statement": "Introduction, options, and recommendation are drafted.",
+        "deadline": "2026-08-19T15:00:00Z",
+        "state": "active",
+        "created_at": "2026-08-19T14:00:00Z",
+        "updated_at": "2026-08-19T14:01:00Z"
+      }
+    }
+  },
+  {
+    "response_type": "complete_goal",
+    "payload": {
+      "goal": {
+        "goal_id": "018f0000-0000-7000-8000-000000000101",
+        "revision": 3,
+        "owner_id": "018f0000-0000-7000-8000-000000000001",
+        "title": "Synthetic Atlas brief",
+        "success_statement": "Introduction, options, and recommendation are drafted.",
+        "deadline": "2026-08-19T15:00:00Z",
+        "state": "completed",
+        "created_at": "2026-08-19T14:00:00Z",
+        "updated_at": "2026-08-19T14:42:00Z"
+      }
+    }
+  },
+  {
+    "response_type": "abandon_goal",
+    "payload": {
+      "goal": {
+        "goal_id": "018f0000-0000-7000-8000-000000000101",
+        "revision": 3,
+        "owner_id": "018f0000-0000-7000-8000-000000000001",
+        "title": "Synthetic Atlas brief",
+        "success_statement": "Introduction, options, and recommendation are drafted.",
+        "deadline": "2026-08-19T15:00:00Z",
+        "state": "abandoned",
+        "created_at": "2026-08-19T14:00:00Z",
+        "updated_at": "2026-08-19T14:42:00Z"
+      }
+    }
+  },
+  {
+    "response_type": "approve_model_route",
+    "payload": {
+      "approval": {
+        "model_route_approval_id": "018f0000-0000-7000-8000-000000000501",
+        "revision": 1,
+        "owner_id": "018f0000-0000-7000-8000-000000000001",
+        "route": {
+          "provider_id": "synthetic-provider",
+          "route_id": "synthetic-text-route",
+          "placement": "remote"
+        },
+        "account_profile": "default",
+        "allowed_data_categories": [
+          "goal",
+          "focus_session",
+          "evidence_aggregates",
+          "selected_document",
+          "delivery_constraints"
+        ],
+        "handling": {
+          "retention": {
+            "kind": "bounded",
+            "maximum_seconds": 0
+          },
+          "training_use": "excluded",
+          "data_residency": "synthetic-region",
+          "profile_version": "synthetic-handling-v1"
+        },
+        "purpose": "reason.focus_context",
+        "maximum_request_tokens": 800,
+        "state": "active",
+        "effective_at": "2026-08-19T14:00:00Z",
+        "expires_at": "2026-08-20T14:00:00Z",
+        "disclosure_version": "synthetic-disclosure-v1"
+      }
+    }
+  },
+  {
+    "response_type": "grant_session_permission",
+    "payload": {
+      "permission": {
+        "permission_grant_id": "018f0000-0000-7000-8000-000000000401",
+        "revision": 1,
+        "owner_id": "018f0000-0000-7000-8000-000000000001",
+        "requested_by_client": "018f0000-0000-7000-8000-000000000011",
+        "device_id": "018f0000-0000-7000-8000-000000000201",
+        "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+        "goal_id": "018f0000-0000-7000-8000-000000000101",
+        "scope": "observe.content.selected_document",
+        "selected_resource_id": "018f0000-0000-7000-8000-000000000301",
+        "purpose": "Maintain bounded context for the synthetic focus session.",
+        "continuity": {
+          "while_client_disconnected": true,
+          "after_daemon_restart": true
+        },
+        "state": "active",
+        "effective_at": "2026-08-19T14:00:00Z",
+        "expires_at": "2026-08-19T15:05:00Z",
+        "consent_copy_version": "synthetic-consent-v1",
+        "sensitivity": "sensitive",
+        "retention": "durable_until_expiry"
+      }
+    }
+  },
+  {
+    "response_type": "revoke_permission",
+    "payload": {
+      "permission": {
+        "record_type": "session_grant",
+        "record": {
+          "permission_grant_id": "018f0000-0000-7000-8000-000000000401",
+        "revision": 2,
+        "owner_id": "018f0000-0000-7000-8000-000000000001",
+        "requested_by_client": "018f0000-0000-7000-8000-000000000011",
+        "device_id": "018f0000-0000-7000-8000-000000000201",
+        "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+        "goal_id": "018f0000-0000-7000-8000-000000000101",
+        "scope": "observe.content.selected_document",
+        "selected_resource_id": "018f0000-0000-7000-8000-000000000301",
+        "purpose": "Maintain bounded context for the synthetic focus session.",
+        "continuity": {
+          "while_client_disconnected": true,
+          "after_daemon_restart": true
+        },
+        "state": "revoked",
+        "effective_at": "2026-08-19T14:00:00Z",
+        "expires_at": "2026-08-19T15:05:00Z",
+        "consent_copy_version": "synthetic-consent-v1",
+        "sensitivity": "sensitive",
+        "retention": "durable_until_expiry",
+        "revoked_at": "2026-08-19T14:42:00Z",
+          "revocation_reason": "Synthetic user stop."
+        }
+      }
+    }
+  },
+  {
+    "response_type": "start_focus_session",
+    "payload": {
+      "focus_session": {
+        "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+        "revision": 1,
+        "goal_id": "018f0000-0000-7000-8000-000000000101",
+        "goal_revision": 2,
+        "state": "starting",
+        "interventions_muted": false,
+        "source_degraded": false,
+        "model_route_approval_id": "018f0000-0000-7000-8000-000000000501",
+        "permission_grant_ids": [
+          "018f0000-0000-7000-8000-000000000401"
+        ],
+        "selected_resource_ids": [
+          "018f0000-0000-7000-8000-000000000301"
+        ],
+        "continuity": {
+          "while_client_disconnected": true,
+          "after_daemon_restart": true
+        },
+        "created_at": "2026-08-19T14:00:00Z",
+        "updated_at": "2026-08-19T14:01:00Z"
+      }
+    }
+  },
+  {
+    "response_type": "set_interventions_muted",
+    "payload": {
+      "focus_session": {
+        "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+        "revision": 2,
+        "goal_id": "018f0000-0000-7000-8000-000000000101",
+        "goal_revision": 2,
+        "state": "active",
+        "interventions_muted": true,
+        "source_degraded": false,
+        "model_route_approval_id": "018f0000-0000-7000-8000-000000000501",
+        "permission_grant_ids": [
+          "018f0000-0000-7000-8000-000000000401"
+        ],
+        "selected_resource_ids": [
+          "018f0000-0000-7000-8000-000000000301"
+        ],
+        "continuity": {
+          "while_client_disconnected": true,
+          "after_daemon_restart": true
+        },
+        "created_at": "2026-08-19T14:00:00Z",
+        "updated_at": "2026-08-19T14:42:00Z",
+        "started_at": "2026-08-19T14:01:00Z"
+      }
+    }
+  },
+  {
+    "response_type": "end_focus_session",
+    "payload": {
+      "focus_session": {
+        "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+        "revision": 3,
+        "goal_id": "018f0000-0000-7000-8000-000000000101",
+        "goal_revision": 2,
+        "state": "stopping",
+        "interventions_muted": false,
+        "source_degraded": false,
+        "model_route_approval_id": "018f0000-0000-7000-8000-000000000501",
+        "permission_grant_ids": [
+          "018f0000-0000-7000-8000-000000000401"
+        ],
+        "selected_resource_ids": [
+          "018f0000-0000-7000-8000-000000000301"
+        ],
+        "continuity": {
+          "while_client_disconnected": true,
+          "after_daemon_restart": true
+        },
+        "created_at": "2026-08-19T14:00:00Z",
+        "updated_at": "2026-08-19T14:42:00Z",
+        "started_at": "2026-08-19T14:01:00Z"
+      }
+    }
+  },
+  {
+    "response_type": "record_intervention_feedback",
+    "payload": {
+      "intervention": {
+        "intervention_id": "018f0000-0000-7000-8000-000000000901",
+        "revision": 2,
+        "candidate_revision": 1,
+        "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+        "goal_id": "018f0000-0000-7000-8000-000000000101",
+        "urgency": "normal",
+        "reason_codes": [
+          "deadline_near",
+          "success_condition_unobserved"
+        ],
+        "state": "accepted_by_channel",
+        "outcome": "corrected",
+        "user_visible_text": "You have 18 minutes left. The selected brief may still need its recommendation.",
+        "delivery_channel_id": "018f0000-0000-7000-8000-000000000801",
+        "sensitivity": "personal",
+        "retention": "bounded_audit",
+        "created_at": "2026-08-19T14:42:00Z",
+        "expires_at": "2026-08-19T15:00:00Z",
+        "updated_at": "2026-08-19T14:44:00Z"
+      },
+      "outcome": "corrected",
+      "context_correction_applied": true
+    }
+  },
+  {
+    "response_type": "get_goal",
+    "payload": {
+      "goal": {
+        "goal_id": "018f0000-0000-7000-8000-000000000101",
+        "revision": 2,
+        "owner_id": "018f0000-0000-7000-8000-000000000001",
+        "title": "Synthetic Atlas brief",
+        "success_statement": "Introduction, options, and recommendation are drafted.",
+        "deadline": "2026-08-19T15:00:00Z",
+        "state": "active",
+        "created_at": "2026-08-19T14:00:00Z",
+        "updated_at": "2026-08-19T14:01:00Z"
+      }
+    }
+  },
+  {
+    "response_type": "get_focus_session_view",
+    "payload": {
+      "focus_session": {
+        "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+        "revision": 1,
+        "goal_id": "018f0000-0000-7000-8000-000000000101",
+        "goal_revision": 2,
+        "state": "active",
+        "interventions_muted": false,
+        "source_degraded": false,
+        "model_route_approval_id": "018f0000-0000-7000-8000-000000000501",
+        "permission_grant_ids": [
+          "018f0000-0000-7000-8000-000000000401"
+        ],
+        "selected_resource_ids": [
+          "018f0000-0000-7000-8000-000000000301"
+        ],
+        "continuity": {
+          "while_client_disconnected": true,
+          "after_daemon_restart": true
+        },
+        "created_at": "2026-08-19T14:00:00Z",
+        "updated_at": "2026-08-19T14:42:00Z",
+        "started_at": "2026-08-19T14:01:00Z"
+      },
+      "capture": {
+        "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+        "revision": 1,
+        "state": "active",
+        "active_categories": [
+          "selected_document"
+        ],
+        "sources": [
+          {
+            "observation_source_id": "018f0000-0000-7000-8000-000000000701",
+            "category": "selected_document",
+            "selected_resource_id": "018f0000-0000-7000-8000-000000000301",
+            "health": "healthy",
+            "last_complete_at": "2026-08-19T14:41:30Z"
+          }
+        ],
+        "native_status_visible": true,
+        "emergency_stop_available": true,
+        "updated_at": "2026-08-19T14:42:00Z"
+      }
+    }
+  },
+  {
+    "response_type": "get_capability_health",
+    "payload": {
+      "capabilities": [
+        {
+          "capability": "focus_sessions",
+          "schema_version": 1,
+          "state": "healthy"
+        }
+      ]
+    }
+  },
+  {
+    "response_type": "get_permission_view",
+    "payload": {
+      "records": [
+        {
+          "record_type": "session_grant",
+          "record": {
+            "permission_grant_id": "018f0000-0000-7000-8000-000000000401",
+            "revision": 1,
+            "owner_id": "018f0000-0000-7000-8000-000000000001",
+            "requested_by_client": "018f0000-0000-7000-8000-000000000011",
+            "device_id": "018f0000-0000-7000-8000-000000000201",
+            "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+            "goal_id": "018f0000-0000-7000-8000-000000000101",
+            "scope": "observe.content.selected_document",
+            "selected_resource_id": "018f0000-0000-7000-8000-000000000301",
+            "purpose": "Maintain bounded context for the synthetic focus session.",
+            "continuity": {
+              "while_client_disconnected": true,
+              "after_daemon_restart": true
+            },
+            "state": "active",
+            "effective_at": "2026-08-19T14:00:00Z",
+            "expires_at": "2026-08-19T15:05:00Z",
+            "consent_copy_version": "synthetic-consent-v1",
+            "sensitivity": "sensitive",
+            "retention": "durable_until_expiry"
+          }
+        },
+        {
+          "record_type": "model_route_approval",
+          "record": {
+            "model_route_approval_id": "018f0000-0000-7000-8000-000000000501",
+            "revision": 1,
+            "owner_id": "018f0000-0000-7000-8000-000000000001",
+            "route": {
+              "provider_id": "synthetic-provider",
+              "route_id": "synthetic-text-route",
+              "placement": "remote"
+            },
+            "account_profile": "default",
+            "allowed_data_categories": [
+              "goal",
+              "focus_session",
+              "evidence_aggregates",
+              "selected_document",
+              "delivery_constraints"
+            ],
+            "handling": {
+              "retention": {
+                "kind": "bounded",
+                "maximum_seconds": 0
+              },
+              "training_use": "excluded",
+              "data_residency": "synthetic-region",
+              "profile_version": "synthetic-handling-v1"
+            },
+            "purpose": "reason.focus_context",
+            "maximum_request_tokens": 800,
+            "state": "active",
+            "effective_at": "2026-08-19T14:00:00Z",
+            "expires_at": "2026-08-20T14:00:00Z",
+            "disclosure_version": "synthetic-disclosure-v1"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "response_type": "get_intervention_history",
+    "payload": {
+      "history": {
+        "as_of": "2026-08-19T14:42:00Z",
+        "entries": [
+          {
+            "intervention_id": "018f0000-0000-7000-8000-000000000901",
+            "revision": 1,
+            "candidate_revision": 1,
+            "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+            "goal_id": "018f0000-0000-7000-8000-000000000101",
+            "urgency": "normal",
+            "reason_codes": [
+              "deadline_near",
+              "success_condition_unobserved"
+            ],
+            "state": "accepted_by_channel",
+            "outcome": "unacknowledged",
+            "user_visible_text": "You have 18 minutes left. The selected brief may still need its recommendation.",
+            "delivery_channel_id": "018f0000-0000-7000-8000-000000000801",
+            "sensitivity": "personal",
+            "retention": "bounded_audit",
+            "created_at": "2026-08-19T14:42:00Z",
+            "expires_at": "2026-08-19T15:00:00Z",
+            "updated_at": "2026-08-19T14:42:00Z"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "response_type": "explain_intervention",
+    "payload": {
+      "explanation": {
+        "intervention_id": "018f0000-0000-7000-8000-000000000901",
+        "candidate_revision": 1,
+        "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+        "evidence": [
+          {
+            "category": "selected_document",
+            "freshness": "fresh",
+            "confidence": "medium",
+            "role": "supports_deadline_risk",
+            "observed_from": "2026-08-19T14:40:00Z",
+            "observed_until": "2026-08-19T14:41:30Z"
+          }
+        ],
+        "decision": {
+          "policy_decision_id": "018f0000-0000-7000-8000-000000000a01",
+          "policy_version": "synthetic-policy-v1",
+          "outcome": "allow",
+          "reason_codes": [
+            "deadline_near",
+            "success_condition_unobserved"
+          ],
+          "authority": [
+            {
+              "authority_id": "018f0000-0000-7000-8000-000000000b01",
+              "revision": 1
+            }
+          ],
+          "issued_at": "2026-08-19T14:42:00Z",
+          "expires_at": "2026-08-19T14:43:00Z"
+        },
+        "delivery_state": "accepted_by_channel",
+        "outcome": "unacknowledged",
+        "delivered_text": "You have 18 minutes left. The selected brief may still need its recommendation.",
+        "correction_recorded": false
+      }
+    }
+  },
+  {
+    "response_type": "delete_goal",
+    "payload": {
+      "tombstone": {
+        "goal_id": "018f0000-0000-7000-8000-000000000101",
+        "deleted_revision": 3,
+        "deleted_at": "2026-08-19T14:45:00Z",
+        "focus_sessions_deleted": 1,
+        "grants_deleted": 1,
+        "interventions_deleted": 1,
+        "pending_deliveries_deleted": 0,
+        "private_audit_records_deleted": 2,
+        "resource_bindings_deleted": 1
+      },
+      "already_deleted": false
+    }
+  },
+  {
+    "response_type": "register_selected_resource",
+    "payload": {
+      "resource": {
+        "selected_resource_id": "018f0000-0000-7000-8000-000000000301",
+        "kind": "document",
+        "display_name": "Synthetic Atlas brief",
+        "revision": 1,
+        "created_at": "2026-08-19T14:00:00Z"
+      }
+    }
+  },
+  {
+    "response_type": "remove_selected_resource",
+    "payload": {
+      "tombstone": {
+        "selected_resource_id": "018f0000-0000-7000-8000-000000000301",
+        "deleted_revision": 1,
+        "deleted_at": "2026-08-19T14:46:00Z"
+      }
+    }
+  },
+  {
+    "response_type": "update_user_preferences",
+    "payload": {
+      "preferences": {
+        "schema_version": 1,
+        "owner_id": "018f0000-0000-7000-8000-000000000001",
+        "revision": 2,
+        "preferred_form_of_address": "Synthetic collaborator",
+        "intervention_style": "concise",
+        "proactive_enabled": true,
+        "proactive_muted": false,
+        "maximum_interventions_per_session": 3,
+        "maximum_model_requests_per_hour": 12,
+        "minimum_intervention_cooldown_ms": 300000,
+        "do_not_disturb_windows": [
+          {
+            "start_minute_local": 1320,
+            "end_minute_local": 420,
+            "utc_offset_minutes": 60
+          }
+        ],
+        "allowed_delivery_channels": [
+          "native_desktop_notification",
+          "connected_desktop"
+        ],
+        "remote_processing_enabled": false,
+        "restart_continuity_default": true,
+        "provenance": {
+          "source": "direct_user",
+          "version": "synthetic-preferences-v1",
+          "recorded_at": "2026-08-19T14:47:00Z"
+        }
+      },
+      "effective_policy": {
+        "schema_version": 1,
+        "policy_profile_id": "synthetic-policy-v1",
+        "user_preferences_revision": 2,
+        "source_stale_after_ms": 30000,
+        "maximum_model_evidence_age_ms": 120000,
+        "model_request_cooldown_ms": 60000,
+        "maximum_model_requests_per_hour": 12,
+        "intervention_cooldown_ms": 300000,
+        "maximum_interventions_per_session": 3,
+        "proactive_enabled": true,
+        "proactive_muted": false,
+        "do_not_disturb_windows": [
+          {
+            "start_minute_local": 1320,
+            "end_minute_local": 420,
+            "utc_offset_minutes": 60
+          }
+        ],
+        "allowed_delivery_channels": [
+          "native_desktop_notification",
+          "connected_desktop"
+        ],
+        "remote_processing_enabled": false,
+        "restart_continuity_default": true,
+        "outbox_capacity_per_user": 20,
+        "outbox_capacity_per_session": 5
+      }
+    }
+  },
+  {
+    "response_type": "get_stein_identity",
+    "payload": {
+      "identity": {
+        "schema_version": 1,
+        "owner_id": "018f0000-0000-7000-8000-000000000001",
+        "revision": 1,
+        "display_name": "STEIN",
+        "role_statement": "A synthetic second mind that advises while the user decides and acts.",
+        "invariant_behavioral_constraints": [
+          "advises_rather_than_acts",
+          "preserves_uncertainty",
+          "respects_silence",
+          "never_impersonates_user",
+          "never_bypasses_policy"
+        ],
+        "provenance": {
+          "source": "product_default",
+          "version": "synthetic-identity-v1",
+          "recorded_at": "2026-08-19T14:00:00Z"
+        }
+      }
+    }
+  },
+  {
+    "response_type": "get_user_preferences",
+    "payload": {
+      "preferences": {
+        "schema_version": 1,
+        "owner_id": "018f0000-0000-7000-8000-000000000001",
+        "revision": 2,
+        "preferred_form_of_address": "Synthetic collaborator",
+        "intervention_style": "concise",
+        "proactive_enabled": true,
+        "proactive_muted": false,
+        "maximum_interventions_per_session": 3,
+        "maximum_model_requests_per_hour": 12,
+        "minimum_intervention_cooldown_ms": 300000,
+        "do_not_disturb_windows": [
+          {
+            "start_minute_local": 1320,
+            "end_minute_local": 420,
+            "utc_offset_minutes": 60
+          }
+        ],
+        "allowed_delivery_channels": [
+          "native_desktop_notification",
+          "connected_desktop"
+        ],
+        "remote_processing_enabled": false,
+        "restart_continuity_default": true,
+        "provenance": {
+          "source": "direct_user",
+          "version": "synthetic-preferences-v1",
+          "recorded_at": "2026-08-19T14:47:00Z"
+        }
+      }
+    }
+  },
+  {
+    "response_type": "get_effective_policy",
+    "payload": {
+      "effective_policy": {
+        "schema_version": 1,
+        "policy_profile_id": "synthetic-policy-v1",
+        "user_preferences_revision": 2,
+        "source_stale_after_ms": 30000,
+        "maximum_model_evidence_age_ms": 120000,
+        "model_request_cooldown_ms": 60000,
+        "maximum_model_requests_per_hour": 12,
+        "intervention_cooldown_ms": 300000,
+        "maximum_interventions_per_session": 3,
+        "proactive_enabled": true,
+        "proactive_muted": false,
+        "do_not_disturb_windows": [
+          {
+            "start_minute_local": 1320,
+            "end_minute_local": 420,
+            "utc_offset_minutes": 60
+          }
+        ],
+        "allowed_delivery_channels": [
+          "native_desktop_notification",
+          "connected_desktop"
+        ],
+        "remote_processing_enabled": false,
+        "restart_continuity_default": true,
+        "outbox_capacity_per_user": 20,
+        "outbox_capacity_per_session": 5
+      }
+    }
+  },
+  {
+    "response_type": "get_selected_resources",
+    "payload": {
+      "resources": [
+        {
+          "selected_resource_id": "018f0000-0000-7000-8000-000000000301",
+          "kind": "document",
+          "display_name": "Synthetic Atlas brief",
+          "revision": 1,
+          "created_at": "2026-08-19T14:00:00Z"
+        }
+      ]
+    }
+  }
+]

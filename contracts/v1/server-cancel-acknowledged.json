@@ -1,0 +1,16 @@
+{
+  "message_type": "cancel_acknowledged",
+  "body": {
+    "message_id": "018f0000-0000-7001-8000-000000000039",
+    "issued_at": "2026-08-19T08:00:04Z",
+    "correlation_id": "018f0000-0000-7001-8000-000000000008",
+    "causation_id": "018f0000-0000-7001-8000-000000000011",
+    "actor": {
+      "actor_id": "018f0000-0000-7001-8000-000000000002",
+      "kind": "core_daemon"
+    },
+    "target_request_id": "018f0000-0000-7001-8000-000000000006",
+    "cancellation_id": "018f0000-0000-7001-8000-000000000010",
+    "status": "cancellation_requested"
+  }
+}

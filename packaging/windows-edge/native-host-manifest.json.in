@@ -1,0 +1,9 @@
+{
+  "name": "com.stein.personal_intelligence.browser",
+  "description": "STEIN selected Microsoft Edge surface bridge",
+  "path": "__STEIN_NATIVE_HOST_PATH__",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://__STEIN_EDGE_EXTENSION_ID__/"
+  ]
+}

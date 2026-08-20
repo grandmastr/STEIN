@@ -1,0 +1,17 @@
+{
+  "message_type": "event_gap",
+  "body": {
+    "message_id": "018f0000-0000-7001-8000-000000000015",
+    "occurred_at": "2026-08-19T08:00:03Z",
+    "reason": "sequence_mismatch",
+    "expected_cursor": {
+      "daemon_instance_id": "018f0000-0000-7001-8000-000000000002",
+      "sequence": 6
+    },
+    "observed_cursor": {
+      "daemon_instance_id": "018f0000-0000-7001-8000-000000000002",
+      "sequence": 8
+    },
+    "action": "reconnect_for_snapshot"
+  }
+}

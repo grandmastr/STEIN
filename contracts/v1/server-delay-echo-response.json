@@ -1,0 +1,30 @@
+{
+  "message_type": "response",
+  "body": {
+    "request_id": "018f0000-0000-7001-8000-000000000027",
+    "metadata": {
+      "message_id": "018f0000-0000-7001-8000-000000000037",
+      "schema_version": 1,
+      "issued_at": "2026-08-19T08:00:04Z",
+      "correlation_id": "018f0000-0000-7001-8000-000000000029",
+      "causation_id": "018f0000-0000-7001-8000-000000000028",
+      "actor": {
+        "actor_id": "018f0000-0000-7001-8000-000000000004",
+        "kind": "local_os_user"
+      },
+      "origin": "core_daemon",
+      "sensitivity": "personal",
+      "retention": "runtime"
+    },
+    "outcome": {
+      "outcome": "success",
+      "body": {
+        "response_type": "delay_echo",
+        "payload": {
+          "text": "synthetic echo",
+          "completed_after_ms": 25
+        }
+      }
+    }
+  }
+}

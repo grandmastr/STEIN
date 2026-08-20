@@ -1,0 +1,23 @@
+[package]
+name = "stein-edge-native-host"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+publish = false
+build = "build.rs"
+
+[workspace]
+
+[features]
+default = []
+production-edge-host = []
+
+[dependencies]
+serde_json = "1.0"
+stein-platform-windows = { path = "../../crates/stein-platform-windows" }
+zeroize = "1.9"
+
+[[bin]]
+name = "stein-edge-native-host"
+path = "src/main.rs"

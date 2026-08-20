@@ -1,0 +1,50 @@
+{
+  "message_type": "response",
+  "body": {
+    "request_id": "018f0000-0000-7001-8000-000000000021",
+    "metadata": {
+      "message_id": "018f0000-0000-7001-8000-000000000034",
+      "schema_version": 1,
+      "issued_at": "2026-08-19T08:00:04Z",
+      "correlation_id": "018f0000-0000-7001-8000-000000000023",
+      "causation_id": "018f0000-0000-7001-8000-000000000022",
+      "actor": {
+        "actor_id": "018f0000-0000-7001-8000-000000000004",
+        "kind": "local_os_user"
+      },
+      "origin": "core_daemon",
+      "sensitivity": "personal",
+      "retention": "runtime"
+    },
+    "outcome": {
+      "outcome": "success",
+      "body": {
+        "response_type": "get_snapshot",
+        "payload": {
+          "snapshot": {
+            "snapshot_id": "018f0000-0000-7001-8000-000000000035",
+            "as_of": "2026-08-19T08:00:04Z",
+            "cursor": {
+              "daemon_instance_id": "018f0000-0000-7001-8000-000000000002",
+              "sequence": 5
+            },
+            "runtime": {
+              "daemon_instance_id": "018f0000-0000-7001-8000-000000000002",
+              "state": "ready",
+              "started_at": "2026-08-19T07:59:00Z",
+              "observed_at": "2026-08-19T08:00:04Z",
+              "build_id": "0.1.0-poc",
+              "protocol_version": {
+                "major": 1,
+                "minor": 0
+              },
+              "active_connections": 1
+            },
+            "capabilities": [],
+            "goals": []
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "message_type": "fatal",
+  "body": {
+    "reason": "malformed_frame",
+    "error": {
+      "code": "invalid_argument",
+      "category": "invalid_argument",
+      "summary": "The client frame could not be decoded.",
+      "retryable": false,
+      "correlation_id": "018f0000-0000-7001-8000-000000000042"
+    }
+  }
+}

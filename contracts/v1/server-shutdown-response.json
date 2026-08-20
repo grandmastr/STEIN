@@ -1,0 +1,30 @@
+{
+  "message_type": "response",
+  "body": {
+    "request_id": "018f0000-0000-7001-8000-000000000031",
+    "metadata": {
+      "message_id": "018f0000-0000-7001-8000-000000000038",
+      "schema_version": 1,
+      "issued_at": "2026-08-19T08:00:04Z",
+      "correlation_id": "018f0000-0000-7001-8000-000000000033",
+      "causation_id": "018f0000-0000-7001-8000-000000000032",
+      "actor": {
+        "actor_id": "018f0000-0000-7001-8000-000000000004",
+        "kind": "local_os_user"
+      },
+      "origin": "core_daemon",
+      "sensitivity": "operational",
+      "retention": "runtime"
+    },
+    "outcome": {
+      "outcome": "success",
+      "body": {
+        "response_type": "shutdown",
+        "payload": {
+          "daemon_instance_id": "018f0000-0000-7001-8000-000000000002",
+          "accepted": true
+        }
+      }
+    }
+  }
+}

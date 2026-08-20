@@ -1,0 +1,281 @@
+[
+  {
+    "event_type": "focus_session_view_changed",
+    "payload": {
+      "change": "started",
+      "focus_session": {
+        "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+        "revision": 1,
+        "goal_id": "018f0000-0000-7000-8000-000000000101",
+        "goal_revision": 2,
+        "state": "active",
+        "interventions_muted": false,
+        "source_degraded": false,
+        "model_route_approval_id": "018f0000-0000-7000-8000-000000000501",
+        "permission_grant_ids": [
+          "018f0000-0000-7000-8000-000000000401"
+        ],
+        "selected_resource_ids": [
+          "018f0000-0000-7000-8000-000000000301"
+        ],
+        "continuity": {
+          "while_client_disconnected": true,
+          "after_daemon_restart": true
+        },
+        "created_at": "2026-08-19T14:00:00Z",
+        "started_at": "2026-08-19T14:01:00Z",
+        "updated_at": "2026-08-19T14:42:00Z"
+      }
+    }
+  },
+  {
+    "event_type": "capture_state_changed",
+    "payload": {
+      "capture": {
+        "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+        "revision": 1,
+        "state": "active",
+        "active_categories": [
+          "selected_document"
+        ],
+        "sources": [
+          {
+            "observation_source_id": "018f0000-0000-7000-8000-000000000701",
+            "category": "selected_document",
+            "selected_resource_id": "018f0000-0000-7000-8000-000000000301",
+            "health": "healthy",
+            "last_complete_at": "2026-08-19T14:41:30Z"
+          }
+        ],
+        "native_status_visible": true,
+        "emergency_stop_available": true,
+        "updated_at": "2026-08-19T14:42:00Z"
+      }
+    }
+  },
+  {
+    "event_type": "capability_health_changed",
+    "payload": {
+      "capability": {
+        "capability": "desktop_observation",
+        "schema_version": 1,
+        "state": "healthy"
+      }
+    }
+  },
+  {
+    "event_type": "delivery_channel_view_changed",
+    "payload": {
+      "channel": {
+        "delivery_channel_id": "018f0000-0000-7000-8000-000000000801",
+        "class": "native_desktop_notification",
+        "state": "healthy",
+        "may_show_content_while_locked": false,
+        "observed_at": "2026-08-19T14:42:00Z"
+      }
+    }
+  },
+  {
+    "event_type": "permission_view_changed",
+    "payload": {
+      "change": "granted",
+      "permission": {
+        "record_type": "session_grant",
+        "record": {
+          "permission_grant_id": "018f0000-0000-7000-8000-000000000401",
+          "revision": 1,
+          "owner_id": "018f0000-0000-7000-8000-000000000001",
+          "requested_by_client": "018f0000-0000-7000-8000-000000000011",
+          "device_id": "018f0000-0000-7000-8000-000000000201",
+          "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+          "goal_id": "018f0000-0000-7000-8000-000000000101",
+          "scope": "observe.content.selected_document",
+          "selected_resource_id": "018f0000-0000-7000-8000-000000000301",
+          "purpose": "Maintain bounded context for the synthetic focus session.",
+          "continuity": {
+            "while_client_disconnected": true,
+            "after_daemon_restart": true
+          },
+          "state": "active",
+          "effective_at": "2026-08-19T14:00:00Z",
+          "expires_at": "2026-08-19T15:05:00Z",
+          "consent_copy_version": "synthetic-consent-v1",
+          "sensitivity": "sensitive",
+          "retention": "durable_until_expiry"
+        }
+      }
+    }
+  },
+  {
+    "event_type": "intervention_available",
+    "payload": {
+      "intervention": {
+        "intervention_id": "018f0000-0000-7000-8000-000000000901",
+        "revision": 1,
+        "candidate_revision": 1,
+        "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+        "goal_id": "018f0000-0000-7000-8000-000000000101",
+        "urgency": "normal",
+        "reason_codes": [
+          "deadline_near",
+          "success_condition_unobserved"
+        ],
+        "state": "accepted_by_channel",
+        "outcome": "unacknowledged",
+        "user_visible_text": "You have 18 minutes left. The selected brief may still need its recommendation.",
+        "delivery_channel_id": "018f0000-0000-7000-8000-000000000801",
+        "sensitivity": "personal",
+        "retention": "bounded_audit",
+        "created_at": "2026-08-19T14:42:00Z",
+        "expires_at": "2026-08-19T15:00:00Z",
+        "updated_at": "2026-08-19T14:42:00Z"
+      }
+    }
+  },
+  {
+    "event_type": "intervention_view_changed",
+    "payload": {
+      "intervention": {
+        "intervention_id": "018f0000-0000-7000-8000-000000000901",
+        "revision": 2,
+        "candidate_revision": 1,
+        "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+        "goal_id": "018f0000-0000-7000-8000-000000000101",
+        "urgency": "normal",
+        "reason_codes": [
+          "deadline_near",
+          "success_condition_unobserved"
+        ],
+        "state": "accepted_by_channel",
+        "outcome": "accepted",
+        "user_visible_text": "You have 18 minutes left. The selected brief may still need its recommendation.",
+        "delivery_channel_id": "018f0000-0000-7000-8000-000000000801",
+        "sensitivity": "personal",
+        "retention": "bounded_audit",
+        "created_at": "2026-08-19T14:42:00Z",
+        "expires_at": "2026-08-19T15:00:00Z",
+        "updated_at": "2026-08-19T14:44:00Z"
+      }
+    }
+  },
+  {
+    "event_type": "intervention_history_changed",
+    "payload": {
+      "change": "added",
+      "intervention_id": "018f0000-0000-7000-8000-000000000901",
+      "entry": {
+        "intervention_id": "018f0000-0000-7000-8000-000000000901",
+        "revision": 1,
+        "candidate_revision": 1,
+        "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+        "goal_id": "018f0000-0000-7000-8000-000000000101",
+        "urgency": "normal",
+        "reason_codes": [
+          "deadline_near",
+          "success_condition_unobserved"
+        ],
+        "state": "accepted_by_channel",
+        "outcome": "unacknowledged",
+        "user_visible_text": "You have 18 minutes left. The selected brief may still need its recommendation.",
+        "delivery_channel_id": "018f0000-0000-7000-8000-000000000801",
+        "sensitivity": "personal",
+        "retention": "bounded_audit",
+        "created_at": "2026-08-19T14:42:00Z",
+        "expires_at": "2026-08-19T15:00:00Z",
+        "updated_at": "2026-08-19T14:42:00Z"
+      }
+    }
+  },
+  {
+    "event_type": "goal_deleted",
+    "payload": {
+      "tombstone": {
+        "goal_id": "018f0000-0000-7000-8000-000000000101",
+        "deleted_revision": 3,
+        "deleted_at": "2026-08-19T14:45:00Z",
+        "focus_sessions_deleted": 1,
+        "grants_deleted": 1,
+        "interventions_deleted": 1,
+        "pending_deliveries_deleted": 0,
+        "private_audit_records_deleted": 2,
+        "resource_bindings_deleted": 1
+      }
+    }
+  },
+  {
+    "event_type": "selected_resource_view_changed",
+    "payload": {
+      "change": "registered",
+      "resource": {
+        "selected_resource_id": "018f0000-0000-7000-8000-000000000301",
+        "kind": "document",
+        "display_name": "Synthetic Atlas brief",
+        "revision": 1,
+        "created_at": "2026-08-19T14:00:00Z"
+      }
+    }
+  },
+  {
+    "event_type": "user_preferences_view_changed",
+    "payload": {
+      "preferences": {
+        "schema_version": 1,
+        "owner_id": "018f0000-0000-7000-8000-000000000001",
+        "revision": 2,
+        "preferred_form_of_address": "Synthetic collaborator",
+        "intervention_style": "concise",
+        "proactive_enabled": true,
+        "proactive_muted": false,
+        "maximum_interventions_per_session": 3,
+        "maximum_model_requests_per_hour": 12,
+        "minimum_intervention_cooldown_ms": 300000,
+        "do_not_disturb_windows": [
+          {
+            "start_minute_local": 1320,
+            "end_minute_local": 420,
+            "utc_offset_minutes": 60
+          }
+        ],
+        "allowed_delivery_channels": [
+          "native_desktop_notification",
+          "connected_desktop"
+        ],
+        "remote_processing_enabled": false,
+        "restart_continuity_default": true,
+        "provenance": {
+          "source": "direct_user",
+          "version": "synthetic-preferences-v1",
+          "recorded_at": "2026-08-19T14:47:00Z"
+        }
+      },
+      "effective_policy": {
+        "schema_version": 1,
+        "policy_profile_id": "synthetic-policy-v1",
+        "user_preferences_revision": 2,
+        "source_stale_after_ms": 30000,
+        "maximum_model_evidence_age_ms": 120000,
+        "model_request_cooldown_ms": 60000,
+        "maximum_model_requests_per_hour": 12,
+        "intervention_cooldown_ms": 300000,
+        "maximum_interventions_per_session": 3,
+        "proactive_enabled": true,
+        "proactive_muted": false,
+        "do_not_disturb_windows": [
+          {
+            "start_minute_local": 1320,
+            "end_minute_local": 420,
+            "utc_offset_minutes": 60
+          }
+        ],
+        "allowed_delivery_channels": [
+          "native_desktop_notification",
+          "connected_desktop"
+        ],
+        "remote_processing_enabled": false,
+        "restart_continuity_default": true,
+        "outbox_capacity_per_user": 20,
+        "outbox_capacity_per_session": 5
+      }
+    }
+  }
+]

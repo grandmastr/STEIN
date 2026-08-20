@@ -1,0 +1,24 @@
+{
+  "message_type": "request",
+  "body": {
+    "request_id": "018f0000-0000-7001-8000-000000000027",
+    "metadata": {
+      "message_id": "018f0000-0000-7001-8000-000000000028",
+      "schema_version": 1,
+      "issued_at": "2026-08-19T08:00:03Z",
+      "correlation_id": "018f0000-0000-7001-8000-000000000029",
+      "origin": "core_cli",
+      "sensitivity": "personal",
+      "retention": "runtime",
+      "deadline_at": "2026-08-19T08:00:13Z",
+      "cancellation_id": "018f0000-0000-7001-8000-000000000030"
+    },
+    "body": {
+      "request_type": "delay_echo",
+      "payload": {
+        "delay_ms": 25,
+        "text": "synthetic echo"
+      }
+    }
+  }
+}

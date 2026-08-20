@@ -1,0 +1,417 @@
+{
+  "message_type": "session_opened",
+  "body": {
+    "protocol_version": {
+      "major": 1,
+      "minor": 1
+    },
+    "server_build_id": "0.1.0-phase2-fixture",
+    "daemon_instance_id": "018f0000-0000-7000-8000-000000000021",
+    "authenticated_actor": {
+      "actor_id": "018f0000-0000-7000-8000-000000000001",
+      "kind": "local_os_user"
+    },
+    "max_frame_bytes": 1048576,
+    "capabilities": [
+      {
+        "capability": "snapshot",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "runtime_status",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "goal_create",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "goal_update",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "view_events",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "request_cancellation",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "model_route_approval",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "session_permissions",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "focus_sessions",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "capture_state",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "delivery_channels",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "intervention_feedback",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "intervention_history",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "intervention_explanation",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "desktop_observation",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "model_reasoning",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "durable_persistence",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "native_notification",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "native_status",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "emergency_control",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "secret_store",
+        "schema_version": 1,
+        "state": "healthy"
+      }
+    ],
+    "snapshot": {
+      "snapshot_id": "018f0000-0000-7000-8000-000000000031",
+      "as_of": "2026-08-19T14:42:00Z",
+      "cursor": {
+        "daemon_instance_id": "018f0000-0000-7000-8000-000000000021",
+        "sequence": 12
+      },
+      "runtime": {
+        "daemon_instance_id": "018f0000-0000-7000-8000-000000000021",
+        "state": "ready",
+        "started_at": "2026-08-19T14:00:00Z",
+        "observed_at": "2026-08-19T14:42:00Z",
+        "build_id": "0.1.0-phase2-fixture",
+        "protocol_version": {
+          "major": 1,
+          "minor": 1
+        },
+        "active_connections": 1
+      },
+      "capabilities": [
+        {
+          "capability": "snapshot",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "runtime_status",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "goal_create",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "goal_update",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "view_events",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "request_cancellation",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "model_route_approval",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "session_permissions",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "focus_sessions",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "capture_state",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "delivery_channels",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "intervention_feedback",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "intervention_history",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "intervention_explanation",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "desktop_observation",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "model_reasoning",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "durable_persistence",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "native_notification",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "native_status",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "emergency_control",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "secret_store",
+          "schema_version": 1,
+          "state": "healthy"
+        }
+      ],
+      "goals": [
+        {
+          "goal_id": "018f0000-0000-7000-8000-000000000101",
+          "revision": 2,
+          "owner_id": "018f0000-0000-7000-8000-000000000001",
+          "title": "Synthetic Atlas brief",
+          "success_statement": "Introduction, options, and recommendation are drafted.",
+          "deadline": "2026-08-19T15:00:00Z",
+          "state": "active",
+          "created_at": "2026-08-19T14:00:00Z",
+          "updated_at": "2026-08-19T14:01:00Z"
+        }
+      ],
+      "phase2": {
+        "selected_resources": [
+          {
+            "selected_resource_id": "018f0000-0000-7000-8000-000000000301",
+            "kind": "document",
+            "display_name": "Synthetic selected brief"
+          }
+        ],
+        "permission_records": [
+          {
+            "record_type": "session_grant",
+            "record": {
+              "permission_grant_id": "018f0000-0000-7000-8000-000000000401",
+              "revision": 1,
+              "owner_id": "018f0000-0000-7000-8000-000000000001",
+              "requested_by_client": "018f0000-0000-7000-8000-000000000011",
+              "device_id": "018f0000-0000-7000-8000-000000000201",
+              "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+              "goal_id": "018f0000-0000-7000-8000-000000000101",
+              "scope": "observe.content.selected_document",
+              "selected_resource_id": "018f0000-0000-7000-8000-000000000301",
+              "purpose": "Maintain bounded context for the synthetic focus session.",
+              "continuity": {
+                "while_client_disconnected": true,
+                "after_daemon_restart": true
+              },
+              "state": "active",
+              "effective_at": "2026-08-19T14:00:00Z",
+              "expires_at": "2026-08-19T15:05:00Z",
+              "consent_copy_version": "synthetic-consent-v1",
+              "sensitivity": "sensitive",
+                "retention": "durable_until_expiry"
+            }
+          },
+          {
+            "record_type": "model_route_approval",
+            "record": {
+              "model_route_approval_id": "018f0000-0000-7000-8000-000000000501",
+              "revision": 1,
+              "owner_id": "018f0000-0000-7000-8000-000000000001",
+              "route": {
+                "provider_id": "synthetic-provider",
+                "route_id": "synthetic-text-route",
+                "placement": "remote"
+              },
+              "account_profile": "default",
+              "allowed_data_categories": [
+                "goal",
+                "focus_session",
+                "evidence_aggregates",
+                "selected_document",
+                "delivery_constraints"
+              ],
+              "handling": {
+                "retention": {
+                  "kind": "bounded",
+                  "maximum_seconds": 0
+                },
+                "training_use": "excluded",
+                "data_residency": "synthetic-region",
+                "profile_version": "synthetic-handling-v1"
+              },
+              "purpose": "reason.focus_context",
+              "maximum_request_tokens": 800,
+              "state": "active",
+              "effective_at": "2026-08-19T14:00:00Z",
+              "expires_at": "2026-08-20T14:00:00Z",
+              "disclosure_version": "synthetic-disclosure-v1"
+            }
+          }
+        ],
+        "focus_sessions": [
+          {
+            "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+            "revision": 1,
+            "goal_id": "018f0000-0000-7000-8000-000000000101",
+            "goal_revision": 2,
+            "state": "active",
+            "interventions_muted": false,
+            "source_degraded": false,
+            "model_route_approval_id": "018f0000-0000-7000-8000-000000000501",
+            "permission_grant_ids": [
+              "018f0000-0000-7000-8000-000000000401"
+            ],
+            "selected_resource_ids": [
+              "018f0000-0000-7000-8000-000000000301"
+            ],
+            "continuity": {
+              "while_client_disconnected": true,
+              "after_daemon_restart": true
+            },
+            "created_at": "2026-08-19T14:00:00Z",
+            "started_at": "2026-08-19T14:01:00Z",
+            "updated_at": "2026-08-19T14:42:00Z"
+          }
+        ],
+        "capture_states": [
+          {
+            "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+            "revision": 1,
+            "state": "active",
+            "active_categories": [
+              "selected_document"
+            ],
+            "sources": [
+              {
+                "observation_source_id": "018f0000-0000-7000-8000-000000000701",
+                "category": "selected_document",
+                "selected_resource_id": "018f0000-0000-7000-8000-000000000301",
+                "health": "healthy",
+                "last_complete_at": "2026-08-19T14:41:30Z"
+              }
+            ],
+            "native_status_visible": true,
+            "emergency_stop_available": true,
+            "updated_at": "2026-08-19T14:42:00Z"
+          }
+        ],
+        "delivery_channels": [
+          {
+            "delivery_channel_id": "018f0000-0000-7000-8000-000000000801",
+            "class": "native_desktop_notification",
+            "state": "healthy",
+            "may_show_content_while_locked": false,
+            "observed_at": "2026-08-19T14:42:00Z"
+          }
+        ],
+        "intervention_history": {
+          "as_of": "2026-08-19T14:42:00Z",
+          "entries": [
+            {
+              "intervention_id": "018f0000-0000-7000-8000-000000000901",
+              "revision": 1,
+              "candidate_revision": 1,
+              "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+              "goal_id": "018f0000-0000-7000-8000-000000000101",
+              "urgency": "normal",
+              "reason_codes": [
+                "deadline_near",
+                "success_condition_unobserved"
+              ],
+              "state": "accepted_by_channel",
+              "outcome": "unacknowledged",
+              "user_visible_text": "You have 18 minutes left. The selected brief may still need its recommendation.",
+              "delivery_channel_id": "018f0000-0000-7000-8000-000000000801",
+              "sensitivity": "personal",
+              "retention": "bounded_audit",
+              "created_at": "2026-08-19T14:42:00Z",
+              "expires_at": "2026-08-19T15:00:00Z",
+              "updated_at": "2026-08-19T14:42:00Z"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

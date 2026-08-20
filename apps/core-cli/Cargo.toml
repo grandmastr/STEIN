@@ -1,0 +1,20 @@
+[package]
+name = "stein-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "stein-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+stein-ipc = { path = "../../crates/stein-ipc" }
+stein-protocol = { path = "../../crates/stein-protocol" }
+tokio.workspace = true
+tokio-util.workspace = true
+

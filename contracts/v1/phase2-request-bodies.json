@@ -1,0 +1,231 @@
+[
+  {
+    "request_type": "update_goal",
+    "payload": {
+      "goal_id": "018f0000-0000-7000-8000-000000000101",
+      "expected_revision": 1,
+      "patch": {
+        "success_statement": "Introduction, options, and recommendation are drafted.",
+        "deadline": {
+          "operation": "set",
+          "deadline": "2026-08-19T15:00:00Z"
+        }
+      }
+    }
+  },
+  {
+    "request_type": "complete_goal",
+    "payload": {
+      "goal_id": "018f0000-0000-7000-8000-000000000101",
+      "expected_revision": 2
+    }
+  },
+  {
+    "request_type": "abandon_goal",
+    "payload": {
+      "goal_id": "018f0000-0000-7000-8000-000000000101",
+      "expected_revision": 2,
+      "reason": "Synthetic plan changed."
+    }
+  },
+  {
+    "request_type": "approve_model_route",
+    "payload": {
+      "route": {
+        "provider_id": "synthetic-provider",
+        "route_id": "synthetic-text-route",
+        "placement": "remote"
+      },
+      "account_profile": "default",
+      "allowed_data_categories": [
+        "goal",
+        "focus_session",
+        "evidence_aggregates",
+        "selected_document",
+        "delivery_constraints"
+      ],
+      "handling": {
+        "retention": {
+          "kind": "bounded",
+          "maximum_seconds": 0
+        },
+        "training_use": "excluded",
+        "data_residency": "synthetic-region",
+        "profile_version": "synthetic-handling-v1"
+      },
+      "purpose": "reason.focus_context",
+      "maximum_request_tokens": 800,
+      "expires_at": "2026-08-20T14:00:00Z",
+      "disclosure_version": "synthetic-disclosure-v1"
+    }
+  },
+  {
+    "request_type": "grant_session_permission",
+    "payload": {
+      "goal_id": "018f0000-0000-7000-8000-000000000101",
+      "device_id": "018f0000-0000-7000-8000-000000000201",
+      "scope": "observe.content.selected_document",
+      "selected_resource_id": "018f0000-0000-7000-8000-000000000301",
+      "purpose": "Maintain bounded context for the synthetic focus session.",
+      "expires_at": "2026-08-19T15:05:00Z",
+      "continuity": {
+        "while_client_disconnected": true,
+        "after_daemon_restart": true
+      },
+      "consent_copy_version": "synthetic-consent-v1"
+    }
+  },
+  {
+    "request_type": "revoke_permission",
+    "payload": {
+      "target": {
+        "permission_type": "session_grant",
+        "permission_grant_id": "018f0000-0000-7000-8000-000000000401"
+      },
+      "expected_revision": 1,
+      "reason": "Synthetic user stop."
+    }
+  },
+  {
+    "request_type": "start_focus_session",
+    "payload": {
+      "goal_id": "018f0000-0000-7000-8000-000000000101",
+      "goal_revision": 1,
+      "selected_resource_ids": [
+        "018f0000-0000-7000-8000-000000000301"
+      ],
+      "permission_grant_ids": [
+        "018f0000-0000-7000-8000-000000000401"
+      ],
+      "model_route_approval_id": "018f0000-0000-7000-8000-000000000501"
+    }
+  },
+  {
+    "request_type": "set_interventions_muted",
+    "payload": {
+      "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+      "expected_revision": 1,
+      "muted": true
+    }
+  },
+  {
+    "request_type": "end_focus_session",
+    "payload": {
+      "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+      "expected_revision": 2,
+      "reason": "user_requested"
+    }
+  },
+  {
+    "request_type": "record_intervention_feedback",
+    "payload": {
+      "intervention_id": "018f0000-0000-7000-8000-000000000901",
+      "expected_revision": 1,
+      "feedback": {
+        "outcome": "corrected",
+        "correction": "The synthetic research activity was relevant.",
+        "associate_resource_id": "018f0000-0000-7000-8000-000000000301"
+      }
+    }
+  },
+  {
+    "request_type": "get_goal",
+    "payload": {
+      "goal_id": "018f0000-0000-7000-8000-000000000101"
+    }
+  },
+  {
+    "request_type": "get_focus_session_view",
+    "payload": {
+      "focus_session_id": "018f0000-0000-7000-8000-000000000601"
+    }
+  },
+  {
+    "request_type": "get_capability_health",
+    "payload": {}
+  },
+  {
+    "request_type": "get_permission_view",
+    "payload": {
+      "permission_grant_id": "018f0000-0000-7000-8000-000000000401"
+    }
+  },
+  {
+    "request_type": "get_intervention_history",
+    "payload": {
+      "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+      "limit": 20,
+      "before": "2026-08-19T15:05:00Z"
+    }
+  },
+  {
+    "request_type": "explain_intervention",
+    "payload": {
+      "intervention_id": "018f0000-0000-7000-8000-000000000901"
+    }
+  },
+  {
+    "request_type": "delete_goal",
+    "payload": {
+      "goal_id": "018f0000-0000-7000-8000-000000000101",
+      "expected_revision": 3
+    }
+  },
+  {
+    "request_type": "register_selected_resource",
+    "payload": {
+      "kind": "document"
+    }
+  },
+  {
+    "request_type": "remove_selected_resource",
+    "payload": {
+      "selected_resource_id": "018f0000-0000-7000-8000-000000000301",
+      "expected_revision": 1
+    }
+  },
+  {
+    "request_type": "update_user_preferences",
+    "payload": {
+      "expected_revision": 1,
+      "preferences": {
+        "preferred_form_of_address": "Synthetic collaborator",
+        "intervention_style": "concise",
+        "proactive_enabled": true,
+        "proactive_muted": false,
+        "maximum_interventions_per_session": 3,
+        "maximum_model_requests_per_hour": 12,
+        "minimum_intervention_cooldown_ms": 300000,
+        "do_not_disturb_windows": [
+          {
+            "start_minute_local": 1320,
+            "end_minute_local": 420,
+            "utc_offset_minutes": 60
+          }
+        ],
+        "allowed_delivery_channels": [
+          "native_desktop_notification",
+          "connected_desktop"
+        ],
+        "remote_processing_enabled": false,
+        "restart_continuity_default": true
+      }
+    }
+  },
+  {
+    "request_type": "get_stein_identity",
+    "payload": {}
+  },
+  {
+    "request_type": "get_user_preferences",
+    "payload": {}
+  },
+  {
+    "request_type": "get_effective_policy",
+    "payload": {}
+  },
+  {
+    "request_type": "get_selected_resources",
+    "payload": {}
+  }
+]

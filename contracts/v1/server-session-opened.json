@@ -1,0 +1,155 @@
+{
+  "message_type": "session_opened",
+  "body": {
+    "protocol_version": {
+      "major": 1,
+      "minor": 0
+    },
+    "server_build_id": "0.1.0-poc",
+    "daemon_instance_id": "018f0000-0000-7001-8000-000000000002",
+    "authenticated_actor": {
+      "actor_id": "018f0000-0000-7001-8000-000000000004",
+      "kind": "local_os_user"
+    },
+    "max_frame_bytes": 1048576,
+    "capabilities": [
+      {
+        "capability": "snapshot",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "runtime_status",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "goal_create",
+        "schema_version": 1,
+        "state": "healthy"
+      },
+      {
+        "capability": "desktop_observation",
+        "schema_version": 1,
+        "state": "unavailable",
+        "unavailable_reason": "not_implemented"
+      },
+      {
+        "capability": "model_reasoning",
+        "schema_version": 1,
+        "state": "unavailable",
+        "unavailable_reason": "not_implemented"
+      },
+      {
+        "capability": "durable_persistence",
+        "schema_version": 1,
+        "state": "unavailable",
+        "unavailable_reason": "not_implemented"
+      },
+      {
+        "capability": "native_notification",
+        "schema_version": 1,
+        "state": "unavailable",
+        "unavailable_reason": "not_implemented"
+      },
+      {
+        "capability": "native_status",
+        "schema_version": 1,
+        "state": "unavailable",
+        "unavailable_reason": "not_implemented"
+      },
+      {
+        "capability": "emergency_control",
+        "schema_version": 1,
+        "state": "unavailable",
+        "unavailable_reason": "not_implemented"
+      },
+      {
+        "capability": "secret_store",
+        "schema_version": 1,
+        "state": "unavailable",
+        "unavailable_reason": "not_implemented"
+      }
+    ],
+    "snapshot": {
+      "snapshot_id": "018f0000-0000-7001-8000-000000000003",
+      "as_of": "2026-08-19T08:00:00Z",
+      "cursor": {
+        "daemon_instance_id": "018f0000-0000-7001-8000-000000000002",
+        "sequence": 4
+      },
+      "runtime": {
+        "daemon_instance_id": "018f0000-0000-7001-8000-000000000002",
+        "state": "ready",
+        "started_at": "2026-08-19T07:59:00Z",
+        "observed_at": "2026-08-19T08:00:00Z",
+        "build_id": "0.1.0-poc",
+        "protocol_version": {
+          "major": 1,
+          "minor": 0
+        },
+        "active_connections": 1
+      },
+      "capabilities": [
+        {
+          "capability": "snapshot",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "runtime_status",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "goal_create",
+          "schema_version": 1,
+          "state": "healthy"
+        },
+        {
+          "capability": "desktop_observation",
+          "schema_version": 1,
+          "state": "unavailable",
+          "unavailable_reason": "not_implemented"
+        },
+        {
+          "capability": "model_reasoning",
+          "schema_version": 1,
+          "state": "unavailable",
+          "unavailable_reason": "not_implemented"
+        },
+        {
+          "capability": "durable_persistence",
+          "schema_version": 1,
+          "state": "unavailable",
+          "unavailable_reason": "not_implemented"
+        },
+        {
+          "capability": "native_notification",
+          "schema_version": 1,
+          "state": "unavailable",
+          "unavailable_reason": "not_implemented"
+        },
+        {
+          "capability": "native_status",
+          "schema_version": 1,
+          "state": "unavailable",
+          "unavailable_reason": "not_implemented"
+        },
+        {
+          "capability": "emergency_control",
+          "schema_version": 1,
+          "state": "unavailable",
+          "unavailable_reason": "not_implemented"
+        },
+        {
+          "capability": "secret_store",
+          "schema_version": 1,
+          "state": "unavailable",
+          "unavailable_reason": "not_implemented"
+        }
+      ],
+      "goals": []
+    }
+  }
+}

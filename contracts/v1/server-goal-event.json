@@ -1,0 +1,40 @@
+{
+  "message_type": "event",
+  "body": {
+    "cursor": {
+      "daemon_instance_id": "018f0000-0000-7001-8000-000000000002",
+      "sequence": 5
+    },
+    "metadata": {
+      "message_id": "018f0000-0000-7001-8000-000000000013",
+      "schema_version": 1,
+      "occurred_at": "2026-08-19T08:00:02Z",
+      "correlation_id": "018f0000-0000-7001-8000-000000000008",
+      "causation_id": "018f0000-0000-7001-8000-000000000007",
+      "actor": {
+        "actor_id": "018f0000-0000-7001-8000-000000000004",
+        "kind": "local_os_user"
+      },
+      "origin": "core_application",
+      "sensitivity": "personal",
+      "retention": "runtime"
+    },
+    "event": {
+      "event_type": "goal_view_changed",
+      "payload": {
+        "change": "created",
+        "goal": {
+          "goal_id": "018f0000-0000-7001-8000-000000000005",
+          "revision": 1,
+          "owner_id": "018f0000-0000-7001-8000-000000000004",
+          "title": "Synthetic Atlas brief",
+          "success_statement": "A synthetic introduction and recommendation exist.",
+          "deadline": "2026-08-19T09:00:00Z",
+          "state": "active",
+          "created_at": "2026-08-19T08:00:02Z",
+          "updated_at": "2026-08-19T08:00:02Z"
+        }
+      }
+    }
+  }
+}

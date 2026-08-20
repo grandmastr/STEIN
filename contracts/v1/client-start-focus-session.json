@@ -1,0 +1,38 @@
+{
+  "message_type": "request",
+  "body": {
+    "request_id": "018f0000-0000-7000-8000-000000001001",
+    "metadata": {
+      "message_id": "018f0000-0000-7000-8000-000000001002",
+      "schema_version": 1,
+      "issued_at": "2026-08-19T14:00:00Z",
+      "correlation_id": "018f0000-0000-7000-8000-000000001003",
+      "origin": "desktop_client",
+      "authority": [
+        {
+          "authority_id": "018f0000-0000-7000-8000-000000000b01",
+          "revision": 1
+        }
+      ],
+      "sensitivity": "restricted",
+      "retention": "runtime",
+      "idempotency_key": "018f0000-0000-7000-8000-000000001004",
+      "deadline_at": "2026-08-19T14:00:10Z",
+      "cancellation_id": "018f0000-0000-7000-8000-000000001005"
+    },
+    "body": {
+      "request_type": "start_focus_session",
+      "payload": {
+        "goal_id": "018f0000-0000-7000-8000-000000000101",
+        "goal_revision": 1,
+        "selected_resource_ids": [
+          "018f0000-0000-7000-8000-000000000301"
+        ],
+        "permission_grant_ids": [
+          "018f0000-0000-7000-8000-000000000401"
+        ],
+        "model_route_approval_id": "018f0000-0000-7000-8000-000000000501"
+      }
+    }
+  }
+}

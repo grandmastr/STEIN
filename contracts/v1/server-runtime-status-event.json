@@ -1,0 +1,39 @@
+{
+  "message_type": "event",
+  "body": {
+    "cursor": {
+      "daemon_instance_id": "018f0000-0000-7001-8000-000000000002",
+      "sequence": 6
+    },
+    "metadata": {
+      "message_id": "018f0000-0000-7001-8000-000000000040",
+      "schema_version": 1,
+      "occurred_at": "2026-08-19T08:00:05Z",
+      "correlation_id": "018f0000-0000-7001-8000-000000000041",
+      "actor": {
+        "actor_id": "018f0000-0000-7001-8000-000000000002",
+        "kind": "core_daemon"
+      },
+      "origin": "core_application",
+      "sensitivity": "operational",
+      "retention": "runtime"
+    },
+    "event": {
+      "event_type": "runtime_status_changed",
+      "payload": {
+        "runtime": {
+          "daemon_instance_id": "018f0000-0000-7001-8000-000000000002",
+          "state": "stopping",
+          "started_at": "2026-08-19T07:59:00Z",
+          "observed_at": "2026-08-19T08:00:05Z",
+          "build_id": "0.1.0-poc",
+          "protocol_version": {
+            "major": 1,
+            "minor": 0
+          },
+          "active_connections": 1
+        }
+      }
+    }
+  }
+}
