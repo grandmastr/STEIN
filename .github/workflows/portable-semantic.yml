@@ -1,0 +1,57 @@
+name: portable-semantic-fixture
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portable-semantic-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  portable-semantic-fixture:
+    name: Portable semantic fixture (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Verify provider-neutral formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check provider-neutral crates
+        run: >-
+          cargo check --locked --all-targets
+          -p stein-core
+          -p stein-protocol
+          -p stein-ipc
+          -p stein-model-openai
+          -p stein-store-sqlite
+
+      - name: Lint provider-neutral crates
+        run: >-
+          cargo clippy --locked --all-targets
+          -p stein-core
+          -p stein-protocol
+          -p stein-ipc
+          -p stein-model-openai
+          -p stein-store-sqlite
+          -- -D warnings
+
+      - name: Run the portable semantic fixture
+        run: >-
+          cargo test --locked --all-targets
+          -p stein-core
+          -p stein-protocol
+          -p stein-ipc
+          -p stein-model-openai
+          -p stein-store-sqlite
