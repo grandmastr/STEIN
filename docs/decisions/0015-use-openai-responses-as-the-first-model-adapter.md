@@ -169,6 +169,20 @@ health and approval review must account for later changes.
 - CORE retains only content-free request outcome metadata. It does not persist
   request bodies, raw responses, response IDs, chain of thought, or provider
   credentials.
+- CORE keeps only the latest model-request receipt in the active session's
+  ephemeral state. Protocol 1.2 exposes that receipt solely through the
+  authenticated `GetFocusSessionView` query, and the desktop offers a narrow
+  read-only projection. The receipt identifies the request, focus session,
+  exact approval and route revision, timestamps, and a closed outcome; it does
+  not contain prompt, context, candidate text, provider response/error/status,
+  response ID, endpoint, secret reference, or credential state.
+- The receipt observes an existing daemon-owned scheduler request. It is not a
+  command and does not trigger or retry paid work. It is absent before the
+  session's first model boundary and disappears when the ephemeral session ends
+  or CORE restarts. Because it is deliberately latest-only, a later
+  deterministic pre-model silence does not erase an earlier completed receipt;
+  acceptance consumers must baseline the prior request ID/timestamp and require
+  a new receipt after the evidence under test.
 - Provider retention may exceed CORE's local ephemeral window and is visible in
   consent. A route whose handling is unacceptable can be left unapproved.
 - Adding a local adapter or a different provider does not change the agent loop or
@@ -178,6 +192,13 @@ health and approval review must account for later changes.
 
 - A live synthetic request through the installed daemon and approved route returns
   a strict `silence` or candidate result through the provider-neutral gateway.
+- The installed trace polls the read-only authenticated receipt after the
+  scheduler runs and accepts only `completed_strict_silence` or
+  `completed_strict_candidate` for the exact durable approval ID and revision,
+  with a request ID and start time newer than the pre-trigger baseline.
+  The ignored adapter-only paid/network probe is useful transport evidence but
+  is not installed acceptance evidence because it fabricates its request and
+  bypasses durable session/grant/policy authority.
 - Golden request fixtures contain only categories allowed by both current grants
   and the exact route approval, at the least sensitive useful granularity.
 - Requests set `store: false`, omit tools, conversations, previous-response state,

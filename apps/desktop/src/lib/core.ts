@@ -20,6 +20,8 @@ import type {
   InterventionHistoryInput,
   InterventionHistoryView,
   InterventionView,
+  LatestModelRequestReceiptInput,
+  ModelRequestReceiptView,
   ModelRouteView,
   RegisterSelectedResourceInput,
   RemoveSelectedResourceInput,
@@ -99,6 +101,10 @@ export const core = {
     input: InterventionHistoryInput,
   ): Promise<InterventionHistoryView> =>
     invoke<InterventionHistoryView>("desktop_get_intervention_history", { input }),
+  getLatestModelRequestReceipt: (
+    input: LatestModelRequestReceiptInput,
+  ): Promise<ModelRequestReceiptView | null> =>
+    invoke<ModelRequestReceiptView | null>("desktop_get_latest_model_request_receipt", { input }),
   subscribe: (onEvent: (event: DesktopBridgeEvent) => void): Promise<UnlistenFn> =>
     listen<DesktopBridgeEvent>(DESKTOP_BRIDGE_EVENT, ({ payload }) => onEvent(payload)),
   subscribeToastActivation: (

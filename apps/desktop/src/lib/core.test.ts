@@ -107,6 +107,9 @@ describe("renderer-to-Tauri boundary", () => {
     await core.getUserPreferences();
     await core.getEffectivePolicy();
     await core.getSelectedResources();
+    await core.getLatestModelRequestReceipt({
+      focusSessionId: "0198c083-f38b-7000-8000-000000000060",
+    });
 
     const calls = tauri.invoke.mock.calls as unknown as Array<[string, unknown?]>;
     expect(calls.map(([command]) => command)).toEqual([
@@ -119,7 +122,21 @@ describe("renderer-to-Tauri boundary", () => {
       "desktop_get_user_preferences",
       "desktop_get_effective_policy",
       "desktop_get_selected_resources",
+      "desktop_get_latest_model_request_receipt",
     ]);
+  });
+
+  it("exposes only a read-only content-free model request receipt query", async () => {
+    const input = { focusSessionId: "0198c083-f38b-7000-8000-000000000060" };
+    await core.getLatestModelRequestReceipt(input);
+
+    expect(tauri.invoke).toHaveBeenCalledWith(
+      "desktop_get_latest_model_request_receipt",
+      { input },
+    );
+    expect(core).not.toHaveProperty("triggerModelRequest");
+    expect(core).not.toHaveProperty("runReasoningCycle");
+    expect(JSON.stringify(input)).not.toMatch(/prompt|response|candidate|credential|secret/i);
   });
 
   it("routes only structurally valid authoritative toast explanations", async () => {

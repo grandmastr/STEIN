@@ -18,12 +18,12 @@ use stein_protocol::{
     AbandonGoalRequest, ApproveModelRouteRequest, CompleteGoalRequest, Component,
     DeleteGoalRequest, DeliveryChannelClass, DoNotDisturbWindowView as ProtocolDndWindow,
     ErrorCategory as ProtocolErrorCategory, ErrorCode, ErrorDetails, ExplainInterventionRequest,
-    FocusSessionEndReason, GetInterventionHistoryRequest, GoalDeadlinePatch, GoalPatch,
-    GrantSessionPermissionRequest, IdempotencyKey, InterventionFeedback, InterventionStyle,
-    ModelDataCategory, ModelPlacement, ModelRouteApprovalId, ModelRouteReference,
-    PermissionContinuity, PermissionReference, PermissionScope, ProtocolSupport,
-    ProviderHandlingProfile, ProviderRetentionPolicy, ProviderTrainingUse,
-    RecordInterventionFeedbackRequest, RegisterSelectedResourceRequest,
+    FocusSessionEndReason, GetFocusSessionViewRequest, GetInterventionHistoryRequest,
+    GoalDeadlinePatch, GoalPatch, GrantSessionPermissionRequest, IdempotencyKey,
+    InterventionFeedback, InterventionStyle, ModelDataCategory, ModelPlacement,
+    ModelRouteApprovalId, ModelRouteReference, PermissionContinuity, PermissionReference,
+    PermissionScope, ProtocolSupport, ProviderHandlingProfile, ProviderRetentionPolicy,
+    ProviderTrainingUse, RecordInterventionFeedbackRequest, RegisterSelectedResourceRequest,
     RemoveSelectedResourceRequest, RevokePermissionRequest, SelectedResourceKind,
     SetInterventionsMutedRequest, StartFocusSessionRequest, UpdateGoalRequest,
     UpdateUserPreferencesRequest, UserPreferencesV1Input, UtcTimestamp, ValidationField,
@@ -37,8 +37,9 @@ use crate::{
         EndFocusSessionInput, ErrorCategory, ExplainInterventionInput, FocusSessionView,
         GoalDeadlinePatchInput, GoalDeletionView, GoalRevisionInput, GoalView,
         GrantPermissionInput, InterventionExplanationView, InterventionFeedbackInput,
-        InterventionHistoryInput, InterventionHistoryView, InterventionView, ModelRouteView,
-        PublicErrorView, RegisterSelectedResourceInput, RemoveSelectedResourceInput, ResourceView,
+        InterventionHistoryInput, InterventionHistoryView, InterventionView,
+        LatestModelRequestReceiptInput, ModelRequestReceiptView, ModelRouteView, PublicErrorView,
+        RegisterSelectedResourceInput, RemoveSelectedResourceInput, ResourceView,
         RevokePermissionInput, SelectedResourceDeletionView, SessionGrantView, SetMutedInput,
         StartFocusSessionInput, SteinIdentityView, UpdateGoalInput, UpdateUserPreferencesInput,
         UserPreferencesUpdateView, UserPreferencesView,
@@ -595,6 +596,25 @@ impl SteinClientAdapter {
             })
             .await
             .map(|response| InterventionHistoryView::from_protocol(&response.history))
+            .map_err(public_client_error)
+    }
+
+    pub async fn get_latest_model_request_receipt(
+        &self,
+        input: LatestModelRequestReceiptInput,
+    ) -> Result<Option<ModelRequestReceiptView>, PublicErrorView> {
+        self.require_private()?;
+        self.client
+            .get_focus_session_view(GetFocusSessionViewRequest {
+                focus_session_id: parse_id(&input.focus_session_id, "focusSessionId")?,
+            })
+            .await
+            .map(|response| {
+                response
+                    .latest_model_request_receipt
+                    .as_ref()
+                    .map(ModelRequestReceiptView::from_protocol)
+            })
             .map_err(public_client_error)
     }
 

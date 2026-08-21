@@ -195,6 +195,41 @@ machine check or declared native fixture failed; exit `2` means a required
 machine prerequisite or declared native fixture was blocked. All evidence,
 including failed runs, should be retained.
 
+## Independent installed-evidence review
+
+After retaining the collector directory and recording the SHA-256 of its
+`root-anchor.json` file outside that directory, run the separate read-only
+reviewer with a closed review manifest and the exact attachment files it maps:
+
+```text
+scripts\windows\phase2\Review-Installed.cmd ^
+  -EvidenceDirectory C:\projects\STEIN\artifacts\evidence\phase-2\installed-<run> ^
+  -ExpectedRootAnchorSha256 "<SHA-256 of collector root-anchor.json>" ^
+  -ReviewManifest C:\projects\STEIN\artifacts\evidence\phase-2\review-input\review.json
+```
+
+`-OutputRoot` is optional and, when supplied, must remain below the repository
+`artifacts` directory. The reviewer rehashes the collector generator, host,
+ledger, all 32 row artifacts, and the exact attachment set before it evaluates
+the 32 closed review records. A row can become `pass` only when its collector
+row is not `fail` or `blocked`, its bound native result is an exact successful
+content-free fixture, and the manifest explicitly records completed independent,
+semantic, privacy, and synthetic-only review. Screenshots never promote a row.
+Source `fail` and `blocked` results propagate conservatively.
+
+The manifest booleans and `review_identity` are process declarations. They
+record that a review procedure was followed; they do not cryptographically
+authenticate a reviewer, person, or organization. The reviewer output root is
+likewise a content-integrity chain, not a signature or authenticated reviewer-
+identity claim. Bind reviewer identity through a separately controlled and
+authenticated operator record when that assurance is required.
+
+Reviewer exit `0` means all 32 rows passed and `complete_acceptance` is true.
+Exit `1` means a row failed or an input, hash, schema, privacy, or trust binding
+was invalid. Exit `2` means no row failed but at least one row is blocked. Exit
+`3` means the review is valid but incomplete because at least one row remains
+`not_run`. Retain every output, including failed and incomplete review attempts.
+
 ## Uninstall and explicit data removal
 
 ```text
@@ -231,9 +266,12 @@ signed installed bundle is still present.
 `Test-VerifyInstalled.ps1` statically proves that the installed harness contains
 the exact 32-gate set, mandatory trust pins, quoted launcher, attachment
 fail-closed rules, and no direct install/task/process/credential mutation
-commands. `packaging\windows-msix\Test-Static.ps1` runs that contract alongside
-its parser, source-contract, MakeAppx schema, and temporary-directory safety
-checks only. It does not run
+commands. `Test-ReviewInstalled.ps1` exercises one complete 32-row promotion and
+23 fail-closed source-set, tree-closure, tamper, command-binding, output-integrity,
+mapping, privacy, result-propagation, and incomplete-review cases.
+`packaging\windows-msix\Test-Static.ps1` runs both contracts alongside its
+parser, launcher, source-contract, MakeAppx schema, and temporary-directory
+safety checks only. It does not run
 `Add-AppxPackage`, `Remove-AppxPackage`, register/stop/start a task, stop a
 process, mutate Credential Manager, or alter certificate stores.
 
@@ -267,11 +305,34 @@ scripts\windows\phase2\Verify-Source.cmd
 It records format, all-target/all-feature Rust check/Clippy/tests, renderer
 typecheck/lint/tests/build, Edge-extension policy tests, isolated native-host
 format/check/Clippy/tests, dependency-boundary checks, static MSIX/lifecycle
-checks, release workspace/production-CORE/native-host builds, and the no-bundle
-Tauri build under a timestamped `artifacts\evidence\phase-2\source-*`
-directory. The report labels itself `source_verification_only`; synthetic
+checks, the installed-reviewer suite under both exact Windows PowerShell 5.1 and
+PowerShell 7 (`pwsh`), release workspace/production-CORE/native-host builds, and
+the no-bundle Tauri build under a timestamped
+`artifacts\evidence\phase-2\source-*` directory. The report labels itself
+`source_verification_only`; synthetic
 compile-time PFN/hash/extension values are never represented as an installed or
 signed identity.
+
+`source-verification.json` schema 2 also records bounded, content-free source
+provenance: the exact Git HEAD, clean/dirty categories and digests without file
+names, Cargo/rustc/Node/pnpm/Git/pwsh versions and executable hashes, checked-in
+package and lockfile hashes, and the application-schema, migration-catalog,
+protocol, message-schema, and policy-profile identifiers compiled by the run.
+The discovered `pwsh.exe` is mandatory and fails closed unless it is a regular,
+non-reparse file with a valid Authenticode signature whose exact signer Subject
+is Microsoft Corporation; an unsigned earlier PATH entry is rejected. Its
+validated signer Subject, signature status, version, and executable hash are
+retained in the bounded provenance. The verifier samples provenance before and
+after the suite and fails the run if it changes. Its nine-file generator binds
+the source verifier plus the installed reviewer, launcher, reviewer test, and
+reviewer runtime dependencies. `root-anchor.json` binds the report, generator,
+provenance, check records, and hashed logs through one deterministic root digest.
+Generator files are accepted only through regular, non-reparse ancestors below
+the repository root; a junction-to-external-source negative fixture enforces that
+containment.
+The root is content-integrity evidence only, not a signature, installed identity,
+signed-package claim, authenticated reviewer-identity claim, or Phase 2
+completion claim.
 
 The opt-in ignored Windows fixtures can display native UI and temporarily create
 synthetic current-user OS resources. Run them only in an unlocked disposable

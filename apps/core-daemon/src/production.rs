@@ -36,6 +36,7 @@ pub struct ProductionComposition {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RecoverySummary {
+    pub interrupted_deliveries_reconciled: usize,
     pub reactivated_with_fresh_sources: usize,
     pub ended_without_restart_authority: usize,
     pub resumed_stopping_cleanup: usize,
@@ -179,6 +180,14 @@ pub async fn recover_authorized_workflows(
     core: &CoreApplication,
     owner: ActorId,
 ) -> Result<RecoverySummary> {
+    // Reconcile possible external notification attempts before any workflow is
+    // reactivated or the reasoning scheduler can create new work.
+    let interrupted_deliveries_reconciled = core
+        .second_mind()
+        .reconcile_interrupted_deliveries(owner)
+        .map_err(|error| anyhow!(error.summary))
+        .context("reconcile interrupted native notification delivery")?
+        .len();
     let cleanup = core
         .second_mind()
         .recover_cleanup_obligations(owner)
@@ -219,6 +228,7 @@ pub async fn recover_authorized_workflows(
         reactivated_with_fresh_sources += 1;
     }
     Ok(RecoverySummary {
+        interrupted_deliveries_reconciled,
         reactivated_with_fresh_sources,
         ended_without_restart_authority,
         resumed_stopping_cleanup,

@@ -8,7 +8,8 @@ use stein_protocol::{
     FocusSessionView as ProtocolFocusSessionView, GoalDeletionTombstoneView,
     GoalState as ProtocolGoalState, GoalView as ProtocolGoalView,
     InterventionExplanationView as ProtocolExplanationView,
-    InterventionView as ProtocolInterventionView, ModelRouteApprovalView,
+    InterventionView as ProtocolInterventionView,
+    ModelRequestReceiptView as ProtocolModelRequestReceiptView, ModelRouteApprovalView,
     ObservationSourceView as ProtocolObservationSourceView, PermissionGrantView,
     PermissionRecordView, RuntimeState as ProtocolRuntimeState,
     SelectedResourceDeletionTombstoneView, SelectedResourceView,
@@ -792,6 +793,33 @@ impl FocusSessionView {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ModelRequestReceiptView {
+    pub request_id: String,
+    pub focus_session_id: String,
+    pub model_route_approval_id: String,
+    pub model_route_revision: u64,
+    pub started_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    pub outcome: String,
+}
+
+impl ModelRequestReceiptView {
+    pub fn from_protocol(receipt: &ProtocolModelRequestReceiptView) -> Self {
+        Self {
+            request_id: receipt.request_id.to_string(),
+            focus_session_id: receipt.focus_session_id.to_string(),
+            model_route_approval_id: receipt.model_route_approval_id.to_string(),
+            model_route_revision: receipt.model_route_revision,
+            started_at: receipt.started_at.to_string(),
+            completed_at: receipt.completed_at.map(|time| time.to_string()),
+            outcome: snake_debug(receipt.outcome),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ObservationSourceView {
     pub id: String,
     pub category: String,
@@ -1312,6 +1340,12 @@ pub struct ExplainInterventionInput {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LatestModelRequestReceiptInput {
+    pub focus_session_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InterventionHistoryInput {
     pub focus_session_id: Option<String>,
     pub limit: u16,
@@ -1740,5 +1774,43 @@ mod tests {
         assert_eq!(trace.user_preferences_revision, 7);
         assert_eq!(trace.input_schema_version, 1);
         assert_eq!(trace.input_digest_sha256, "ab".repeat(32));
+    }
+
+    #[test]
+    fn model_request_receipt_projection_is_content_free_and_route_exact() {
+        let now = UtcTimestamp::now();
+        let protocol = ProtocolModelRequestReceiptView {
+            request_id: stein_protocol::RequestId::new_v7(),
+            focus_session_id: stein_protocol::FocusSessionId::new_v7(),
+            model_route_approval_id: stein_protocol::ModelRouteApprovalId::new_v7(),
+            model_route_revision: 4,
+            started_at: now,
+            completed_at: Some(now),
+            outcome: stein_protocol::ModelRequestReceiptOutcome::CompletedStrictSilence,
+        };
+
+        let view = ModelRequestReceiptView::from_protocol(&protocol);
+        assert_eq!(view.request_id, protocol.request_id.to_string());
+        assert_eq!(view.focus_session_id, protocol.focus_session_id.to_string());
+        assert_eq!(
+            view.model_route_approval_id,
+            protocol.model_route_approval_id.to_string()
+        );
+        assert_eq!(view.model_route_revision, 4);
+        assert_eq!(view.outcome, "completed_strict_silence");
+
+        let encoded = serde_json::to_value(view).unwrap();
+        let keys = encoded.as_object().unwrap().keys().collect::<Vec<_>>();
+        assert_eq!(keys.len(), 7);
+        for forbidden in [
+            "prompt",
+            "response",
+            "candidateText",
+            "providerError",
+            "credential",
+            "secret",
+        ] {
+            assert!(encoded.get(forbidden).is_none());
+        }
     }
 }

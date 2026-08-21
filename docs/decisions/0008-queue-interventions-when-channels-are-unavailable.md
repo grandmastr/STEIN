@@ -112,6 +112,25 @@ when the new preference would otherwise be equally permissive, because the
 stored text was proposed under different exact inputs. A successful recovery
 evaluation writes a fresh trace/digest and correlated audit before delivery.
 
+Every external notification submission, whether direct or recovered from the
+outbox, requires a durable `delivering` attempt marker first. A direct send
+commits the intervention's `allowed -> delivering` revision with a content-free
+delivery audit before invoking the channel. Outbox recovery commits the matching
+intervention and outbox `queued -> delivering` revisions, the incremented attempt
+metadata, the fresh policy-decision reference, and the delivery audit in one
+repository transaction. Policy revalidation alone leaves both records queued and
+is therefore definitely unattempted.
+
+This is an at-most-one-submission contract per deduplication identity, not a
+claim that SQLite and an operating-system notification API form one exactly-once
+transaction. A crash before the durable marker cannot have reached the adapter;
+startup cancels an orphan direct `allowed` record or leaves a coherent queued
+pair eligible for fresh revalidation. A crash after the marker but before a
+terminal acknowledgement is durably committed becomes `delivery_unknown` with
+an audit and is never submitted again. Startup performs this reconciliation
+before workflow reactivation or outbox scheduling and never calls a notification
+adapter while reconciling.
+
 For deadline-sensitive focus interventions, expiry cannot exceed the focus
 session or the point at which the proposed advice stops being actionable. Policy
 may choose a shorter lifetime.
@@ -135,7 +154,9 @@ session mute cancels affected queued items immediately. The same direct-user
 transition cancels the separate proactive model/delivery token before the
 durable revision changes; it does not cancel the session's observation token.
 Private outbox and intervention text is scrubbed before the command returns and
-follows user deletion commands.
+follows user deletion commands. Each queued cancellation commits the matching
+intervention revision, outbox state/scrub, and content-free delivery audit
+atomically.
 
 ## Consequences
 
@@ -164,6 +185,13 @@ follows user deletion commands.
   queued; each operation cancels and removes affected private content.
 - Restart CORE with queued items and prove bounded recovery does not duplicate an
   acknowledged or ambiguous delivery.
+- Crash before and after both direct and outbox attempt markers. Prove the
+  pre-marker fixture makes no adapter call, while every post-marker fixture
+  becomes audited `delivery_unknown` and is never retried.
+- Reopen a legacy database whose outbox is already `delivery_unknown` while its
+  intervention remains `delivering`; repository open must not make another
+  semantic state change, and runtime startup must reconcile both records and the
+  audit atomically.
 - Force a channel acknowledgement without a seen receipt and prove the audit
   reports only `accepted_by_channel`.
 - Golden outbox fixtures contain none of the prohibited raw evidence or model

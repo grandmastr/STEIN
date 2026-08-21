@@ -1,7 +1,14 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import type { GoalView, ModelRouteView, ResourceView, SessionGrantView } from "../protocol";
+import type {
+  FocusSessionView,
+  GoalView,
+  ModelRequestReceiptView,
+  ModelRouteView,
+  ResourceView,
+  SessionGrantView,
+} from "../protocol";
 import { FocusPanel } from "./FocusPanel";
 
 const goal: GoalView = {
@@ -54,6 +61,32 @@ const route: ModelRouteView = {
   effectiveAt: "2026-08-20T08:00:00Z",
   disclosureVersion: "v1",
 };
+const session: FocusSessionView = {
+  id: "0198c083-f38b-7000-8000-000000000206",
+  revision: 2,
+  goalId: goal.id,
+  goalRevision: goal.revision,
+  state: "active",
+  interventionsMuted: false,
+  sourceDegraded: false,
+  modelRouteApprovalId: route.id,
+  permissionGrantIds: [grant.id],
+  selectedResourceIds: [resource.id],
+  whileClientDisconnected: true,
+  afterDaemonRestart: false,
+  createdAt: "2026-08-20T08:00:00Z",
+  startedAt: "2026-08-20T08:00:01Z",
+  updatedAt: "2026-08-20T08:00:01Z",
+};
+const receipt: ModelRequestReceiptView = {
+  requestId: "0198c083-f38b-7000-8000-000000000207",
+  focusSessionId: session.id,
+  modelRouteApprovalId: route.id,
+  modelRouteRevision: route.revision,
+  startedAt: "2026-08-20T08:01:00Z",
+  completedAt: "2026-08-20T08:01:02Z",
+  outcome: "completed_strict_candidate",
+};
 
 describe("FocusPanel", () => {
   it("derives the exact resource set from chosen grants and submits no independent UUID choices", async () => {
@@ -69,6 +102,7 @@ describe("FocusPanel", () => {
         routes={[route]}
         sessions={[]}
         onEnd={vi.fn()}
+        onGetLatestModelRequestReceipt={vi.fn()}
         onSetMuted={vi.fn()}
         onStart={onStart}
       />,
@@ -91,5 +125,38 @@ describe("FocusPanel", () => {
 
     await user.selectOptions(screen.getByLabelText("Focus goal"), "");
     expect(screen.getByLabelText("Derived selected-resource set")).not.toHaveTextContent(resource.displayName);
+  });
+
+  it("lets a private operator read content-free latest-only model evidence without triggering work", async () => {
+    const user = userEvent.setup();
+    const onGetLatestModelRequestReceipt = vi.fn().mockResolvedValue(receipt);
+    render(
+      <FocusPanel
+        captures={[]}
+        disabled={false}
+        goals={[goal]}
+        grants={[grant]}
+        resources={[resource]}
+        routes={[route]}
+        sessions={[session]}
+        onEnd={vi.fn()}
+        onGetLatestModelRequestReceipt={onGetLatestModelRequestReceipt}
+        onSetMuted={vi.fn()}
+        onStart={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/never starts a model request/i)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Check latest model request receipt" }));
+
+    await waitFor(() => expect(onGetLatestModelRequestReceipt).toHaveBeenCalledWith({
+      focusSessionId: session.id,
+    }));
+    const evidence = await screen.findByLabelText(`Latest model request receipt for ${session.id}`);
+    expect(evidence).toHaveTextContent(receipt.outcome);
+    expect(evidence).toHaveTextContent(receipt.requestId);
+    expect(evidence).toHaveTextContent(receipt.modelRouteApprovalId);
+    expect(evidence).not.toHaveTextContent("prompt");
+    expect(evidence).not.toHaveTextContent("response");
   });
 });

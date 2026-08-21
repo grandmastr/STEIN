@@ -141,7 +141,7 @@ retention maximum, bypass a grant, or make policy fail open.
 | Private text per item | The same 512-character candidate limit. |
 | Actionable lifetime | The earliest of 15 minutes after queueing, candidate validity supplied by policy, goal deadline, focus-session end, grant expiry, or user deletion. |
 | Recovery batch | Revalidate at most 3 items per channel-health transition and no more than one batch every 10 seconds. |
-| Delivery attempts | One attempt after each fresh allow decision; ambiguous or acknowledged attempts are never automatic retries. |
+| Delivery attempts | One attempt after each fresh allow decision, preceded by a durable audited `delivering` marker. A restart after that marker becomes `delivery_unknown`; ambiguous or acknowledged attempts are never automatic retries. |
 
 When a queue is full, policy denies the new pending delivery and appends a
 content-free bounded-capacity outcome; it does not evict an item and deliver it

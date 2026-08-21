@@ -206,6 +206,25 @@ export interface FocusSessionView {
   updatedAt: string;
 }
 
+export type ModelRequestReceiptOutcome =
+  | "in_flight"
+  | "completed_strict_silence"
+  | "completed_strict_candidate"
+  | "cancelled"
+  | "deadline_exceeded"
+  | "failed";
+
+/** Content-free, latest-only evidence for an existing daemon-owned request. */
+export interface ModelRequestReceiptView {
+  requestId: string;
+  focusSessionId: string;
+  modelRouteApprovalId: string;
+  modelRouteRevision: number;
+  startedAt: string;
+  completedAt?: string;
+  outcome: ModelRequestReceiptOutcome;
+}
+
 export interface ObservationSourceView {
   id: string;
   category: string;
@@ -542,6 +561,10 @@ export interface InterventionFeedbackInput {
 
 export interface ExplainInterventionInput {
   interventionId: string;
+}
+
+export interface LatestModelRequestReceiptInput {
+  focusSessionId: string;
 }
 
 export interface InterventionHistoryInput {

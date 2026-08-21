@@ -13,6 +13,7 @@ $desktopRoot = Join-Path $repoRoot "apps\desktop"
 $edgeExtensionRoot = Join-Path $repoRoot "extensions\edge"
 $edgeHostManifest = Join-Path $repoRoot "apps\edge-native-host\Cargo.toml"
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
+. (Join-Path $PSScriptRoot "Source-Evidence.ps1")
 
 function Resolve-SteinSourceWindowsPowerShell {
     $systemRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
@@ -53,16 +54,51 @@ function Resolve-SteinSourceWindowsPowerShell {
     return $item.FullName
 }
 
+function Resolve-SteinSourcePwsh {
+    $command = Get-Command "pwsh.exe" -CommandType Application -ErrorAction Stop |
+        Select-Object -First 1
+    if ($null -eq $command -or [string]::IsNullOrWhiteSpace([string]$command.Source)) {
+        throw "The required pwsh source-verification host is unavailable."
+    }
+    $candidate = [IO.Path]::GetFullPath([string]$command.Source)
+    if ([IO.Path]::GetFileName($candidate) -cne "pwsh.exe") {
+        throw "The required pwsh source-verification host is invalid."
+    }
+    $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        $item.Length -le 0) {
+        throw "The required pwsh source-verification host is invalid."
+    }
+    $signature = Get-AuthenticodeSignature -LiteralPath $item.FullName -ErrorAction Stop
+    $expectedSubject =
+        "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
+    if ([string]$signature.Status -cne "Valid" -or
+        $null -eq $signature.SignerCertificate -or
+        [string]$signature.SignerCertificate.Subject -cne $expectedSubject) {
+        throw "The required pwsh source-verification host has an invalid publisher signature."
+    }
+    $probe = $item.Directory
+    while ($null -ne $probe) {
+        if (($probe.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "The required pwsh source-verification host is invalid."
+        }
+        $probe = $probe.Parent
+    }
+    return $item.FullName
+}
+
 if ($env:OS -cne "Windows_NT") {
     throw "Phase 2 source verification must run with native Windows tools."
 }
 
-foreach ($tool in @("cargo.exe", "rustc.exe", "node.exe", "pnpm.cmd")) {
+foreach ($tool in @("cargo.exe", "rustc.exe", "node.exe", "pnpm.cmd", "git.exe")) {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
         throw "Required source-verification tool is unavailable: $tool"
     }
 }
 $powershell = Resolve-SteinSourceWindowsPowerShell
+$pwsh = Resolve-SteinSourcePwsh
 
 if ([string]::IsNullOrWhiteSpace($EvidenceRoot)) {
     $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
@@ -79,6 +115,18 @@ $null = New-Item -ItemType Directory -Path $evidencePath -Force
 
 $checks = New-Object Collections.Generic.List[object]
 $startedAt = (Get-Date).ToUniversalTime()
+$toolExecutables = [ordered]@{
+    cargo = (Get-Command "cargo.exe" -ErrorAction Stop).Source
+    rustc = (Get-Command "rustc.exe" -ErrorAction Stop).Source
+    node = (Get-Command "node.exe" -ErrorAction Stop).Source
+    pnpm = (Get-Command "pnpm.cmd" -ErrorAction Stop).Source
+    git = (Get-Command "git.exe" -ErrorAction Stop).Source
+    pwsh = $pwsh
+}
+$initialProvenance = Get-SteinSourceEvidenceProvenance `
+    -RepositoryRoot $repoRoot `
+    -ToolExecutables $toolExecutables
+$initialProvenanceDigest = Get-SteinSourceEvidenceObjectDigest -Value $initialProvenance
 
 function ConvertTo-SteinSafeLeaf {
     param([Parameter(Mandatory = $true)][string] $Value)
@@ -228,8 +276,8 @@ try {
     $env:STEIN_EDGE_PUBLISHER_SHA256 = "2222222222222222222222222222222222222222222222222222222222222222"
     $env:STEIN_EDGE_HOST_PUBLISHER_SHA256 = "3333333333333333333333333333333333333333333333333333333333333333"
 
-    $cargo = (Get-Command "cargo.exe" -ErrorAction Stop).Source
-    $pnpm = (Get-Command "pnpm.cmd" -ErrorAction Stop).Source
+    $cargo = [string]$toolExecutables["cargo"]
+    $pnpm = [string]$toolExecutables["pnpm"]
     Invoke-SteinSourceCheck -Id "rust-format" -Executable $cargo `
         -Arguments @("fmt", "--all", "--", "--check") -WorkingDirectory $repoRoot
     Invoke-SteinSourceCheck -Id "rust-check" -Executable $cargo `
@@ -279,6 +327,13 @@ try {
             "-File", (Join-Path $repoRoot "scripts\windows\check-boundaries.ps1"),
             "-Json"
         ) -WorkingDirectory $repoRoot
+    Invoke-SteinSourceCheck -Id "source-evidence-contract" -Executable $powershell `
+        -Arguments @(
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", (Join-Path $repoRoot "scripts\windows\phase2\Test-VerifySource.ps1")
+        ) -WorkingDirectory $repoRoot
     Invoke-SteinSourceCheck -Id "installed-evidence-harness-static" -Executable $powershell `
         -Arguments @(
             "-NoLogo",
@@ -286,6 +341,25 @@ try {
             "-ExecutionPolicy", "Bypass",
             "-File", (Join-Path $repoRoot "scripts\windows\phase2\Test-VerifyInstalled.ps1")
         ) -WorkingDirectory $repoRoot
+    Invoke-SteinSourceCheck `
+        -Id "installed-reviewer-windows-powershell-contract" `
+        -Executable $powershell `
+        -Arguments @(
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", (Join-Path $repoRoot "scripts\windows\phase2\Test-ReviewInstalled.ps1")
+        ) `
+        -WorkingDirectory $repoRoot
+    Invoke-SteinSourceCheck `
+        -Id "installed-reviewer-pwsh-contract" `
+        -Executable $pwsh `
+        -Arguments @(
+            "-NoLogo",
+            "-NoProfile",
+            "-File", (Join-Path $repoRoot "scripts\windows\phase2\Test-ReviewInstalled.ps1")
+        ) `
+        -WorkingDirectory $repoRoot
     Invoke-SteinSourceCheck -Id "msix-static-contract" -Executable $powershell `
         -Arguments @(
             "-NoProfile",
@@ -331,11 +405,42 @@ finally {
     $env:STEIN_EDGE_HOST_PUBLISHER_SHA256 = $originalEdgeHostPublisher
 }
 
+$completedProvenance = Get-SteinSourceEvidenceProvenance `
+    -RepositoryRoot $repoRoot `
+    -ToolExecutables $toolExecutables
+$completedProvenanceDigest = Get-SteinSourceEvidenceObjectDigest -Value $completedProvenance
+$provenanceStable = $initialProvenanceDigest -ceq $completedProvenanceDigest
+$checks.Add([ordered]@{
+    id = "source-provenance-stability"
+    status = if ($provenanceStable) { "pass" } else { "fail" }
+    initial_provenance_sha256 = $initialProvenanceDigest
+    completed_provenance_sha256 = $completedProvenanceDigest
+    failure_summary = if ($provenanceStable) {
+        $null
+    }
+    else {
+        "Repository or source-verification toolchain state changed during the run."
+    }
+})
+$generator = Get-SteinSourceEvidenceGenerator `
+    -RepositoryRoot $repoRoot `
+    -Paths @(
+        (Join-Path $PSScriptRoot "Verify-Source.ps1"),
+        (Join-Path $PSScriptRoot "Verify-Source.cmd"),
+        (Join-Path $PSScriptRoot "Source-Evidence.ps1"),
+        (Join-Path $PSScriptRoot "Test-VerifySource.ps1"),
+        (Join-Path $PSScriptRoot "Review-Installed.ps1"),
+        (Join-Path $PSScriptRoot "Review-Installed.cmd"),
+        (Join-Path $PSScriptRoot "Test-ReviewInstalled.ps1"),
+        (Join-Path $PSScriptRoot "Common.ps1"),
+        (Join-Path $repoRoot "packaging\windows-msix\PackageTools.ps1")
+    )
+$checksDigest = Get-SteinSourceEvidenceObjectDigest -Value @($checks | ForEach-Object { $_ })
 $completedAt = (Get-Date).ToUniversalTime()
 $failed = @($checks | Where-Object { $_.status -eq "fail" })
 $notRun = @($checks | Where-Object { $_.status -eq "not_run" })
 $report = [ordered]@{
-    schema_version = 1
+    schema_version = 2
     claim = "source_verification_only"
     installed_or_signed_evidence = $false
     passed = $failed.Count -eq 0
@@ -345,9 +450,19 @@ $report = [ordered]@{
     host = [ordered]@{
         os_version = [Environment]::OSVersion.VersionString
         process_architecture = $env:PROCESSOR_ARCHITECTURE
+        powershell_edition = [string]$PSVersionTable.PSEdition
+        powershell_version = $PSVersionTable.PSVersion.ToString()
         elevated = [Security.Principal.WindowsPrincipal]::new(
             [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
                 [Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    provenance = $completedProvenance
+    integrity = [ordered]@{
+        semantics = "content_integrity_only_not_authentication"
+        generator = $generator
+        provenance_sha256 = $completedProvenanceDigest
+        checks_sha256 = $checksDigest
+        root_anchor_path = "root-anchor.json"
     }
     checks = @($checks | ForEach-Object { $_ })
     summary = [ordered]@{
@@ -357,8 +472,16 @@ $report = [ordered]@{
     }
 }
 $reportPath = Join-Path $evidencePath "source-verification.json"
-$report | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $reportPath -Encoding UTF8
+Write-SteinSourceEvidenceJson -Path $reportPath -Value $report -Depth 20
+$rootAnchor = New-SteinSourceEvidenceRootAnchor `
+    -ReportPath $reportPath `
+    -GeneratorDigest $generator.digest_sha256 `
+    -ProvenanceDigest $completedProvenanceDigest `
+    -ChecksDigest $checksDigest
+$rootAnchorPath = Join-Path $evidencePath "root-anchor.json"
+Write-SteinSourceEvidenceJson -Path $rootAnchorPath -Value $rootAnchor -Depth 8
 Write-Host "Source verification report: $reportPath"
+Write-Host "Source evidence root digest: $($rootAnchor.root_digest_sha256)"
 
 if ($failed.Count -ne 0) {
     exit 1

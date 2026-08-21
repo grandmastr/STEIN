@@ -20,11 +20,11 @@ use crate::{
         EndFocusSessionInput, ExplainInterventionInput, FocusSessionView, GoalDeletionView,
         GoalRevisionInput, GoalView, GrantPermissionInput, InterventionExplanationView,
         InterventionFeedbackInput, InterventionHistoryInput, InterventionHistoryView,
-        InterventionView, ModelRouteView, PublicErrorView, RegisterSelectedResourceInput,
-        RemoveSelectedResourceInput, ResourceView, RevokePermissionInput,
-        SelectedResourceDeletionView, SessionGrantView, SetMutedInput, StartFocusSessionInput,
-        SteinIdentityView, UpdateGoalInput, UpdateUserPreferencesInput, UserPreferencesUpdateView,
-        UserPreferencesView,
+        InterventionView, LatestModelRequestReceiptInput, ModelRequestReceiptView, ModelRouteView,
+        PublicErrorView, RegisterSelectedResourceInput, RemoveSelectedResourceInput, ResourceView,
+        RevokePermissionInput, SelectedResourceDeletionView, SessionGrantView, SetMutedInput,
+        StartFocusSessionInput, SteinIdentityView, UpdateGoalInput, UpdateUserPreferencesInput,
+        UserPreferencesUpdateView, UserPreferencesView,
     },
 };
 
@@ -332,6 +332,16 @@ impl CoreBridge {
         self.connected_client()
             .await?
             .get_intervention_history(input)
+            .await
+    }
+
+    pub async fn get_latest_model_request_receipt(
+        &self,
+        input: LatestModelRequestReceiptInput,
+    ) -> Result<Option<ModelRequestReceiptView>, PublicErrorView> {
+        self.connected_client()
+            .await?
+            .get_latest_model_request_receipt(input)
             .await
     }
 

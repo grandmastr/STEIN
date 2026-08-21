@@ -19,10 +19,10 @@ use stein_core::{
     ActorId, AuditKind, AuditRecord, DeletionSummary, DeviceId, DeviceRegistration,
     DurableRepository, ExplicitPreferences, FocusSession, FocusSessionLifecycleWrite, Goal,
     GoalCreateReceipt, GoalDeletionResult, GoalDeletionTombstone, GoalId, IdempotencyKey,
-    Intervention, InterventionDecisionWrite, InterventionState, InterventionTransitionWrite,
-    ModelRouteApproval, NativeResourceCleanup, OperationKind, OperationReceipt, OutboxState,
-    OwnerStateSnapshot, PendingDeliveryTransition, PendingInterventionDelivery, PermissionGrant,
-    PermissionGrantRevocationWrite, PolicyDecision, PolicyOutcome, PortFuture, RecordProvenance,
+    Intervention, InterventionDecisionWrite, InterventionTransitionWrite, ModelRouteApproval,
+    NativeResourceCleanup, OperationKind, OperationReceipt, OutboxState, OwnerStateSnapshot,
+    PendingDeliveryTransition, PendingInterventionDelivery, PermissionGrant,
+    PermissionGrantRevocationWrite, PolicyDecision, PortFuture, RecordProvenance,
     RecordProvenanceSource, RepositoryError, RepositoryErrorKind, ResourceBinding, ResourceId,
     SecretDeletionCleanup, SelectedResourceDeletionResult, SelectedResourceDeletionTombstone,
     SteinIdentity, USER_PREFERENCES_SCHEMA_V1,
@@ -632,7 +632,6 @@ fn initialize(connection: &mut Connection) -> Result<(), RepositoryError> {
     }
     verify_migration_catalog(connection, SCHEMA_VERSION)?;
     verify_database_integrity(connection)?;
-    recover_incomplete_outbox_attempts(connection)?;
     scrub_terminal_outbox_content(connection)?;
     verify_database_integrity(connection)?;
     verify_logical_integrity(connection)?;
@@ -1612,48 +1611,6 @@ fn verify_operation_receipts(connection: &Connection) -> Result<(), RepositoryEr
     Ok(())
 }
 
-fn recover_incomplete_outbox_attempts(connection: &mut Connection) -> Result<(), RepositoryError> {
-    let transaction = connection.transaction().map_err(sql_error)?;
-    let mut statement = transaction
-        .prepare("SELECT id,payload FROM outbox_records WHERE state='delivering'")
-        .map_err(sql_error)?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(sql_error)?;
-    let interrupted: Result<Vec<_>, RepositoryError> = rows
-        .map(|row| {
-            let (record_id, payload) = row.map_err(sql_error)?;
-            let mut delivery: PendingInterventionDelivery = decode(payload)?;
-            if record_id != id(delivery.id.as_uuid()) || delivery.state != OutboxState::Delivering {
-                return Err(relational_payload_mismatch());
-            }
-            delivery.state = OutboxState::DeliveryUnknown;
-            delivery.user_visible_text.clear();
-            Ok(delivery)
-        })
-        .collect();
-    drop(statement);
-    for delivery in interrupted? {
-        let changed = transaction
-            .execute(
-                "UPDATE outbox_records SET state='delivery_unknown',payload=?1
-                 WHERE id=?2 AND owner=?3 AND state='delivering'",
-                params![
-                    encode(&delivery)?,
-                    id(delivery.id.as_uuid()),
-                    id(delivery.owner.as_uuid()),
-                ],
-            )
-            .map_err(sql_error)?;
-        if changed != 1 {
-            return Err(relational_payload_mismatch());
-        }
-    }
-    transaction.commit().map_err(sql_error)
-}
-
 fn scrub_terminal_outbox_content(connection: &mut Connection) -> Result<(), RepositoryError> {
     let transaction = connection.transaction().map_err(sql_error)?;
     let mut statement = transaction
@@ -1970,7 +1927,10 @@ fn validate_delivery_update(
     expected
         .user_visible_text
         .clone_from(&next.user_visible_text);
-    if current.state == OutboxState::Queued && next.state != OutboxState::Queued {
+    // Only the atomic queued -> delivering attempt marker may adopt the
+    // freshly revalidated decision. Cancellation and expiry preserve the
+    // decision that originally authorized the queued content.
+    if current.state == OutboxState::Queued && next.state == OutboxState::Delivering {
         expected.policy_decision_id = next.policy_decision_id;
     }
     if transition_allowed && attempt_metadata_valid && terminal_text_valid && expected == *next {
@@ -2216,54 +2176,6 @@ fn validate_creation_audit(
             summary: "A creation audit record does not match its aggregate.",
         })
     }
-}
-
-fn validate_intervention_decision_write(
-    value: &InterventionDecisionWrite,
-) -> Result<(), RepositoryError> {
-    let decision = &value.decision;
-    if value.audit.owner != decision.owner
-        || value.audit.kind != AuditKind::InterventionDecision
-        || value.audit.subject_id != decision.candidate_id.as_uuid()
-        || value.audit.reason_codes != decision.reason_codes
-        || !decision.policy_trace.is_complete()
-        || decision.policy_version != decision.policy_trace.policy_profile_id
-        || value.audit.policy_trace.as_ref() != Some(&decision.policy_trace)
-    {
-        return Err(RepositoryError {
-            kind: RepositoryErrorKind::Corrupt,
-            summary: "An intervention decision audit does not match its decision.",
-        });
-    }
-    if value.intervention.is_none() && value.expected_intervention_revision.is_some() {
-        return Err(RepositoryError {
-            kind: RepositoryErrorKind::Corrupt,
-            summary: "An intervention revision was supplied without an intervention.",
-        });
-    }
-    if (decision.outcome == PolicyOutcome::Allow) != value.intervention.is_some() {
-        return Err(RepositoryError {
-            kind: RepositoryErrorKind::Corrupt,
-            summary: "An intervention record does not match the policy outcome.",
-        });
-    }
-    if let Some(intervention) = &value.intervention
-        && (intervention.owner != decision.owner
-            || intervention.candidate_id != decision.candidate_id
-            || intervention.candidate_revision != decision.candidate_revision
-            || intervention.policy_decision_id != decision.id
-            || intervention.focus_session_id != decision.focus_session_id
-            || !matches!(
-                intervention.state,
-                InterventionState::Allowed | InterventionState::Delivering
-            ))
-    {
-        return Err(RepositoryError {
-            kind: RepositoryErrorKind::Corrupt,
-            summary: "An intervention record does not match its policy decision.",
-        });
-    }
-    Ok(())
 }
 
 fn insert_operation_receipt(
@@ -3965,6 +3877,19 @@ impl DurableRepository for SqliteRepository {
             })?;
             let current: Intervention = decode_owned(current_payload, value.intervention.owner)?;
             value.validate_against(&current)?;
+            let policy_payload: Option<String> = transaction
+                .query_row(
+                    "SELECT payload FROM policy_records WHERE id=?1 AND owner=?2",
+                    params![
+                        id(value.intervention.policy_decision_id.as_uuid()),
+                        id(value.intervention.owner.as_uuid())
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            let policy = policy_payload.map(decode::<PolicyDecision>).transpose()?;
+            value.validate_policy_against(policy.as_ref())?;
             require_owned_reference(
                 &transaction,
                 "goals_records",
@@ -3994,7 +3919,8 @@ impl DurableRepository for SqliteRepository {
                     PendingDeliveryTransition::Enqueue(delivery) => {
                         insert_pending_delivery(&transaction, delivery)?;
                     }
-                    PendingDeliveryTransition::Update { delivery, .. } => {
+                    PendingDeliveryTransition::Update { delivery, .. }
+                    | PendingDeliveryTransition::ReconcileLegacy { delivery, .. } => {
                         update_pending_delivery(&transaction, delivery)?;
                     }
                 }
@@ -4058,7 +3984,7 @@ impl DurableRepository for SqliteRepository {
         value: &'a InterventionDecisionWrite,
     ) -> PortFuture<'a, Result<(), RepositoryError>> {
         Box::pin(async move {
-            validate_intervention_decision_write(value)?;
+            value.validate()?;
             let value = value.clone();
             self.call(move |connection| {
                 let transaction = connection
@@ -4095,6 +4021,16 @@ impl DurableRepository for SqliteRepository {
                 insert_audit(&transaction, &value.audit)?;
 
                 if let Some(intervention) = &value.intervention {
+                    let current_payload: Option<String> = transaction
+                        .query_row(
+                            "SELECT payload FROM intervention_records WHERE id=?1",
+                            [id(intervention.id.as_uuid())],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(sql_error)?;
+                    let current = current_payload.map(decode::<Intervention>).transpose()?;
+                    value.validate_against(current.as_ref())?;
                     check_expected_revision(
                         &transaction,
                         "intervention_records",

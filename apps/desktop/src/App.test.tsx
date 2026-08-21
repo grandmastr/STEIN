@@ -31,6 +31,7 @@ const rendererClient = vi.hoisted(() => ({
   getUserPreferences: vi.fn(),
   getEffectivePolicy: vi.fn(),
   getSelectedResources: vi.fn(),
+  getLatestModelRequestReceipt: vi.fn(),
   setInterventionsMuted: vi.fn(),
   endFocusSession: vi.fn(),
   recordInterventionFeedback: vi.fn(),
@@ -264,6 +265,7 @@ describe("STEIN Phase 2 desktop", () => {
     });
     rendererClient.setupModelRoute.mockResolvedValue(privateSnapshot.modelRoutes[0]);
     rendererClient.revokePermission.mockResolvedValue(undefined);
+    rendererClient.getLatestModelRequestReceipt.mockResolvedValue(null);
     rendererClient.subscribe.mockResolvedValue(() => undefined);
     rendererClient.subscribeToastActivation.mockResolvedValue(() => undefined);
     scrollIntoView.mockReset();

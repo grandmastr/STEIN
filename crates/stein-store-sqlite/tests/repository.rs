@@ -12,13 +12,16 @@ use stein_core::{
     FocusSessionId, FocusSessionLifecycleWrite, FocusSessionState, Goal, GoalCreateReceipt, GoalId,
     GoalState, GrantState, IdempotencyKey, Intervention, InterventionDecisionWrite, InterventionId,
     InterventionOutcome, InterventionState, InterventionTone, InterventionTransitionWrite,
-    MemoryRepository, ModelHandlingProfile, ModelPlacement, ModelRouteApproval,
+    ManualClock, MemoryRepository, ModelHandlingProfile, ModelPlacement, ModelRouteApproval,
     ModelRouteApprovalId, NativeResourceCleanup, OperationKind, OperationReceipt, OutboxEntryId,
     OutboxState, PendingDeliveryTransition, PendingInterventionDelivery, PermissionGrant,
     PermissionGrantId, PermissionGrantRevocationWrite, PermissionScope, PolicyDecision,
     PolicyDecisionId, PolicyOutcome, PolicyTrace, ProviderRetentionPolicy, ProviderTrainingUse,
-    RepositoryErrorKind, ResourceBinding, ResourceId, ResourceKind, Revision,
-    SecretDeletionCleanup, SteinIdentity, USER_PREFERENCES_SCHEMA_V1, Urgency,
+    RepositoryErrorKind, ResourceBinding, ResourceId, ResourceKind, Revision, SecondMindConfig,
+    SecondMindPorts, SecondMindRuntime, SecretDeletionCleanup, SteinIdentity,
+    USER_PREFERENCES_SCHEMA_V1, UnavailableEmergencyControlPort, UnavailableModelGateway,
+    UnavailableNativeStatusPort, UnavailableNotificationPort, UnavailableObservationPort,
+    UnavailableResourceSelectionPort, UnavailableSecretStore, Urgency,
 };
 use stein_store_sqlite::SqliteRepository;
 use tempfile::tempdir;
@@ -307,7 +310,7 @@ fn synthetic_graph(owner: ActorId, offset: u128) -> SyntheticGraph {
         }],
         urgency: Urgency::Normal,
         created_at: now() + Duration::seconds(2),
-        expires_at: now() + Duration::minutes(15),
+        expires_at: now() + Duration::seconds(32),
         updated_at: now() + Duration::seconds(2),
         delivery_channel: Some("windows.native_notification".to_owned()),
         delivered_at: None,
@@ -331,7 +334,7 @@ fn synthetic_graph(owner: ActorId, offset: u128) -> SyntheticGraph {
         attempt_count: 0,
         created_at: now() + Duration::seconds(2),
         not_before: now() + Duration::seconds(2),
-        expires_at: now() + Duration::minutes(15),
+        expires_at: now() + Duration::seconds(32),
         last_attempt_at: None,
     };
     let route_receipt = OperationReceipt {
@@ -435,7 +438,7 @@ fn allow_decision_write(graph: &SyntheticGraph) -> InterventionDecisionWrite {
 }
 
 fn install_graph(
-    repository: &SqliteRepository,
+    repository: &dyn DurableRepository,
     graph: &SyntheticGraph,
     with_delivery: bool,
     with_audit: bool,
@@ -451,7 +454,7 @@ fn install_graph(
     }
 }
 
-fn install_graph_foundation(repository: &SqliteRepository, graph: &SyntheticGraph) {
+fn install_graph_foundation(repository: &dyn DurableRepository, graph: &SyntheticGraph) {
     repository.save_identity(&graph.identity, None).unwrap();
     repository
         .save_preferences(&graph.preferences, None)
@@ -485,7 +488,7 @@ fn install_graph_foundation(repository: &SqliteRepository, graph: &SyntheticGrap
         .unwrap();
 }
 
-fn append_graph_audit(repository: &SqliteRepository, graph: &SyntheticGraph) {
+fn append_graph_audit(repository: &dyn DurableRepository, graph: &SyntheticGraph) {
     let subjects = std::iter::once(graph.goal.id.as_uuid())
         .chain(std::iter::once(graph.resource.id.as_uuid()))
         .chain(graph.bound_grants.iter().map(|grant| grant.id.as_uuid()))
@@ -966,14 +969,35 @@ fn memory_permission_and_intervention_transitions_commit_with_their_audits() {
     repository
         .save_intervention(&graph.intervention, None)
         .unwrap();
-    let mut delivered = graph.intervention.clone();
+    repository.save_policy_decision(&graph.policy).unwrap();
+    let mut delivering = graph.intervention.clone();
+    delivering.revision += 1;
+    delivering.state = InterventionState::Delivering;
+    delivering.updated_at = now() + Duration::seconds(3);
+    let mut attempt_audit = creation_audit(
+        actor(),
+        0x690,
+        AuditKind::InterventionDelivery,
+        delivering.id.as_uuid(),
+    );
+    attempt_audit.policy_trace = Some(graph.policy.policy_trace.clone());
+    repository
+        .save_intervention_transition(&InterventionTransitionWrite {
+            intervention: delivering.clone(),
+            expected_revision: graph.intervention.revision,
+            audit: attempt_audit.clone(),
+            delivery: None,
+        })
+        .unwrap();
+
+    let mut delivered = delivering.clone();
     delivered.revision += 1;
     delivered.state = InterventionState::AcceptedByChannel;
     delivered.delivered_at = Some(now() + Duration::seconds(4));
     delivered.updated_at = now() + Duration::seconds(4);
     let mut delivery_audit = creation_audit(
         actor(),
-        0x690,
+        0x692,
         AuditKind::InterventionDelivery,
         delivered.id.as_uuid(),
     );
@@ -981,7 +1005,7 @@ fn memory_permission_and_intervention_transitions_commit_with_their_audits() {
     repository
         .save_intervention_transition(&InterventionTransitionWrite {
             intervention: delivered.clone(),
-            expected_revision: graph.intervention.revision,
+            expected_revision: delivering.revision,
             audit: delivery_audit.clone(),
             delivery: None,
         })
@@ -996,6 +1020,7 @@ fn memory_permission_and_intervention_transitions_commit_with_their_audits() {
         .load_audit(actor(), OffsetDateTime::UNIX_EPOCH, 100)
         .unwrap();
     assert!(audit.contains(&permission_audit));
+    assert!(audit.contains(&attempt_audit));
     assert!(audit.contains(&delivery_audit));
 }
 
@@ -1328,8 +1353,8 @@ fn stale_intervention_revision_rolls_back_decision_and_audit() {
     recovery.audit.id = AuditRecordId::from_uuid(uuid(0x5f1));
     let intervention = recovery.intervention.as_mut().unwrap();
     intervention.policy_decision_id = recovery.decision.id;
-    intervention.revision = 2;
-    intervention.state = InterventionState::Delivering;
+    intervention.revision = 100;
+    intervention.state = InterventionState::Queued;
     intervention.updated_at += Duration::seconds(1);
     recovery.expected_intervention_revision = Some(99);
     {
@@ -1362,6 +1387,67 @@ fn stale_intervention_revision_rolls_back_decision_and_audit() {
             .unwrap()
             .iter()
             .all(|record| record.id != recovery.audit.id)
+    );
+}
+
+#[test]
+fn queued_revalidation_cannot_overwrite_intervention_content() {
+    let directory = tempdir().unwrap();
+    let repository =
+        SqliteRepository::open(directory.path().join("decision-revalidation-shape.db")).unwrap();
+    let graph = synthetic_graph(actor(), 0x5a0);
+    install_graph(&repository, &graph, false, false);
+
+    let mut queued = graph.intervention.clone();
+    queued.revision += 1;
+    queued.state = InterventionState::Queued;
+    queued.updated_at += Duration::seconds(1);
+    let mut queue_audit = creation_audit(
+        actor(),
+        0x5a1,
+        AuditKind::InterventionDelivery,
+        queued.id.as_uuid(),
+    );
+    queue_audit.policy_trace = Some(graph.policy.policy_trace.clone());
+    repository
+        .save_intervention_transition(&InterventionTransitionWrite {
+            intervention: queued.clone(),
+            expected_revision: graph.intervention.revision,
+            audit: queue_audit,
+            delivery: Some(PendingDeliveryTransition::Enqueue(graph.delivery.clone())),
+        })
+        .unwrap();
+
+    let mut revalidation = allow_decision_write(&graph);
+    revalidation.decision.id = PolicyDecisionId::from_uuid(uuid(0x5a2));
+    revalidation.audit.id = AuditRecordId::from_uuid(uuid(0x5a3));
+    let next = revalidation.intervention.as_mut().unwrap();
+    *next = queued.clone();
+    next.policy_decision_id = revalidation.decision.id;
+    next.revision += 1;
+    next.updated_at += Duration::seconds(1);
+    next.user_visible_text = "synthetic-overwrite-must-not-commit".to_owned();
+    revalidation.expected_intervention_revision = Some(queued.revision);
+
+    let error =
+        run_repository_future(repository.commit_intervention_decision(&revalidation)).unwrap_err();
+    assert_eq!(error.kind, RepositoryErrorKind::Conflict);
+    assert_eq!(
+        repository.load_interventions(actor()).unwrap(),
+        vec![queued]
+    );
+    assert!(
+        repository
+            .find_policy_decision(revalidation.decision.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repository
+            .load_audit(actor(), OffsetDateTime::UNIX_EPOCH, 100)
+            .unwrap()
+            .iter()
+            .all(|record| record.id != revalidation.audit.id)
     );
 }
 
@@ -1988,26 +2074,108 @@ fn relational_payload_corruption_fails_startup_health() {
 }
 
 #[test]
-fn interrupted_delivery_recovers_as_unknown_without_retry() {
+fn legacy_outbox_only_unknown_recovers_atomically_without_retry() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("outbox-crash.db");
     let graph = synthetic_graph(actor(), 0xc00);
     {
         let repository = SqliteRepository::open(&path).unwrap();
         install_graph(&repository, &graph, true, false);
+        let mut intervention = graph.intervention.clone();
+        intervention.state = InterventionState::Delivering;
+        intervention.revision += 1;
+        intervention.updated_at = now() + Duration::seconds(3);
         let mut delivering = graph.delivery.clone();
         delivering.state = OutboxState::Delivering;
         delivering.attempt_count = 1;
         delivering.last_attempt_at = Some(now() + Duration::seconds(3));
+        let mut attempt_audit = creation_audit(
+            actor(),
+            0xc80,
+            AuditKind::InterventionDelivery,
+            intervention.id.as_uuid(),
+        );
+        attempt_audit.reason_codes = vec!["delivery_attempt_started".to_owned()];
+        attempt_audit.policy_trace = Some(graph.policy.policy_trace.clone());
+        repository
+            .save_intervention_transition(&InterventionTransitionWrite {
+                intervention,
+                expected_revision: graph.intervention.revision,
+                audit: attempt_audit,
+                delivery: Some(PendingDeliveryTransition::Update {
+                    delivery: delivering.clone(),
+                    expected_state: OutboxState::Queued,
+                }),
+            })
+            .unwrap();
+        // Older repository-open recovery mutated only the outbox. Preserve
+        // that historical mismatch as a restart fixture.
+        delivering.state = OutboxState::DeliveryUnknown;
+        delivering.user_visible_text.clear();
         repository.save_delivery(&delivering).unwrap();
     }
 
     let repository = SqliteRepository::open(&path).unwrap();
+    assert_eq!(
+        repository.load_pending_deliveries(actor()).unwrap()[0].state,
+        OutboxState::DeliveryUnknown,
+        "repository open must not perform an unaudited semantic recovery"
+    );
+    assert_eq!(
+        repository.load_interventions(actor()).unwrap()[0].state,
+        InterventionState::Delivering
+    );
+    let runtime = SecondMindRuntime::new(
+        SecondMindConfig::default(),
+        SecondMindPorts {
+            repository: Arc::new(repository.clone()),
+            clock: Arc::new(ManualClock::new(now() + Duration::seconds(4))),
+            observation: Arc::new(UnavailableObservationPort),
+            model: Arc::new(UnavailableModelGateway),
+            notification: Arc::new(UnavailableNotificationPort),
+            native_status: Arc::new(UnavailableNativeStatusPort),
+            emergency_control: Arc::new(UnavailableEmergencyControlPort),
+            secret_store: Arc::new(UnavailableSecretStore::default()),
+            resource_selection: Arc::new(UnavailableResourceSelectionPort),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        runtime
+            .reconcile_interrupted_deliveries(actor())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        runtime
+            .reconcile_interrupted_deliveries(actor())
+            .unwrap()
+            .is_empty(),
+        "runtime recovery must be idempotent"
+    );
     let recovered = repository.load_pending_deliveries(actor()).unwrap();
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].state, OutboxState::DeliveryUnknown);
     assert_eq!(recovered[0].attempt_count, 1);
     assert!(recovered[0].user_visible_text.is_empty());
+    assert_eq!(
+        repository.load_interventions(actor()).unwrap()[0].state,
+        InterventionState::DeliveryUnknown
+    );
+    assert!(
+        repository
+            .load_audit(actor(), OffsetDateTime::UNIX_EPOCH, 100)
+            .unwrap()
+            .iter()
+            .any(|record| {
+                record.kind == AuditKind::InterventionDelivery
+                    && record
+                        .reason_codes
+                        .iter()
+                        .any(|reason| reason == "delivery_unknown_after_restart")
+            })
+    );
     drop(repository);
 
     let restarted = SqliteRepository::open(&path).unwrap();
@@ -2067,6 +2235,124 @@ fn outbox_bounds_and_state_machine_fail_closed() {
         .find(|delivery| delivery.id == expired.id)
         .unwrap();
     assert!(persisted.user_visible_text.is_empty());
+}
+
+#[test]
+fn memory_and_sqlite_reject_terminal_pointer_replacement_with_identical_results() {
+    let directory = tempdir().unwrap();
+    let sqlite = SqliteRepository::open(directory.path().join("outbox-pointer-parity.db")).unwrap();
+    let memory = MemoryRepository::default();
+    let graph = synthetic_graph(actor(), 0xda0);
+    install_graph(&sqlite, &graph, true, false);
+    install_graph(&memory, &graph, true, false);
+
+    for repository in [
+        &memory as &dyn DurableRepository,
+        &sqlite as &dyn DurableRepository,
+    ] {
+        let mut invalid_terminal = graph.delivery.clone();
+        invalid_terminal.state = OutboxState::Cancelled;
+        invalid_terminal.policy_decision_id = PolicyDecisionId::from_uuid(uuid(0xdff));
+        invalid_terminal.user_visible_text.clear();
+        assert_eq!(
+            repository
+                .save_delivery(&invalid_terminal)
+                .unwrap_err()
+                .kind,
+            RepositoryErrorKind::Conflict,
+            "only queued -> delivering may adopt a fresh policy decision"
+        );
+
+        let mut invalid_bypass = graph.delivery.clone();
+        invalid_bypass.state = OutboxState::AcceptedByChannel;
+        invalid_bypass.user_visible_text.clear();
+        assert_eq!(
+            repository.save_delivery(&invalid_bypass).unwrap_err().kind,
+            RepositoryErrorKind::Conflict,
+            "a queued record cannot bypass the durable attempt marker"
+        );
+
+        let mut valid_terminal = graph.delivery.clone();
+        valid_terminal.state = OutboxState::Cancelled;
+        repository.save_delivery(&valid_terminal).unwrap();
+        let persisted = repository
+            .load_pending_deliveries(actor())
+            .unwrap()
+            .into_iter()
+            .find(|delivery| delivery.id == valid_terminal.id)
+            .unwrap();
+        assert!(
+            persisted.user_visible_text.is_empty(),
+            "both repositories scrub caller-supplied text at terminal save"
+        );
+    }
+}
+
+#[test]
+fn memory_and_sqlite_require_a_delivering_intervention_before_delivery_failed() {
+    let directory = tempdir().unwrap();
+    let sqlite =
+        SqliteRepository::open(directory.path().join("delivery-marker-parity.db")).unwrap();
+    let memory = MemoryRepository::default();
+    let graph = synthetic_graph(actor(), 0xdb0);
+
+    for repository in [
+        &memory as &dyn DurableRepository,
+        &sqlite as &dyn DurableRepository,
+    ] {
+        install_graph(repository, &graph, false, false);
+        let mut queued = graph.intervention.clone();
+        queued.revision = queued.revision.saturating_add(1);
+        queued.state = InterventionState::Queued;
+        queued.updated_at = now() + Duration::seconds(3);
+        let mut queued_audit = creation_audit(
+            actor(),
+            0xdc8,
+            AuditKind::InterventionDelivery,
+            queued.id.as_uuid(),
+        );
+        queued_audit.policy_trace = Some(graph.policy.policy_trace.clone());
+        repository
+            .save_intervention_transition(&InterventionTransitionWrite {
+                intervention: queued.clone(),
+                expected_revision: graph.intervention.revision,
+                audit: queued_audit,
+                delivery: Some(PendingDeliveryTransition::Enqueue(graph.delivery.clone())),
+            })
+            .unwrap();
+
+        let mut bypass = queued.clone();
+        bypass.revision = bypass.revision.saturating_add(1);
+        bypass.state = InterventionState::DeliveryFailed;
+        bypass.updated_at = now() + Duration::seconds(4);
+        let mut bypass_audit = creation_audit(
+            actor(),
+            0xdca,
+            AuditKind::InterventionDelivery,
+            bypass.id.as_uuid(),
+        );
+        bypass_audit.policy_trace = Some(graph.policy.policy_trace.clone());
+        assert_eq!(
+            repository
+                .save_intervention_transition(&InterventionTransitionWrite {
+                    intervention: bypass,
+                    expected_revision: queued.revision,
+                    audit: bypass_audit,
+                    delivery: None,
+                })
+                .unwrap_err()
+                .kind,
+            RepositoryErrorKind::Conflict
+        );
+        assert_eq!(
+            repository
+                .load_interventions(actor())
+                .unwrap()
+                .into_iter()
+                .find(|intervention| intervention.id == queued.id),
+            Some(queued)
+        );
+    }
 }
 
 #[test]

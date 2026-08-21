@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ActorId, AuthorityReference, ClientInstanceId, DaemonInstanceId, DeliveryChannelId, DeviceId,
     FocusSessionId, GoalId, InterventionId, ModelRouteApprovalId, ObservationSourceId,
-    PermissionGrantId, PolicyDecisionId, ProtocolVersion, RetentionClass, SelectedResourceId,
-    SensitivityClass, SnapshotId, UtcTimestamp,
+    PermissionGrantId, PolicyDecisionId, ProtocolVersion, RequestId, RetentionClass,
+    SelectedResourceId, SensitivityClass, SnapshotId, UtcTimestamp,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -470,6 +470,29 @@ pub struct FocusSessionView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<UtcTimestamp>,
     pub updated_at: UtcTimestamp,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRequestReceiptOutcome {
+    InFlight,
+    CompletedStrictSilence,
+    CompletedStrictCandidate,
+    Cancelled,
+    DeadlineExceeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ModelRequestReceiptView {
+    pub request_id: RequestId,
+    pub focus_session_id: FocusSessionId,
+    pub model_route_approval_id: ModelRouteApprovalId,
+    pub model_route_revision: u64,
+    pub started_at: UtcTimestamp,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<UtcTimestamp>,
+    pub outcome: ModelRequestReceiptOutcome,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

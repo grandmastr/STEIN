@@ -350,6 +350,24 @@ export interface FocusSessionView {
   updated_at: UtcTimestamp;
 }
 
+export type ModelRequestReceiptOutcome =
+  | "in_flight"
+  | "completed_strict_silence"
+  | "completed_strict_candidate"
+  | "cancelled"
+  | "deadline_exceeded"
+  | "failed";
+
+export interface ModelRequestReceiptView {
+  request_id: Uuid;
+  focus_session_id: Uuid;
+  model_route_approval_id: Uuid;
+  model_route_revision: number;
+  started_at: UtcTimestamp;
+  completed_at?: UtcTimestamp;
+  outcome: ModelRequestReceiptOutcome;
+}
+
 export interface CaptureStateView {
   focus_session_id: Uuid;
   revision: number;
@@ -497,7 +515,7 @@ export type ResponseBody =
       payload: { runtime: RuntimeStatus; capabilities: CapabilityHealth[] };
     }
   | { response_type: "get_goal"; payload: { goal: GoalView } }
-  | { response_type: "get_focus_session_view"; payload: { focus_session: FocusSessionView; capture?: CaptureStateView } }
+  | { response_type: "get_focus_session_view"; payload: { focus_session: FocusSessionView; capture?: CaptureStateView; latest_model_request_receipt?: ModelRequestReceiptView } }
   | { response_type: "get_capability_health"; payload: { capabilities: CapabilityHealth[] } }
   | { response_type: "get_permission_view"; payload: { records: PermissionRecordView[] } }
   | { response_type: "get_intervention_history"; payload: { history: { as_of: UtcTimestamp; entries: InterventionView[] } } }
@@ -1092,6 +1110,28 @@ function focusSession(value: unknown, path: string): void {
   timestamp(item.updated_at, `${path}.updated_at`);
 }
 
+function modelRequestReceipt(value: unknown, path: string): void {
+  const item = object(value, path);
+  uuid(item.request_id, `${path}.request_id`);
+  uuid(item.focus_session_id, `${path}.focus_session_id`);
+  uuid(item.model_route_approval_id, `${path}.model_route_approval_id`);
+  number(item.model_route_revision, `${path}.model_route_revision`);
+  timestamp(item.started_at, `${path}.started_at`);
+  optional(item.completed_at, timestamp, `${path}.completed_at`);
+  oneOf(
+    item.outcome,
+    [
+      "in_flight",
+      "completed_strict_silence",
+      "completed_strict_candidate",
+      "cancelled",
+      "deadline_exceeded",
+      "failed",
+    ] as const,
+    `${path}.outcome`,
+  );
+}
+
 function capture(value: unknown, path: string): void {
   const item = object(value, path);
   uuid(item.focus_session_id, `${path}.focus_session_id`);
@@ -1396,6 +1436,11 @@ function responseBody(value: unknown, path: string): void {
     case "get_focus_session_view":
       focusSession(payload.focus_session, `${path}.payload.focus_session`);
       optional(payload.capture, capture, `${path}.payload.capture`);
+      optional(
+        payload.latest_model_request_receipt,
+        modelRequestReceipt,
+        `${path}.payload.latest_model_request_receipt`,
+      );
       break;
     case "get_capability_health":
       array(payload.capabilities, `${path}.payload.capabilities`).forEach((entry, index) => capability(entry, `${path}.payload.capabilities[${index}]`));

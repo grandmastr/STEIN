@@ -5,6 +5,8 @@ import type {
   EndFocusSessionInput,
   FocusSessionView,
   GoalView,
+  LatestModelRequestReceiptInput,
+  ModelRequestReceiptView,
   ModelRouteView,
   PublicErrorView,
   ResourceView,
@@ -24,16 +26,36 @@ interface Props {
   onStart: (input: StartFocusSessionInput) => Promise<FocusSessionView>;
   onSetMuted: (input: SetMutedInput) => Promise<FocusSessionView>;
   onEnd: (input: EndFocusSessionInput) => Promise<FocusSessionView>;
+  onGetLatestModelRequestReceipt: (
+    input: LatestModelRequestReceiptInput,
+  ) => Promise<ModelRequestReceiptView | null>;
 }
 
 const RUNNING_STATES = new Set(["requested", "starting", "active", "recovering", "stopping"]);
 
-export function FocusPanel({ disabled, goals, routes, grants, resources, sessions, captures, onStart, onSetMuted, onEnd }: Props) {
+export function FocusPanel({
+  disabled,
+  goals,
+  routes,
+  grants,
+  resources,
+  sessions,
+  captures,
+  onStart,
+  onSetMuted,
+  onEnd,
+  onGetLatestModelRequestReceipt,
+}: Props) {
   const [goalId, setGoalId] = useState("");
   const [routeId, setRouteId] = useState("");
   const [grantIds, setGrantIds] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [receiptPendingFor, setReceiptPendingFor] = useState<string | null>(null);
+  const [receiptBySession, setReceiptBySession] = useState<
+    Record<string, ModelRequestReceiptView | null>
+  >({});
+  const [receiptErrorBySession, setReceiptErrorBySession] = useState<Record<string, string>>({});
   const commandIdentity = useRef<{ fingerprint: string; key: string } | null>(null);
   const selectedGoal = goals.find((goal) => goal.id === goalId);
   const eligibleGrants = useMemo(
@@ -80,6 +102,27 @@ export function FocusPanel({ disabled, goals, routes, grants, resources, session
       setMessage((caught as PublicErrorView).summary ?? "CORE could not start this focus session.");
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  async function getLatestModelRequestReceipt(focusSessionId: string) {
+    setReceiptPendingFor(focusSessionId);
+    setReceiptErrorBySession((current) => {
+      const next = { ...current };
+      delete next[focusSessionId];
+      return next;
+    });
+    try {
+      const receipt = await onGetLatestModelRequestReceipt({ focusSessionId });
+      setReceiptBySession((current) => ({ ...current, [focusSessionId]: receipt }));
+    } catch (caught) {
+      setReceiptErrorBySession((current) => ({
+        ...current,
+        [focusSessionId]:
+          (caught as PublicErrorView).summary ?? "CORE could not read the latest model request receipt.",
+      }));
+    } finally {
+      setReceiptPendingFor(null);
     }
   }
 
@@ -138,6 +181,9 @@ export function FocusPanel({ disabled, goals, routes, grants, resources, session
         <div className="record-stack" aria-label="Focus session status">
           {sessions.length === 0 ? <p className="empty-inline">No focus session exists.</p> : sessions.map((session) => {
             const capture = captures.find((item) => item.focusSessionId === session.id);
+            const receiptWasRead = Object.prototype.hasOwnProperty.call(receiptBySession, session.id);
+            const receipt = receiptBySession[session.id];
+            const receiptError = receiptErrorBySession[session.id];
             return (
               <article className="record-card session-card" key={session.id}>
                 <div className="record-card__heading"><strong>{goals.find((goal) => goal.id === session.goalId)?.title ?? "Focus session"}</strong><span className={`status-chip status-chip--${session.state}`}>{session.state}</span></div>
@@ -155,6 +201,31 @@ export function FocusPanel({ disabled, goals, routes, grants, resources, session
                   </div>
                 ) : <p>Capture view not available.</p>}
                 <small>Revision {session.revision} · desktop close {session.whileClientDisconnected ? "allowed" : "not allowed"} · restart {session.afterDaemonRestart ? "allowed" : "not allowed"}</small>
+                <div className="button-row">
+                  <button
+                    className="button button--ghost button--small"
+                    disabled={disabled || receiptPendingFor !== null}
+                    type="button"
+                    onClick={() => void getLatestModelRequestReceipt(session.id)}
+                  >
+                    {receiptPendingFor === session.id ? "Checking…" : "Check latest model request receipt"}
+                  </button>
+                </div>
+                <small>This read-only check reports an existing daemon request. It never starts a model request.</small>
+                {receipt ? (
+                  <div className="source-health" aria-label={`Latest model request receipt for ${session.id}`}>
+                    <strong>Latest model request receipt</strong>
+                    <span>Outcome: <code>{receipt.outcome}</code></span>
+                    <span>Request: <code>{receipt.requestId}</code></span>
+                    <span>Focus session: <code>{receipt.focusSessionId}</code></span>
+                    <span>Model route approval: <code>{receipt.modelRouteApprovalId}</code> · revision {receipt.modelRouteRevision}</span>
+                    <span>Started: <time dateTime={receipt.startedAt}>{receipt.startedAt}</time></span>
+                    <span>Completed: {receipt.completedAt ? <time dateTime={receipt.completedAt}>{receipt.completedAt}</time> : "not completed"}</span>
+                  </div>
+                ) : receiptWasRead ? (
+                  <p className="empty-inline" role="status">No model request receipt exists for this focus session.</p>
+                ) : null}
+                {receiptError ? <p className="form-result" role="alert">{receiptError}</p> : null}
                 {RUNNING_STATES.has(session.state) ? (
                   <div className="button-row">
                     <button className="button button--ghost button--small" disabled={disabled} type="button" onClick={() => void onSetMuted({ focusSessionId: session.id, expectedRevision: session.revision, muted: !session.interventionsMuted })}>{session.interventionsMuted ? "Unmute delivery" : "Mute delivery"}</button>

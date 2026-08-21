@@ -127,6 +127,25 @@ cannot be part of a SQLite transaction, so the pre-delivery policy/audit
 acknowledgement remains the action boundary and the strongest post-attempt state
 and delivery audit commit together immediately afterward.
 
+Because the external submission cannot join that transaction, `delivering` is a
+durable pre-attempt marker rather than an in-memory status. Direct delivery
+commits the intervention marker plus its content-free delivery audit before the
+adapter call. Recovered delivery commits the intervention marker, matching
+outbox marker and attempt metadata, fresh policy-decision reference, and audit in
+one transaction. The repository accepts a recovery policy update only as a
+narrow `queued -> queued` revalidation: revision increments by one and no
+intervention content or identity may be overwritten.
+
+Opening SQLite establishes schema, pragmas, integrity, and physical privacy
+maintenance, but it does not infer or mutate a delivery outcome. Before any
+workflow or delivery scheduler is reactivated, application startup reconciles
+interrupted records through the typed intervention transaction. A direct
+`delivering` record, an outbox `delivering` record, or the legacy mismatch where
+the outbox is already `delivery_unknown` becomes an atomic intervention/outbox/
+audit `delivery_unknown` result and is never retried. Definitely unattempted
+orphan `allowed` records are cancelled and scrubbed. These rules use the existing
+states and tables, so they require no schema migration.
+
 A durable `Stopping` session is also the bounded cleanup obligation for that
 workflow. Authority and queued delivery text are revoked before native cleanup.
 If the daemon exits after `Stopping` commits, startup scrubs the session outbox
@@ -258,6 +277,10 @@ outbox mutation, or workflow recovery fail the protected operation closed.
   declared boundaries, and deletion removes them from every public read path.
 - Audit-before-delivery and outbox writes fail closed under busy, I/O, full-disk,
   and transaction-rollback injection.
+- Repository open does not perform an outbox-only delivery-state recovery.
+  Startup crash fixtures prove direct and queued pre-attempt markers, terminal
+  reconciliation, and the correlated delivery audit are visible together or not
+  at all, including the legacy outbox-unknown/intervention-delivering mismatch.
 - A conflicting lifecycle-audit insert rolls back its focus-session revision,
   while restart fixtures prove a durable `Stopping` session resumes bounded
   adapter/native-status cleanup and reaches an audited terminal state.

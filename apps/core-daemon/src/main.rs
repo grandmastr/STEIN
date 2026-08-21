@@ -154,6 +154,7 @@ async fn recover_daemon_workflows(core: &CoreApplication, owner: Option<ActorId>
     let owner = owner.context("production CORE has no stable Windows owner")?;
     let recovery = production::recover_authorized_workflows(core, owner).await?;
     info!(
+        interrupted_deliveries = recovery.interrupted_deliveries_reconciled,
         reactivated_sessions = recovery.reactivated_with_fresh_sources,
         ended_sessions = recovery.ended_without_restart_authority,
         resumed_stopping_cleanup = recovery.resumed_stopping_cleanup,

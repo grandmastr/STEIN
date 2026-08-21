@@ -143,6 +143,15 @@ The adapter reports:
 Focus Assist, user notification settings, and OS suppression may leave that as
 the strongest known outcome. An ambiguous result is not blindly retried.
 
+The adapter cannot be invoked until CORE has durably committed a candidate-
+specific `delivering` marker and content-free delivery audit. Cancellation and
+authority are checked again after that marker and immediately before the native
+submission claim. If the process dies after the marker and before a terminal
+result commits, startup records `delivery_unknown` and never calls the adapter
+for that attempt again. This deliberately trades a possible missed notification
+for freedom from duplicate private toasts; no cross-system exactly-once claim is
+made.
+
 ### Durable bounded outbox
 
 The Intervention owner persists the `PendingInterventionDelivery` accepted in
@@ -159,6 +168,13 @@ leave an orphan queued item or an unaudited delivery outcome. The native call is
 still outside SQLite: its candidate-specific policy decision and audit must be
 durably acknowledged before submission, and the strongest known result is
 persisted atomically with its post-attempt audit immediately afterward.
+
+For recovered items, `queued -> delivering`, attempt count/time, the fresh policy
+decision reference, the matching intervention revision, and the delivery audit
+are one transaction. Merely committing fresh policy revalidation does not mark an
+attempt. SQLite open does not perform outbox-only semantic recovery; runtime
+startup reconciles interrupted and legacy mismatched records atomically before
+reactivating sessions or scheduling the outbox.
 
 Channel recovery schedules bounded revalidation; it does not drain the table.
 Current policy rechecks goal/session relevance, grants, expiry, novelty, cooldown,
@@ -219,6 +235,10 @@ recovery before those platform capabilities are called supported.
   items and remove private text.
 - Daemon restart with queued, attempted, acknowledged, and ambiguous fixtures
   does not duplicate delivery.
+- Crash-point fixtures cover direct and recovered delivery before the durable
+  marker, after the marker, after Windows submission, and before terminal audit;
+  only definitely unattempted queued work may be reconsidered, while every
+  marked ambiguous attempt becomes audited `delivery_unknown` without resubmit.
 - Golden outbox, toast activation, logs, audit, protocol, and database inspection
   contain none of the prohibited fields.
 - Install, upgrade, reinstall, and uninstall tests leave exactly the intended

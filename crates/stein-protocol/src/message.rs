@@ -825,6 +825,8 @@ pub struct GetFocusSessionViewResponse {
     pub focus_session: FocusSessionView,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture: Option<crate::CaptureStateView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_model_request_receipt: Option<crate::ModelRequestReceiptView>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

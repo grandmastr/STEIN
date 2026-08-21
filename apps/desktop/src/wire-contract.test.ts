@@ -85,6 +85,49 @@ describe("Rust/TypeScript v1 golden wire contract", () => {
     expect(JSON.parse(JSON.stringify(decodePhase2ResponseBodies(source)))).toEqual(JSON.parse(source));
   });
 
+  it("validates the additive content-free model request receipt", () => {
+    const responses = decodePhase2ResponseBodies(fixture("phase2-response-bodies.json"));
+    const focus = responses.find(
+      (response) => response.response_type === "get_focus_session_view",
+    );
+    if (!focus || focus.response_type !== "get_focus_session_view") {
+      throw new Error("fixture is missing get_focus_session_view");
+    }
+    const receipt = focus.payload.latest_model_request_receipt;
+    expect(receipt).toBeDefined();
+    expect(receipt?.focus_session_id).toBe(focus.payload.focus_session.focus_session_id);
+    expect(receipt?.model_route_approval_id).toBe(
+      focus.payload.focus_session.model_route_approval_id,
+    );
+    expect(receipt?.outcome).toBe("completed_strict_candidate");
+    expect(Object.keys(receipt ?? {}).sort()).toEqual([
+      "completed_at",
+      "focus_session_id",
+      "model_route_approval_id",
+      "model_route_revision",
+      "outcome",
+      "request_id",
+      "started_at",
+    ]);
+
+    const malformed = JSON.parse(fixture("phase2-response-bodies.json")) as Array<{
+      response_type: string;
+      payload: Record<string, unknown>;
+    }>;
+    const malformedFocus = malformed.find(
+      (response) => response.response_type === "get_focus_session_view",
+    );
+    if (!malformedFocus) throw new Error("fixture is missing get_focus_session_view");
+    const malformedReceipt = malformedFocus.payload.latest_model_request_receipt as Record<
+      string,
+      unknown
+    >;
+    malformedReceipt.outcome = "completed_with_provider_payload";
+    expect(() => decodePhase2ResponseBodies(JSON.stringify(malformed))).toThrow(
+      "latest_model_request_receipt.outcome",
+    );
+  });
+
   it("round-trips every typed Phase 2 view event", () => {
     const source = fixture("phase2-view-events.json");
     expect(JSON.parse(JSON.stringify(decodePhase2ViewEvents(source)))).toEqual(JSON.parse(source));

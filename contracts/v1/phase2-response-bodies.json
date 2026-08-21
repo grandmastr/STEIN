@@ -316,6 +316,15 @@
         "native_status_visible": true,
         "emergency_stop_available": true,
         "updated_at": "2026-08-19T14:42:00Z"
+      },
+      "latest_model_request_receipt": {
+        "request_id": "018f0000-0000-7000-8000-000000000801",
+        "focus_session_id": "018f0000-0000-7000-8000-000000000601",
+        "model_route_approval_id": "018f0000-0000-7000-8000-000000000501",
+        "model_route_revision": 1,
+        "started_at": "2026-08-19T14:41:00Z",
+        "completed_at": "2026-08-19T14:41:02Z",
+        "outcome": "completed_strict_candidate"
       }
     }
   },

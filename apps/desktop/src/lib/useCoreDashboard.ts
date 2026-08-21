@@ -12,6 +12,7 @@ import type {
   InterventionFeedbackInput,
   InterventionExplanationView,
   InterventionHistoryInput,
+  LatestModelRequestReceiptInput,
   PublicErrorView,
   RegisterSelectedResourceInput,
   RemoveSelectedResourceInput,
@@ -325,6 +326,11 @@ export function useCoreDashboard(client: CoreRendererClient = core) {
     getSelectedResources: useCallback(
       () => runCommand(client.getSelectedResources),
       [client.getSelectedResources, runCommand],
+    ),
+    getLatestModelRequestReceipt: useCallback(
+      (input: LatestModelRequestReceiptInput) =>
+        runCommand(() => client.getLatestModelRequestReceipt(input)),
+      [client, runCommand],
     ),
     setInterventionsMuted: useCallback(
       (input: SetMutedInput) => runCommand(() => client.setInterventionsMuted(input)),

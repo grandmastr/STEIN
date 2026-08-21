@@ -694,6 +694,16 @@ impl CoreApplication {
                         .second_mind()
                         .observation_source_statuses(context.assurance, owner, session_id)
                         .unwrap_or_default();
+                    let latest_model_request_receipt =
+                        if supports_model_request_receipt(context.negotiated_version) {
+                            self.second_mind()
+                                .latest_model_request_receipt(context.assurance, owner, session_id)
+                                .map_err(crate::application::second_mind_error_to_application)?
+                                .as_ref()
+                                .map(model_request_receipt_to_wire)
+                        } else {
+                            None
+                        };
                     Ok(wire::ResponseBody::GetFocusSessionView(Box::new(
                         wire::GetFocusSessionViewResponse {
                             focus_session: focus_session_to_wire(session),
@@ -703,6 +713,7 @@ impl CoreApplication {
                                 &state.grants,
                                 &statuses,
                             )),
+                            latest_model_request_receipt,
                         },
                     )))
                 }
@@ -1289,6 +1300,44 @@ fn focus_session_to_wire(value: &crate::FocusSession) -> wire::FocusSessionView 
         ended_at: value.ended_at.map(wire::UtcTimestamp::from_datetime),
         updated_at: wire::UtcTimestamp::from_datetime(value.updated_at),
     }
+}
+
+fn model_request_receipt_to_wire(
+    value: &crate::ModelRequestReceipt,
+) -> wire::ModelRequestReceiptView {
+    wire::ModelRequestReceiptView {
+        request_id: wire::RequestId::from_uuid(value.request_id),
+        focus_session_id: wire::FocusSessionId::from_uuid(value.focus_session_id.as_uuid()),
+        model_route_approval_id: wire::ModelRouteApprovalId::from_uuid(
+            value.model_route_approval_id.as_uuid(),
+        ),
+        model_route_revision: value.model_route_revision,
+        started_at: wire::UtcTimestamp::from_datetime(value.started_at),
+        completed_at: value.completed_at.map(wire::UtcTimestamp::from_datetime),
+        outcome: match value.outcome {
+            crate::ModelRequestReceiptOutcome::InFlight => {
+                wire::ModelRequestReceiptOutcome::InFlight
+            }
+            crate::ModelRequestReceiptOutcome::CompletedStrictSilence => {
+                wire::ModelRequestReceiptOutcome::CompletedStrictSilence
+            }
+            crate::ModelRequestReceiptOutcome::CompletedStrictCandidate => {
+                wire::ModelRequestReceiptOutcome::CompletedStrictCandidate
+            }
+            crate::ModelRequestReceiptOutcome::Cancelled => {
+                wire::ModelRequestReceiptOutcome::Cancelled
+            }
+            crate::ModelRequestReceiptOutcome::DeadlineExceeded => {
+                wire::ModelRequestReceiptOutcome::DeadlineExceeded
+            }
+            crate::ModelRequestReceiptOutcome::Failed => wire::ModelRequestReceiptOutcome::Failed,
+        },
+    }
+}
+
+const fn supports_model_request_receipt(version: wire::ProtocolVersion) -> bool {
+    version.major == wire::ProtocolVersion::V1_2.major
+        && version.minor >= wire::ProtocolVersion::V1_2.minor
 }
 
 fn capture_state_to_wire(
@@ -2890,5 +2939,91 @@ mod tests {
                 .unwrap()
                 .contains("private-marker")
         );
+    }
+
+    #[test]
+    fn model_request_receipt_is_v1_2_only_content_free_and_route_exact() {
+        assert!(!supports_model_request_receipt(wire::ProtocolVersion::V1_1));
+        assert!(supports_model_request_receipt(wire::ProtocolVersion::V1_2));
+
+        let session_id = crate::FocusSessionId::new_v7();
+        let route_id = crate::ModelRouteApprovalId::new_v7();
+        let request_id = uuid::Uuid::now_v7();
+        let started_at = time::OffsetDateTime::now_utc();
+        let completed_at = started_at + time::Duration::milliseconds(25);
+        let mapped = model_request_receipt_to_wire(&crate::ModelRequestReceipt {
+            request_id,
+            focus_session_id: session_id,
+            model_route_approval_id: route_id,
+            model_route_revision: 7,
+            started_at,
+            completed_at: Some(completed_at),
+            outcome: crate::ModelRequestReceiptOutcome::CompletedStrictCandidate,
+        });
+
+        assert_eq!(mapped.request_id.into_uuid(), request_id);
+        assert_eq!(mapped.focus_session_id.into_uuid(), session_id.as_uuid());
+        assert_eq!(
+            mapped.model_route_approval_id.into_uuid(),
+            route_id.as_uuid()
+        );
+        assert_eq!(mapped.model_route_revision, 7);
+        assert_eq!(
+            mapped.outcome,
+            wire::ModelRequestReceiptOutcome::CompletedStrictCandidate
+        );
+        let encoded = serde_json::to_value(mapped).unwrap();
+        let fields: std::collections::BTreeSet<_> = encoded
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            fields,
+            std::collections::BTreeSet::from([
+                "completed_at",
+                "focus_session_id",
+                "model_route_approval_id",
+                "model_route_revision",
+                "outcome",
+                "request_id",
+                "started_at",
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostic_client_cannot_query_focus_session_model_receipts() {
+        let runtime = runtime();
+        let actor = actor();
+        let metadata = wire::RequestMetadata::new(
+            wire::Component::TestFixture,
+            wire::SensitivityClass::Personal,
+            wire::RetentionClass::TransientProcessing,
+        );
+        let request = wire::RequestEnvelope::new(
+            metadata,
+            wire::RequestBody::GetFocusSessionView(wire::GetFocusSessionViewRequest {
+                focus_session_id: wire::FocusSessionId::new_v7(),
+            }),
+        );
+        let error = runtime
+            .handle_protocol_request_with_context(
+                ProtocolRequestContext {
+                    actor,
+                    client_id: wire::ClientInstanceId::from_uuid(actor.into_uuid()),
+                    assurance: crate::ClientAssurance::Diagnostic,
+                    negotiated_version: wire::ProtocolVersion::V1_2,
+                },
+                &request,
+                1,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, wire::ErrorCode::PermissionDenied);
+        assert_eq!(error.category, wire::ErrorCategory::PermissionDenied);
     }
 }

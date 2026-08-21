@@ -320,13 +320,125 @@ pub enum PendingDeliveryTransition {
         delivery: PendingInterventionDelivery,
         expected_state: OutboxState,
     },
+    /// Repairs a pre-existing intervention/outbox state mismatch during
+    /// startup. This is the only typed path that may reconcile an unmarked
+    /// queued intervention to an already-terminal or attempted outbox state.
+    ReconcileLegacy {
+        delivery: PendingInterventionDelivery,
+        expected_state: OutboxState,
+    },
+}
+
+impl InterventionDecisionWrite {
+    /// Validates the shape of an initial decision or queued-delivery
+    /// revalidation before a repository transaction begins.
+    pub fn validate(&self) -> Result<(), RepositoryError> {
+        let decision = &self.decision;
+        if self.audit.owner != decision.owner
+            || self.audit.kind != AuditKind::InterventionDecision
+            || self.audit.subject_id != decision.candidate_id.as_uuid()
+            || self.audit.reason_codes != decision.reason_codes
+            || !decision.policy_trace.is_complete()
+            || decision.policy_version != decision.policy_trace.policy_profile_id
+            || self.audit.policy_trace.as_ref() != Some(&decision.policy_trace)
+            || (decision.outcome == crate::PolicyOutcome::Allow) != self.intervention.is_some()
+            || decision.issued_at >= decision.expires_at
+            || (decision.outcome == crate::PolicyOutcome::Allow
+                && (decision.permission_grant_revisions.is_empty() || decision.channel.is_empty()))
+        {
+            return Err(RepositoryError {
+                kind: RepositoryErrorKind::Corrupt,
+                summary: "An intervention decision audit does not match its decision.",
+            });
+        }
+
+        match (&self.intervention, self.expected_intervention_revision) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(RepositoryError {
+                kind: RepositoryErrorKind::Corrupt,
+                summary: "An intervention revision was supplied without an intervention.",
+            }),
+            (Some(intervention), None)
+                if intervention.owner == decision.owner
+                    && intervention.candidate_id == decision.candidate_id
+                    && intervention.candidate_revision == decision.candidate_revision
+                    && intervention.policy_decision_id == decision.id
+                    && intervention.focus_session_id == decision.focus_session_id
+                    && intervention.revision == 1
+                    && intervention.state == InterventionState::Allowed
+                    && intervention.outcome == InterventionOutcome::Unacknowledged
+                    && intervention.outcome_at.is_none()
+                    && intervention.delivered_at.is_none()
+                    && intervention.correction_summary.is_none()
+                    && intervention.created_at < intervention.expires_at
+                    && intervention.expires_at <= decision.expires_at
+                    && intervention.delivery_channel.as_deref() == Some(&decision.channel)
+                    && intervention.created_at == intervention.updated_at =>
+            {
+                Ok(())
+            }
+            (Some(intervention), Some(expected_revision))
+                if expected_revision != u64::MAX
+                    && intervention.owner == decision.owner
+                    && intervention.candidate_id == decision.candidate_id
+                    && intervention.candidate_revision == decision.candidate_revision
+                    && intervention.policy_decision_id == decision.id
+                    && intervention.focus_session_id == decision.focus_session_id
+                    && intervention.revision == expected_revision + 1
+                    && intervention.state == InterventionState::Queued
+                    && intervention.expires_at >= decision.expires_at
+                    && intervention.delivery_channel.as_deref() == Some(&decision.channel) =>
+            {
+                Ok(())
+            }
+            (Some(_), _) => Err(RepositoryError {
+                kind: RepositoryErrorKind::Corrupt,
+                summary: "An intervention record does not match its policy decision.",
+            }),
+        }
+    }
+
+    /// Validates that the intervention side of this decision is either a new
+    /// Allowed record or a narrowly scoped Queued-to-Queued revalidation.
+    pub fn validate_against(&self, current: Option<&Intervention>) -> Result<(), RepositoryError> {
+        self.validate()?;
+        let Some(next) = &self.intervention else {
+            return Ok(());
+        };
+        match (current, self.expected_intervention_revision) {
+            (None, None) => Ok(()),
+            (Some(current), Some(expected_revision)) => {
+                let mut expected = current.clone();
+                expected.policy_decision_id = self.decision.id;
+                expected.revision = next.revision;
+                expected.updated_at = next.updated_at;
+                if current.state == InterventionState::Queued
+                    && current.revision == expected_revision
+                    && expected == *next
+                {
+                    Ok(())
+                } else {
+                    Err(RepositoryError {
+                        kind: RepositoryErrorKind::Conflict,
+                        summary: "The queued intervention revalidation is stale or invalid.",
+                    })
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => Err(RepositoryError {
+                kind: RepositoryErrorKind::Conflict,
+                summary: "The intervention decision revision changed.",
+            }),
+        }
+    }
 }
 
 impl PendingDeliveryTransition {
     #[must_use]
     pub const fn delivery(&self) -> &PendingInterventionDelivery {
         match self {
-            Self::Enqueue(delivery) | Self::Update { delivery, .. } => delivery,
+            Self::Enqueue(delivery)
+            | Self::Update { delivery, .. }
+            | Self::ReconcileLegacy { delivery, .. } => delivery,
         }
     }
 
@@ -340,16 +452,21 @@ impl PendingDeliveryTransition {
                 Self::Update {
                     delivery: next,
                     expected_state,
+                }
+                | Self::ReconcileLegacy {
+                    delivery: next,
+                    expected_state,
                 },
                 Some(current),
             ) if current.state == *expected_state => {
                 validate_pending_delivery_update(current, next)
             }
-            (Self::Enqueue(_), Some(_)) | (Self::Update { .. }, None) => Err(RepositoryError {
+            (Self::Enqueue(_), Some(_))
+            | (Self::Update { .. } | Self::ReconcileLegacy { .. }, None) => Err(RepositoryError {
                 kind: RepositoryErrorKind::Conflict,
                 summary: "The pending-delivery transition is stale.",
             }),
-            (Self::Update { .. }, Some(_)) => Err(RepositoryError {
+            (Self::Update { .. } | Self::ReconcileLegacy { .. }, Some(_)) => Err(RepositoryError {
                 kind: RepositoryErrorKind::Conflict,
                 summary: "The pending-delivery state changed concurrently.",
             }),
@@ -396,7 +513,11 @@ impl InterventionTransitionWrite {
             if delivery.owner != self.intervention.owner
                 || delivery.intervention_id != self.intervention.id
                 || delivery.candidate_revision != self.intervention.candidate_revision
-                || delivery.policy_decision_id != self.intervention.policy_decision_id
+                || (delivery.policy_decision_id != self.intervention.policy_decision_id
+                    && !matches!(
+                        delivery.state,
+                        OutboxState::Expired | OutboxState::Cancelled
+                    ))
                 || !delivery_state_matches_intervention(delivery.state, self.intervention.state)
             {
                 return Err(RepositoryError {
@@ -445,7 +566,18 @@ impl InterventionTransitionWrite {
                 }
             }
             AuditKind::InterventionDelivery => {
-                if !valid_intervention_delivery_transition(current.state, self.intervention.state) {
+                let legacy_reconciliation = matches!(
+                    self.delivery,
+                    Some(PendingDeliveryTransition::ReconcileLegacy { .. })
+                );
+                if !valid_intervention_delivery_transition(
+                    current.state,
+                    self.intervention.state,
+                    legacy_reconciliation,
+                ) || !valid_intervention_delivery_update(current, &self.intervention)
+                    || (legacy_reconciliation
+                        && !valid_legacy_intervention_reconciliation(self, current))
+                {
                     return Err(RepositoryError {
                         kind: RepositoryErrorKind::Conflict,
                         summary: "The intervention delivery transition is invalid.",
@@ -456,25 +588,59 @@ impl InterventionTransitionWrite {
         }
         Ok(())
     }
+
+    /// Binds every intervention revision to the exact durable allow decision
+    /// referenced by the intervention. This is repository-independent so the
+    /// in-memory and SQLite adapters enforce identical policy provenance.
+    pub fn validate_policy_against(
+        &self,
+        decision: Option<&PolicyDecision>,
+    ) -> Result<(), RepositoryError> {
+        let Some(decision) = decision else {
+            return Err(RepositoryError {
+                kind: RepositoryErrorKind::Corrupt,
+                summary: "The intervention policy decision is unavailable.",
+            });
+        };
+        let trace_matches = if decision.policy_trace.is_complete() {
+            self.audit.policy_trace.as_ref() == Some(&decision.policy_trace)
+                && decision.policy_version == decision.policy_trace.policy_profile_id
+        } else {
+            self.audit.policy_trace.is_none()
+        };
+        if decision.id != self.intervention.policy_decision_id
+            || decision.owner != self.intervention.owner
+            || decision.focus_session_id != self.intervention.focus_session_id
+            || decision.candidate_id != self.intervention.candidate_id
+            || decision.candidate_revision != self.intervention.candidate_revision
+            || decision.outcome != crate::PolicyOutcome::Allow
+            || !trace_matches
+        {
+            return Err(RepositoryError {
+                kind: RepositoryErrorKind::Corrupt,
+                summary: "The intervention revision does not match its policy decision.",
+            });
+        }
+        Ok(())
+    }
 }
 
-const fn valid_intervention_delivery_transition(
+fn valid_intervention_delivery_transition(
     current: InterventionState,
     next: InterventionState,
+    legacy_reconciliation: bool,
 ) -> bool {
     matches!(
         (current, next),
         (
             InterventionState::Allowed,
             InterventionState::Queued
-                | InterventionState::AcceptedByChannel
-                | InterventionState::DeliveryUnknown
-                | InterventionState::DeliveryFailed
+                | InterventionState::Delivering
                 | InterventionState::Expired
                 | InterventionState::Cancelled
         ) | (
             InterventionState::Queued,
-            InterventionState::DeliveryUnknown
+            InterventionState::Delivering
                 | InterventionState::Expired
                 | InterventionState::Cancelled
         ) | (
@@ -485,7 +651,94 @@ const fn valid_intervention_delivery_transition(
                 | InterventionState::Expired
                 | InterventionState::Cancelled
         )
-    )
+    ) || (legacy_reconciliation
+        && current == InterventionState::Queued
+        && matches!(
+            next,
+            InterventionState::AcceptedByChannel
+                | InterventionState::DeliveryUnknown
+                | InterventionState::DeliveryFailed
+                | InterventionState::Expired
+                | InterventionState::Cancelled
+        ))
+}
+
+fn valid_intervention_delivery_update(current: &Intervention, next: &Intervention) -> bool {
+    if next.updated_at < current.updated_at {
+        return false;
+    }
+    let private_content_same = next.user_visible_text == current.user_visible_text
+        && next.evidence_summary == current.evidence_summary
+        && next.evidence == current.evidence;
+    let private_content_cleared = next.user_visible_text.is_empty()
+        && next.evidence_summary.is_empty()
+        && next.evidence.is_empty();
+    if !private_content_same && !private_content_cleared {
+        return false;
+    }
+
+    let mut expected = current.clone();
+    expected.revision = next.revision;
+    expected.state = next.state;
+    expected.updated_at = next.updated_at;
+    if private_content_cleared {
+        expected.user_visible_text.clear();
+        expected.evidence_summary.clear();
+        expected.evidence.clear();
+    }
+
+    match next.state {
+        InterventionState::Queued | InterventionState::Delivering => {
+            if !private_content_same {
+                return false;
+            }
+        }
+        InterventionState::AcceptedByChannel => {
+            if next.delivered_at.is_none() {
+                return false;
+            }
+            expected.delivered_at = next.delivered_at;
+        }
+        InterventionState::DeliveryUnknown => {}
+        InterventionState::DeliveryFailed => {
+            if next.reason_code.is_empty() {
+                return false;
+            }
+            expected.reason_code.clone_from(&next.reason_code);
+        }
+        InterventionState::Expired | InterventionState::Cancelled => {
+            if !private_content_cleared
+                || next.outcome != InterventionOutcome::Expired
+                || next.outcome_at.is_none()
+                || next.reason_code.is_empty()
+            {
+                return false;
+            }
+            expected.outcome = next.outcome;
+            expected.outcome_at = next.outcome_at;
+            expected.reason_code.clone_from(&next.reason_code);
+        }
+        InterventionState::Candidate | InterventionState::Denied | InterventionState::Allowed => {
+            return false;
+        }
+    }
+    expected == *next
+}
+
+fn valid_legacy_intervention_reconciliation(
+    write: &InterventionTransitionWrite,
+    current: &Intervention,
+) -> bool {
+    let Some(PendingDeliveryTransition::ReconcileLegacy {
+        delivery,
+        expected_state,
+    }) = &write.delivery
+    else {
+        return false;
+    };
+    current.state == InterventionState::Queued
+        && *expected_state != OutboxState::Queued
+        && delivery_state_matches_intervention(delivery.state, write.intervention.state)
 }
 
 const fn delivery_state_matches_intervention(
@@ -569,7 +822,10 @@ fn validate_pending_delivery_update(
     expected
         .user_visible_text
         .clone_from(&next.user_visible_text);
-    if current.state == OutboxState::Queued && next.state != OutboxState::Queued {
+    // A fresh recovery decision is adopted only by the durable pre-attempt
+    // marker. Definite non-attempt cancellation/expiry must preserve the
+    // queued record's prior decision reference.
+    if current.state == OutboxState::Queued && next.state == OutboxState::Delivering {
         expected.policy_decision_id = next.policy_decision_id;
     }
     if transition_allowed && attempt_metadata_valid && terminal_text_valid && expected == *next {
@@ -1914,6 +2170,11 @@ impl DurableRepository for MemoryRepository {
                 summary: "The durable intervention was not found.",
             })?;
         value.validate_against(&current)?;
+        value.validate_policy_against(
+            state
+                .policy_decisions
+                .get(&value.intervention.policy_decision_id),
+        )?;
         if state.audit.contains_key(&value.audit.id) {
             return Err(revision_error());
         }
@@ -1976,48 +2237,8 @@ impl DurableRepository for MemoryRepository {
                     tokio::time::sleep(delay).await;
                 }
             }
+            value.validate()?;
             let decision = &value.decision;
-            if value.audit.owner != decision.owner
-                || value.audit.kind != AuditKind::InterventionDecision
-                || value.audit.subject_id != decision.candidate_id.as_uuid()
-                || value.audit.reason_codes != decision.reason_codes
-                || !decision.policy_trace.is_complete()
-                || decision.policy_version != decision.policy_trace.policy_profile_id
-                || value.audit.policy_trace.as_ref() != Some(&decision.policy_trace)
-            {
-                return Err(RepositoryError {
-                    kind: RepositoryErrorKind::Corrupt,
-                    summary: "An intervention decision audit does not match its decision.",
-                });
-            }
-            if value.intervention.is_none() && value.expected_intervention_revision.is_some() {
-                return Err(RepositoryError {
-                    kind: RepositoryErrorKind::Corrupt,
-                    summary: "An intervention revision was supplied without an intervention.",
-                });
-            }
-            if (decision.outcome == crate::PolicyOutcome::Allow) != value.intervention.is_some() {
-                return Err(RepositoryError {
-                    kind: RepositoryErrorKind::Corrupt,
-                    summary: "An intervention record does not match the policy outcome.",
-                });
-            }
-            if let Some(intervention) = &value.intervention
-                && (intervention.owner != decision.owner
-                    || intervention.candidate_id != decision.candidate_id
-                    || intervention.candidate_revision != decision.candidate_revision
-                    || intervention.policy_decision_id != decision.id
-                    || intervention.focus_session_id != decision.focus_session_id
-                    || !matches!(
-                        intervention.state,
-                        crate::InterventionState::Allowed | crate::InterventionState::Delivering
-                    ))
-            {
-                return Err(RepositoryError {
-                    kind: RepositoryErrorKind::Corrupt,
-                    summary: "An intervention record does not match its policy decision.",
-                });
-            }
 
             let mut state = self.state.lock().map_err(|_| revision_error())?;
             if state.policy_decisions.contains_key(&decision.id)
@@ -2026,13 +2247,7 @@ impl DurableRepository for MemoryRepository {
                 return Err(revision_error());
             }
             if let Some(intervention) = &value.intervention {
-                check_revision(
-                    state
-                        .interventions
-                        .get(&intervention.id)
-                        .map(|current| current.revision),
-                    value.expected_intervention_revision,
-                )?;
+                value.validate_against(state.interventions.get(&intervention.id))?;
             }
 
             state.policy_decisions.insert(decision.id, decision.clone());
@@ -2120,14 +2335,17 @@ impl DurableRepository for MemoryRepository {
     }
 
     fn save_delivery(&self, value: &PendingInterventionDelivery) -> Result<(), RepositoryError> {
-        let mut state = self.state.lock().map_err(|_| revision_error())?;
-        if !state.outbox.contains_key(&value.id) {
-            return Err(RepositoryError {
-                kind: RepositoryErrorKind::NotFound,
-                summary: "The pending delivery was not found.",
-            });
+        let mut value = value.clone();
+        if !matches!(value.state, OutboxState::Queued | OutboxState::Delivering) {
+            value.user_visible_text.clear();
         }
-        state.outbox.insert(value.id, value.clone());
+        let mut state = self.state.lock().map_err(|_| revision_error())?;
+        let current = state.outbox.get(&value.id).ok_or(RepositoryError {
+            kind: RepositoryErrorKind::NotFound,
+            summary: "The pending delivery was not found.",
+        })?;
+        validate_pending_delivery_update(current, &value)?;
+        state.outbox.insert(value.id, value);
         Ok(())
     }
 

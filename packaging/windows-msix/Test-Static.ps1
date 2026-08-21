@@ -231,9 +231,13 @@ $phase2PowerShell = @(
     "Upgrade.ps1",
     "Status.ps1",
     "Uninstall.ps1",
+    "Source-Evidence.ps1",
     "Verify-Source.ps1",
     "Verify-Installed.ps1",
-    "Test-VerifyInstalled.ps1"
+    "Review-Installed.ps1",
+    "Test-VerifySource.ps1",
+    "Test-VerifyInstalled.ps1",
+    "Test-ReviewInstalled.ps1"
 )
 $phase2Launchers = @(
     "Install.cmd",
@@ -241,7 +245,8 @@ $phase2Launchers = @(
     "Status.cmd",
     "Uninstall.cmd",
     "Verify-Source.cmd",
-    "Verify-Installed.cmd"
+    "Verify-Installed.cmd",
+    "Review-Installed.cmd"
 )
 foreach ($leaf in $phase2PowerShell + $phase2Launchers + @("README.md")) {
     if (-not (Test-Path -LiteralPath (Join-Path $phase2LifecycleRoot $leaf) -PathType Leaf)) {
@@ -351,6 +356,38 @@ if ($null -eq $installedEvidenceStatic -or
     -not [bool]$installedEvidenceStatic.installed_extra_file_rejected -or
     -not [bool]$installedEvidenceStatic.installed_payload_tamper_rejected) {
     throw "The Phase 2 installed-evidence harness failed its static contract."
+}
+
+$reviewerStaticJson = (& (Join-Path $phase2LifecycleRoot "Test-ReviewInstalled.ps1") |
+        Out-String).Trim()
+$reviewerStatic = $reviewerStaticJson | ConvertFrom-Json -ErrorAction Stop
+if ($null -eq $reviewerStatic -or
+    -not [bool]$reviewerStatic.verified -or
+    [int]$reviewerStatic.exact_gate_count -ne 32 -or
+    -not [bool]$reviewerStatic.positive_complete_acceptance -or
+    [int]$reviewerStatic.negative_case_count -ne 23 -or
+    [int]$reviewerStatic.installed_state_mutations -ne 0) {
+    throw "The Phase 2 installed-evidence reviewer failed its static contract."
+}
+
+$sourceEvidenceStatic = & (Join-Path $phase2LifecycleRoot "Test-VerifySource.ps1")
+if ($null -eq $sourceEvidenceStatic -or
+    -not [bool]$sourceEvidenceStatic.verified -or
+    [int]$sourceEvidenceStatic.report_schema_version -ne 2 -or
+    [int]$sourceEvidenceStatic.provenance_schema_version -ne 1 -or
+    [int]$sourceEvidenceStatic.generator_file_count -ne 9 -or
+    -not [bool]$sourceEvidenceStatic.repository_state_content_free -or
+    -not [bool]$sourceEvidenceStatic.generated_outputs_ignored -or
+    [int]$sourceEvidenceStatic.toolchain_version_count -ne 6 -or
+    -not [bool]$sourceEvidenceStatic.dual_reviewer_shell_contract -or
+    -not [bool]$sourceEvidenceStatic.pwsh_path_poison_rejected -or
+    -not [bool]$sourceEvidenceStatic.trusted_pwsh_resolved -or
+    -not [bool]$sourceEvidenceStatic.generator_reparse_ancestor_rejected -or
+    [int]$sourceEvidenceStatic.migration_identifier_count -lt 11 -or
+    [string]$sourceEvidenceStatic.protocol_version -notmatch '^[0-9]+\.[0-9]+$' -or
+    [string]::IsNullOrWhiteSpace([string]$sourceEvidenceStatic.policy_profile) -or
+    -not [bool]$sourceEvidenceStatic.deterministic_root_anchor) {
+    throw "The Phase 2 source-evidence harness failed its static contract."
 }
 
 $phase2Common = Get-Content -LiteralPath (Join-Path $phase2LifecycleRoot "Common.ps1") -Raw

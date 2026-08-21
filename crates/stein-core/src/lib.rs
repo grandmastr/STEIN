@@ -71,9 +71,10 @@ pub use repository::{
 };
 pub use second_mind::{
     CleanupMaintenanceResult, ClientAssurance, EffectivePolicy, EndFocusReason, GrantPermission,
-    IdempotencyContext, ReasoningCycleResult, RetentionMaintenanceResult, SecondMindConfig,
-    SecondMindError, SecondMindErrorCode, SecondMindPorts, SecondMindRuntime, StartFocusSession,
-    UnavailableModelGateway, UnavailableObservationPort,
+    IdempotencyContext, ModelRequestReceipt, ModelRequestReceiptOutcome, ReasoningCycleResult,
+    RetentionMaintenanceResult, SecondMindConfig, SecondMindError, SecondMindErrorCode,
+    SecondMindPorts, SecondMindRuntime, StartFocusSession, UnavailableModelGateway,
+    UnavailableObservationPort,
 };
 pub use view_publication::{
     CaptureViewProjection, CoreEvent, CoreEventActorKind, CoreEventEnvelope,

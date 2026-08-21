@@ -152,13 +152,13 @@ become passes.
 | `P2-UIA` | Selected Notepad `HWND` yields bounded structured visible text; password, secure/protected, consent, other-window, and unverifiable UIA fixtures pause or report unavailable. | NOT RUN |
 | `P2-PIXELS` | Explicit Windows Graphics Capture picker/region and separate pixel grant work with visible status; one transient bounded frame is destroyed and structured input wins when sufficient. | NOT RUN |
 | `P2-MODEL-CONTRACT` | Golden packets prove least-sensitive grant/route intersection; no unapproved category, tool, provider object, prompt, raw response, or credential crosses the gateway/persistence/diagnostic boundaries. | NOT RUN |
-| `P2-MODEL-LIVE` | One live synthetic OpenAI Responses request uses the approved exact route, `store: false`, strict schema, no tools/state/background features, deadline/cancellation, and truthful handling disclosure. | NOT RUN |
+| `P2-MODEL-LIVE` | One scheduler-owned live synthetic OpenAI Responses request uses the durable approved exact route, `store: false`, strict schema, no tools/state/background features, deadline/cancellation, and truthful handling disclosure; after reconnect, the authenticated read-only receipt has a new request ID/start time and completes for that exact session/approval/revision without exposing content. The adapter-only paid test cannot promote this row. | NOT RUN |
 | `P2-SILENCE` | Healthy relevant-writing/research trace produces no model call or intervention merely because foreground activity changes. | NOT RUN |
 | `P2-INTERVENTION` | Near-deadline missing-success-condition trace produces one validated candidate, deterministic allow decision, acknowledged audit append, and one native notification with uncertainty-qualified text. | NOT RUN |
 | `P2-POLICY-FAILSAFE` | Stale source, invalid/tool-shaped/refusal output, absent/expired authority, lock, mute, cap/cooldown, model failure, policy failure, audit failure, legacy/empty policy trace, or policy/profile/preference/grant/route revision mismatch all produce silence/deny; evaluated significance and intervention audits retain only the exact content-free policy trace/digest. | NOT RUN |
 | `P2-NATIVE-CONTROL` | With Tauri closed, native tray/status shows exact capture categories and health, emergency stop takes authority immediately, and Explorer/status-loop loss pauses capture until revalidation. | NOT RUN |
 | `P2-NOTIFICATION` | With Tauri closed and Windows unlocked, daemon-owned native toast is accepted under the registered AUMID; the fixed packaged COM activator accepts only `action=open&intervention=<canonical UUID>`, opens/focuses Tauri, reconnects through the private broker, and resolves the typed authoritative explanation; malformed, input-bearing, wrong-AUMID, unpackaged, and diagnostic activation fixtures fail closed; audit distinguishes accepted from displayed/seen. | NOT RUN |
-| `P2-OUTBOX-RECOVERY` | All channels unavailable queues one minimal item; recovery before expiry revalidates and attempts it once; ambiguous/acknowledged state does not duplicate. | NOT RUN |
+| `P2-OUTBOX-RECOVERY` | All channels unavailable queues one minimal item; recovery before expiry revalidates and attempts it once. Direct and queued crash fixtures prove no native call precedes the atomic audited `delivering` marker; a crash after that marker, after OS submission, or before terminal audit becomes `delivery_unknown` without retry. Runtime startup atomically repairs legacy outbox-unknown/intervention-delivering and other queued/terminal mismatches before reactivation; repository open never performs outbox-only semantic recovery. | NOT RUN |
 | `P2-OUTBOX-EXPIRY` | Recovery after expiry/relevance loss removes private text and shows only non-interruptive missed history, without a notification burst. | NOT RUN |
 | `P2-FEEDBACK` | Accept, dismiss, correct, mute, and stop work through authoritative commands. Correction changes current context/explanation but not historical decision, identity, preferences, or memory. | NOT RUN |
 | `P2-REVOCATION-RACE` | Deterministic races prove revoke/cancel beats late observation, reasoning, queue, and every delivery not terminally acknowledged; native-resource and credential cleanup failures remain durably pending and visible through content-free health/counts without restoring authority. | NOT RUN |
@@ -242,14 +242,32 @@ The retained trace must show, in order:
    category/resource set before capture begins.
 7. Feed healthy relevant editing/research observations and retain the justified-
    silence trace, including proof that foreground change alone made no model call.
+   Before closing the desktop, use **Check latest model request receipt** on the
+   focus-session card and retain the current content-free result as a baseline
+   (including absence); a later pass must use a different request ID and a start
+   time after the synthetic trigger. This read-only control does not request a
+   model call.
 8. Close the full desktop and prove CORE, capture, context, timers, native status,
    and current grants remain active.
-9. Produce the synthetic near-deadline missing-recommendation evidence. Inspect
-   the minimized request, strict model result, deterministic policy decision, and
-   audit acknowledgement.
+9. While the desktop remains closed, produce the synthetic near-deadline
+   missing-recommendation evidence and let the daemon scheduler make the request
+   through the durable approved route; do not add or use a paid-call trigger
+   command. Inspect the minimized request, strict model result, deterministic
+   policy decision, and audit acknowledgement separately without reopening the
+   desktop yet.
 10. Receive exactly one native toast while the desktop remains closed. Record only
     `accepted_by_channel` unless stronger evidence actually exists.
-11. Activate the toast, reconnect through a fresh private session, and inspect the
+11. Activate the toast and reconnect through a fresh private session. In the
+    authoritative focus-session card, use **Check latest model request receipt**;
+    the shipped control invokes only the authenticated read-only
+    `desktop_get_latest_model_request_receipt` query. This nominal
+    toast-producing trace requires a
+    `completed_strict_candidate` receipt whose request ID differs from the
+    step-7 baseline, whose start time follows the step-9 trigger, and whose
+    focus-session ID, approval ID, and route revision match the authoritative
+    views and inspected trace. The receipt contains no prompt, response,
+    candidate text, provider error/status/ID, endpoint, secret reference, or
+    credential state and disappears on session end/restart. Inspect the
     authoritative goal/session/intervention explanation.
     Retain the content-free activation trace proving the fixed desktop AUMID,
     intervention UUID, private connection, explanation response, and dashboard
@@ -276,6 +294,10 @@ The nominal trace cannot substitute for these deterministic fixtures:
 - model timeout, invalid schema, tool-shaped output, refusal, and provider outage
   remain silent;
 - forced audit failure prevents notification submission;
+- direct and recovered notification crashes before the durable attempt marker
+  make no native call; crashes after the marker or after Windows submission are
+  audited as `delivery_unknown` and never resubmitted, including the legacy
+  outbox-unknown/intervention-delivering restart fixture;
 - unavailable channel queues one item, recovery delivers once, and expired
   recovery creates missed history only;
 - daemon restart restores only explicitly authorized continuity and waits for

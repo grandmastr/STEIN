@@ -973,13 +973,16 @@ mod tests {
         assert!(captured.contains("\"tools\":[]"));
     }
 
-    /// Explicit paid/network fixture. It reads only the synthetic
+    /// Explicit paid/network adapter probe. It reads only the synthetic
     /// `STEIN:model-route:phase2-live-openai` Credential Manager entry; API keys
-    /// in environment variables are intentionally unsupported.
+    /// in environment variables are intentionally unsupported. This probe
+    /// fabricates a provider-neutral request and therefore cannot satisfy the
+    /// installed P2-MODEL-LIVE gate, which must use CORE's durable approval,
+    /// focus authority, scheduler, and authenticated request receipt.
     #[cfg(windows)]
     #[tokio::test]
-    #[ignore = "requires explicit opt-in, a configured Credential Manager route, and network cost"]
-    async fn live_installed_route_returns_only_the_provider_neutral_result() {
+    #[ignore = "adapter-only: requires explicit opt-in, a synthetic credential target, and network cost; not installed acceptance"]
+    async fn adapter_only_live_gateway_probe_returns_provider_neutral_result() {
         if std::env::var("STEIN_RUN_LIVE_OPENAI_TEST").as_deref() != Ok("1") {
             panic!("set STEIN_RUN_LIVE_OPENAI_TEST=1 for the explicit live fixture");
         }

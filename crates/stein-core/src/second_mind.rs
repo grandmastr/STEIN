@@ -271,6 +271,27 @@ pub enum ReasoningCycleResult {
     Intervention(Box<Intervention>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelRequestReceiptOutcome {
+    InFlight,
+    CompletedStrictSilence,
+    CompletedStrictCandidate,
+    Cancelled,
+    DeadlineExceeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelRequestReceipt {
+    pub request_id: Uuid,
+    pub focus_session_id: FocusSessionId,
+    pub model_route_approval_id: ModelRouteApprovalId,
+    pub model_route_revision: u64,
+    pub started_at: OffsetDateTime,
+    pub completed_at: Option<OffsetDateTime>,
+    pub outcome: ModelRequestReceiptOutcome,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RetentionMaintenanceResult {
     pub removed_observations: usize,
@@ -306,6 +327,7 @@ struct EphemeralSession {
     last_significance_evaluation_elapsed: Option<Duration>,
     model_request_in_flight: bool,
     model_request_history: VecDeque<Duration>,
+    latest_model_request_receipt: Option<ModelRequestReceipt>,
     deadline_risk_active: bool,
     native_status_revision: Option<u64>,
     last_native_status_heartbeat_at: Option<OffsetDateTime>,
@@ -334,6 +356,7 @@ impl EphemeralSession {
             last_significance_evaluation_elapsed: None,
             model_request_in_flight: false,
             model_request_history: VecDeque::new(),
+            latest_model_request_receipt: None,
             deadline_risk_active: false,
             native_status_revision: None,
             last_native_status_heartbeat_at: None,
@@ -347,6 +370,9 @@ struct EphemeralState {
     activations: BTreeSet<FocusSessionId>,
     last_recovery_batch_elapsed: HashMap<ActorId, Duration>,
 }
+
+#[cfg(test)]
+type TestOneShotHook = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
 
 struct FocusActivationPermit {
     ephemeral: Arc<Mutex<EphemeralState>>,
@@ -714,6 +740,12 @@ pub struct SecondMindRuntime {
     last_emergency_command_revision: Arc<Mutex<u64>>,
     ephemeral: Arc<Mutex<EphemeralState>>,
     publication: PublicationBinding,
+    #[cfg(test)]
+    before_queue_commit: TestOneShotHook,
+    #[cfg(test)]
+    before_permission_revocation_commit: TestOneShotHook,
+    #[cfg(test)]
+    after_recovery_revalidation_commit: TestOneShotHook,
 }
 
 impl SecondMindRuntime {
@@ -734,7 +766,76 @@ impl SecondMindRuntime {
             last_emergency_command_revision: Arc::new(Mutex::new(0)),
             ephemeral: Arc::new(Mutex::new(EphemeralState::default())),
             publication: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(test)]
+            before_queue_commit: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            before_permission_revocation_commit: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            after_recovery_revalidation_commit: Arc::new(Mutex::new(None)),
         })
+    }
+
+    #[cfg(test)]
+    fn set_before_queue_commit_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .before_queue_commit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_before_queue_commit_hook(&self) {
+        let hook = self
+            .before_queue_commit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_before_permission_revocation_commit_hook(
+        &self,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) {
+        *self
+            .before_permission_revocation_commit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_before_permission_revocation_commit_hook(&self) {
+        let hook = self
+            .before_permission_revocation_commit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_after_recovery_revalidation_commit_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .after_recovery_revalidation_commit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_after_recovery_revalidation_commit_hook(&self) {
+        let hook = self
+            .after_recovery_revalidation_commit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     pub(crate) fn attach_publication(&self, publication: ViewPublication) -> Result<(), ()> {
@@ -824,6 +925,8 @@ impl SecondMindRuntime {
         proactive_muted: bool,
     ) -> Result<(), SecondMindError> {
         let sessions = self.repository.load_focus_sessions(owner)?;
+        let goals = self.repository.load_goals(owner)?;
+        let now = self.clock.now_utc();
         let mut state = self
             .ephemeral
             .lock()
@@ -837,7 +940,13 @@ impl SecondMindRuntime {
                 && proactive_enabled
                 && !proactive_muted
                 && !ephemeral.cancellation.is_cancelled();
-            reconcile_proactive_cancellation(ephemeral, allowed);
+            let goal_is_current = goals.iter().any(|goal| {
+                goal.id == session.goal_id
+                    && goal.state == GoalState::Active
+                    && goal.revision.get() == session.goal_revision
+                    && goal.deadline.is_none_or(|deadline| now < deadline)
+            });
+            reconcile_proactive_cancellation(ephemeral, allowed && goal_is_current);
         }
         Ok(())
     }
@@ -847,6 +956,14 @@ impl SecondMindRuntime {
         session: &FocusSession,
         preferences: &EffectivePreferences,
     ) -> Result<(), SecondMindError> {
+        let now = self.clock.now_utc();
+        let goal_is_current = self
+            .get_goal(session.owner, session.goal_id)
+            .is_ok_and(|goal| {
+                goal.state == GoalState::Active
+                    && goal.revision.get() == session.goal_revision
+                    && goal.deadline.is_none_or(|deadline| now < deadline)
+            });
         let mut state = self
             .ephemeral
             .lock()
@@ -856,7 +973,8 @@ impl SecondMindRuntime {
                 && !session.muted
                 && preferences.proactive_interventions_enabled
                 && !preferences.proactive_interventions_muted
-                && !ephemeral.cancellation.is_cancelled();
+                && !ephemeral.cancellation.is_cancelled()
+                && goal_is_current;
             reconcile_proactive_cancellation(ephemeral, allowed);
         }
         Ok(())
@@ -872,6 +990,49 @@ impl SecondMindRuntime {
             .map_err(|_| SecondMindError::unavailable("Ephemeral context is unavailable."))?;
         if let Some(ephemeral) = state.sessions.get_mut(&session_id) {
             ephemeral.proactive_cancellation.cancel();
+        }
+        Ok(())
+    }
+
+    fn cancel_proactive_for_owner(&self, owner: ActorId) -> Result<(), SecondMindError> {
+        let session_ids: BTreeSet<_> = self
+            .repository
+            .load_focus_sessions(owner)?
+            .into_iter()
+            .filter(FocusSession::is_working)
+            .map(|session| session.id)
+            .collect();
+        self.cancel_proactive_for_session_ids(&session_ids)
+    }
+
+    fn cancel_proactive_for_goal(
+        &self,
+        owner: ActorId,
+        goal_id: GoalId,
+    ) -> Result<BTreeSet<FocusSessionId>, SecondMindError> {
+        let session_ids: BTreeSet<_> = self
+            .repository
+            .load_focus_sessions(owner)?
+            .into_iter()
+            .filter(|session| session.goal_id == goal_id && session.is_working())
+            .map(|session| session.id)
+            .collect();
+        self.cancel_proactive_for_session_ids(&session_ids)?;
+        Ok(session_ids)
+    }
+
+    fn cancel_proactive_for_session_ids(
+        &self,
+        session_ids: &BTreeSet<FocusSessionId>,
+    ) -> Result<(), SecondMindError> {
+        let mut state = self
+            .ephemeral
+            .lock()
+            .map_err(|_| SecondMindError::unavailable("Ephemeral context is unavailable."))?;
+        for session_id in session_ids {
+            if let Some(session) = state.sessions.get_mut(session_id) {
+                session.proactive_cancellation.cancel();
+            }
         }
         Ok(())
     }
@@ -1063,6 +1224,55 @@ impl SecondMindRuntime {
         }))
     }
 
+    fn record_model_request_started(
+        &self,
+        receipt: ModelRequestReceipt,
+    ) -> Result<bool, SecondMindError> {
+        let mut state = self
+            .ephemeral
+            .lock()
+            .map_err(|_| SecondMindError::unavailable("Ephemeral context is unavailable."))?;
+        let Some(session) = state.sessions.get_mut(&receipt.focus_session_id) else {
+            // Session end/deletion owns removal. A racing model start is an
+            // expected denied action, not an availability failure, and must
+            // never recreate erased ephemeral evidence.
+            return Ok(false);
+        };
+        if session.cancellation.is_cancelled() || session.proactive_cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        session.latest_model_request_receipt = Some(receipt);
+        Ok(true)
+    }
+
+    fn record_model_request_completed(
+        &self,
+        session_id: FocusSessionId,
+        request_id: Uuid,
+        outcome: ModelRequestReceiptOutcome,
+    ) -> Result<(), SecondMindError> {
+        debug_assert_ne!(outcome, ModelRequestReceiptOutcome::InFlight);
+        let completed_at = self.clock.now_utc();
+        let mut state = self
+            .ephemeral
+            .lock()
+            .map_err(|_| SecondMindError::unavailable("Ephemeral context is unavailable."))?;
+        let Some(session) = state.sessions.get_mut(&session_id) else {
+            // Ending a focus session erases its ephemeral state. A late model
+            // completion must not recreate the receipt after that boundary.
+            return Ok(());
+        };
+        if let Some(receipt) = session
+            .latest_model_request_receipt
+            .as_mut()
+            .filter(|receipt| receipt.request_id == request_id)
+        {
+            receipt.completed_at = Some(completed_at);
+            receipt.outcome = outcome;
+        }
+        Ok(())
+    }
+
     fn pre_model_delivery_gate(
         &self,
         session: &FocusSession,
@@ -1134,9 +1344,9 @@ impl SecondMindRuntime {
         Ok(None)
     }
 
-    /// Fail-closed, side-effect-free revalidation used immediately before a
-    /// notification attempt and after a definite non-delivery result.
-    fn delivery_authority_is_current(
+    /// Fail-closed durable revalidation. Startup uses this before ephemeral
+    /// sources are reactivated; live delivery adds presence/source checks.
+    fn durable_delivery_authority_is_current(
         &self,
         decision: &PolicyDecision,
         goal_id: GoalId,
@@ -1164,7 +1374,9 @@ impl SecondMindRuntime {
         let Ok(goal) = self.get_goal(decision.owner, goal_id) else {
             return false;
         };
-        if goal.state != GoalState::Active || goal.deadline.is_some_and(|deadline| deadline <= now)
+        if goal.state != GoalState::Active
+            || goal.revision.get() != session.goal_revision
+            || goal.deadline.is_some_and(|deadline| deadline <= now)
         {
             return false;
         }
@@ -1237,6 +1449,27 @@ impl SecondMindRuntime {
         {
             return false;
         }
+        true
+    }
+
+    /// Fail-closed, side-effect-free revalidation used immediately before a
+    /// notification attempt and after a definite non-delivery result.
+    fn delivery_authority_is_current(
+        &self,
+        decision: &PolicyDecision,
+        goal_id: GoalId,
+        intervention_id: InterventionId,
+    ) -> bool {
+        if !self.durable_delivery_authority_is_current(decision, goal_id, intervention_id) {
+            return false;
+        }
+        let now = self.clock.now_utc();
+        let Ok(session) = find_session(&*self.repository, decision.focus_session_id) else {
+            return false;
+        };
+        let Ok(grants) = self.repository.load_grants(decision.owner) else {
+            return false;
+        };
         self.ephemeral.lock().is_ok_and(|state| {
             state.sessions.get(&session.id).is_some_and(|ephemeral| {
                 ephemeral.presence == crate::PresenceState::Active
@@ -1395,6 +1628,32 @@ impl SecondMindRuntime {
             .unwrap_or_default();
         statuses.sort_by_key(|status| status.grant_id);
         Ok(statuses)
+    }
+
+    pub fn latest_model_request_receipt(
+        &self,
+        assurance: ClientAssurance,
+        owner: ActorId,
+        session_id: FocusSessionId,
+    ) -> Result<Option<ModelRequestReceipt>, SecondMindError> {
+        require_private(assurance)?;
+        let session = find_session(&*self.repository, session_id)?;
+        if session.owner != owner {
+            return Err(SecondMindError {
+                code: SecondMindErrorCode::NotFound,
+                summary: "The focus session was not found.",
+                retryable: false,
+                current_revision: None,
+            });
+        }
+        let state = self
+            .ephemeral
+            .lock()
+            .map_err(|_| SecondMindError::unavailable("Ephemeral context is unavailable."))?;
+        Ok(state
+            .sessions
+            .get(&session_id)
+            .and_then(|ephemeral| ephemeral.latest_model_request_receipt.clone()))
     }
 
     pub fn notification_availability(&self) -> PlatformPortAvailability {
@@ -1621,11 +1880,30 @@ impl SecondMindRuntime {
         if goal.revision != command.expected_revision {
             return Err(SecondMindError::conflict(goal.revision.get()));
         }
+        let affected_sessions = self.cancel_proactive_for_goal(goal.owner, goal.id)?;
         apply_goal_patch(&mut goal, command.patch);
         let expected = goal.revision.get();
         goal.revision = goal.revision.next();
         goal.updated_at = self.clock.now_utc();
-        self.repository.update_goal(&goal, expected)?;
+        if let Err(error) = self.repository.update_goal(&goal, expected) {
+            if let Ok(preferences) = self.effective_preferences(goal.owner) {
+                let _ = self.reconcile_proactive_cancellation_for_owner(
+                    goal.owner,
+                    preferences.proactive_interventions_enabled,
+                    preferences.proactive_interventions_muted,
+                );
+            }
+            return Err(error.into());
+        }
+        for session_id in affected_sessions {
+            self.cancel_queued_interventions(
+                goal.owner,
+                Some(session_id),
+                None,
+                "goal_revision_changed",
+                self.daemon_context(),
+            )?;
+        }
         self.note_goal_state_change(goal.owner, goal.id);
         Ok(goal)
     }
@@ -1668,11 +1946,12 @@ impl SecondMindRuntime {
         if goal.revision.get() != expected_revision {
             return Err(SecondMindError::conflict(goal.revision.get()));
         }
+        self.cancel_proactive_for_goal(owner, goal_id)?;
         let expected = goal.revision.get();
         goal.state = state;
         goal.revision = goal.revision.next();
         goal.updated_at = self.clock.now_utc();
-        self.commit(context, |events| {
+        let save_result = self.commit(context, |events| {
             self.repository.update_goal(&goal, expected)?;
             events.push(CoreEvent::GoalViewChanged {
                 change: match state {
@@ -1683,7 +1962,17 @@ impl SecondMindRuntime {
                 goal: goal.clone(),
             });
             Ok(())
-        })?;
+        });
+        if let Err(error) = save_result {
+            if let Ok(preferences) = self.effective_preferences(owner) {
+                let _ = self.reconcile_proactive_cancellation_for_owner(
+                    owner,
+                    preferences.proactive_interventions_enabled,
+                    preferences.proactive_interventions_muted,
+                );
+            }
+            return Err(error);
+        }
         for session in self.repository.load_focus_sessions(owner)? {
             if session.goal_id == goal_id && session.is_working() {
                 let stopping = self.end_focus_session(
@@ -1735,13 +2024,19 @@ impl SecondMindRuntime {
         // application mutations. The repository transaction then validates
         // the exact goal revision and revokes every durable authority before
         // any fallible adapter cleanup begins.
-        let (result, deleted_sessions, deleted_grants) = self.commit(context, |events| {
+        let deletion_result = self.commit(context, |events| {
             let deleted_sessions: Vec<_> = self
                 .repository
                 .load_focus_sessions(owner)?
                 .into_iter()
                 .filter(|session| session.goal_id == goal_id)
                 .collect();
+            let deleted_session_ids = deleted_sessions
+                .iter()
+                .filter(|session| session.is_working())
+                .map(|session| session.id)
+                .collect();
+            self.cancel_proactive_for_session_ids(&deleted_session_ids)?;
             let deleted_grants: Vec<_> = self
                 .repository
                 .load_grants(owner)?
@@ -1760,7 +2055,20 @@ impl SecondMindRuntime {
                 });
             }
             Ok((result, deleted_sessions, deleted_grants))
-        })?;
+        });
+        let (result, deleted_sessions, deleted_grants) = match deletion_result {
+            Ok(result) => result,
+            Err(error) => {
+                if let Ok(preferences) = self.effective_preferences(owner) {
+                    let _ = self.reconcile_proactive_cancellation_for_owner(
+                        owner,
+                        preferences.proactive_interventions_enabled,
+                        preferences.proactive_interventions_muted,
+                    );
+                }
+                return Err(error);
+            }
+        };
         // The content-free, checksummed tombstone is the atomic durable
         // deletion marker. A second fallible audit append here would make a
         // completed delete look failed and could never be repaired on retry.
@@ -2001,14 +2309,11 @@ impl SecondMindRuntime {
             value.updated_at,
             Some(value.clone()),
         );
-        // Move cancellation authority before the durable preference boundary:
-        // restrictive changes stop in-flight work immediately, while enabling
-        // changes remain denied by the old durable record until the commit.
-        self.reconcile_proactive_cancellation_for_owner(
-            value.owner,
-            effective_preferences.proactive_interventions_enabled,
-            effective_preferences.proactive_interventions_muted,
-        )?;
+        // Every preference revision invalidates the exact policy trace, even
+        // when the new value is equally permissive. Cancel the old token before
+        // the durable boundary; a successful commit rotates fresh authority
+        // only after stale queued content has been scrubbed.
+        self.cancel_proactive_for_owner(value.owner)?;
         let effective_policy = self.effective_policy_from(effective_preferences.clone());
         let save_result = self.commit(context, |events| {
             self.repository
@@ -2032,26 +2337,27 @@ impl SecondMindRuntime {
             }
             return Err(error);
         }
-        // Reconcile once more against concurrent session mute/state changes.
+        self.cancel_queued_interventions(
+            value.owner,
+            None,
+            None,
+            if effective_preferences.proactive_interventions_muted {
+                "interventions_muted"
+            } else if !effective_preferences.proactive_interventions_enabled {
+                "proactive_interventions_disabled"
+            } else {
+                "preferences_revision_changed"
+            },
+            context,
+        )?;
+        // Reconcile against the now-current record and session/goal state. A
+        // permissive revision gets a fresh token; restrictive/stale sessions
+        // remain cancelled.
         self.reconcile_proactive_cancellation_for_owner(
             value.owner,
             effective_preferences.proactive_interventions_enabled,
             effective_preferences.proactive_interventions_muted,
         )?;
-        if !effective_preferences.proactive_interventions_enabled
-            || effective_preferences.proactive_interventions_muted
-        {
-            self.cancel_queued_interventions(
-                value.owner,
-                None,
-                if effective_preferences.proactive_interventions_muted {
-                    "interventions_muted"
-                } else {
-                    "proactive_interventions_disabled"
-                },
-                context,
-            )?;
-        }
         Ok(value)
     }
 
@@ -2607,6 +2913,19 @@ impl SecondMindRuntime {
                 route.allowed_categories.clone(),
             ),
         );
+        let affected_sessions: Vec<_> = self
+            .repository
+            .load_focus_sessions(owner)?
+            .into_iter()
+            .filter(|session| session.model_route_approval_id == route_id && session.is_working())
+            .collect();
+        for session in &affected_sessions {
+            if let Ok(state) = self.ephemeral.lock()
+                && let Some(ephemeral) = state.sessions.get(&session.id)
+            {
+                ephemeral.cancellation.cancel();
+            }
+        }
         self.commit(self.daemon_context(), |events| {
             self.repository
                 .save_revoked_model_route_with_cleanup(&route, expected, &cleanup, &audit)?;
@@ -2616,16 +2935,14 @@ impl SecondMindRuntime {
             });
             Ok(())
         })?;
-        for session in self.repository.load_focus_sessions(owner)? {
-            if session.model_route_approval_id != route_id || !session.is_working() {
-                continue;
-            }
-            if let Ok(state) = self.ephemeral.lock()
-                && let Some(ephemeral) = state.sessions.get(&session.id)
-            {
-                ephemeral.cancellation.cancel();
-            }
-            self.cancel_outbox_for_session(owner, session.id)?;
+        for session in affected_sessions {
+            self.cancel_queued_interventions(
+                owner,
+                Some(session.id),
+                None,
+                "model_route_revoked",
+                self.daemon_context(),
+            )?;
             let stopping = self.end_focus_session(
                 ClientAssurance::NativeEmergencyControl,
                 owner,
@@ -3831,6 +4148,14 @@ impl SecondMindRuntime {
             });
         }
         let goal = self.get_goal(session.owner, session.goal_id)?;
+        if goal.state != GoalState::Active
+            || goal.revision.get() != session.goal_revision
+            || goal.deadline.is_some_and(|deadline| now >= deadline)
+        {
+            return Ok(ReasoningCycleResult::Silence {
+                reason_code: "reasoning_authority_unavailable".to_owned(),
+            });
+        }
         let preferences = self.effective_preferences(session.owner)?;
         if !preferences.proactive_interventions_enabled {
             return Ok(ReasoningCycleResult::Silence {
@@ -3978,6 +4303,31 @@ impl SecondMindRuntime {
             issued_at: now,
             deadline_at,
         };
+        if !self.record_model_request_started(ModelRequestReceipt {
+            request_id: request.request_id,
+            focus_session_id: session.id,
+            model_route_approval_id: route.id,
+            model_route_revision: route.revision,
+            started_at: self.clock.now_utc(),
+            completed_at: None,
+            outcome: ModelRequestReceiptOutcome::InFlight,
+        })? {
+            drop(model_permit);
+            return Ok(ReasoningCycleResult::Silence {
+                reason_code: "proactive_authority_cancelled".to_owned(),
+            });
+        }
+        if cancellation.is_cancelled() {
+            self.record_model_request_completed(
+                session.id,
+                request.request_id,
+                ModelRequestReceiptOutcome::Cancelled,
+            )?;
+            drop(model_permit);
+            return Ok(ReasoningCycleResult::Silence {
+                reason_code: "proactive_authority_cancelled".to_owned(),
+            });
+        }
         let output = match tokio::time::timeout(
             self.config.model_deadline,
             self.model.reason(&request, cancellation.clone()),
@@ -3985,36 +4335,71 @@ impl SecondMindRuntime {
         .await
         {
             Ok(Ok(value)) => value,
-            Ok(Err(error))
-                if matches!(
-                    error.kind,
-                    ModelGatewayErrorKind::Cancelled | ModelGatewayErrorKind::DeadlineExceeded
-                ) =>
-            {
+            Ok(Err(error)) if error.kind == ModelGatewayErrorKind::Cancelled => {
+                self.record_model_request_completed(
+                    session.id,
+                    request.request_id,
+                    ModelRequestReceiptOutcome::Cancelled,
+                )?;
+                drop(model_permit);
+                return Ok(ReasoningCycleResult::Silence {
+                    reason_code: "reasoning_cancelled_or_timed_out".to_owned(),
+                });
+            }
+            Ok(Err(error)) if error.kind == ModelGatewayErrorKind::DeadlineExceeded => {
+                self.record_model_request_completed(
+                    session.id,
+                    request.request_id,
+                    ModelRequestReceiptOutcome::DeadlineExceeded,
+                )?;
+                drop(model_permit);
                 return Ok(ReasoningCycleResult::Silence {
                     reason_code: "reasoning_cancelled_or_timed_out".to_owned(),
                 });
             }
             Ok(Err(_)) => {
+                self.record_model_request_completed(
+                    session.id,
+                    request.request_id,
+                    ModelRequestReceiptOutcome::Failed,
+                )?;
+                drop(model_permit);
                 return Ok(ReasoningCycleResult::Silence {
                     reason_code: "reasoning_failed".to_owned(),
                 });
             }
             Err(_) => {
                 cancellation.cancel();
+                self.record_model_request_completed(
+                    session.id,
+                    request.request_id,
+                    ModelRequestReceiptOutcome::DeadlineExceeded,
+                )?;
+                drop(model_permit);
                 return Ok(ReasoningCycleResult::Silence {
                     reason_code: "reasoning_cancelled_or_timed_out".to_owned(),
                 });
             }
         };
         if cancellation.is_cancelled() {
+            self.record_model_request_completed(
+                session.id,
+                request.request_id,
+                ModelRequestReceiptOutcome::Cancelled,
+            )?;
+            drop(model_permit);
             return Ok(ReasoningCycleResult::Silence {
                 reason_code: "proactive_authority_cancelled".to_owned(),
             });
         }
-        drop(model_permit);
         match output {
             ModelReasoningOutput::Silence { reason_code } => {
+                self.record_model_request_completed(
+                    session.id,
+                    request.request_id,
+                    ModelRequestReceiptOutcome::CompletedStrictSilence,
+                )?;
+                drop(model_permit);
                 Ok(ReasoningCycleResult::Silence { reason_code })
             }
             ModelReasoningOutput::Candidate {
@@ -4025,12 +4410,26 @@ impl SecondMindRuntime {
                 urgency,
                 confidence_basis_points,
             } => {
-                validate_candidate(
+                if let Err(error) = validate_candidate(
                     &user_visible_text,
                     &reason_code,
                     &evidence_summary,
                     confidence_basis_points,
+                ) {
+                    self.record_model_request_completed(
+                        session.id,
+                        request.request_id,
+                        ModelRequestReceiptOutcome::Failed,
+                    )?;
+                    drop(model_permit);
+                    return Err(error);
+                }
+                self.record_model_request_completed(
+                    session.id,
+                    request.request_id,
+                    ModelRequestReceiptOutcome::CompletedStrictCandidate,
                 )?;
+                drop(model_permit);
                 self.evaluate_and_deliver(
                     &session,
                     &route,
@@ -4460,8 +4859,11 @@ impl SecondMindRuntime {
         // audit acknowledgement and immediately before invoking the adapter.
         let current_now = self.clock.now_utc();
         if !self.delivery_authority_is_current(&decision, session.goal_id, intervention.id) {
-            intervention.state = InterventionState::Cancelled;
-            scrub_intervention(&mut intervention);
+            cancel_intervention_without_delivery(
+                &mut intervention,
+                current_now,
+                "authority_changed_before_delivery",
+            );
             intervention.revision += 1;
             intervention.updated_at = current_now;
             self.commit(self.daemon_context(), |events| {
@@ -4501,9 +4903,70 @@ impl SecondMindRuntime {
             ),
             expires_at: intervention.expires_at,
         };
-        let delivery_cancellation = self.proactive_cancellation(session.id)?;
-        let channel_available = self.notification.availability().is_available();
-        let acknowledgement = if channel_available {
+        let delivery_cancellation = match self.proactive_cancellation(session.id) {
+            Ok(cancellation) => cancellation,
+            Err(_) => {
+                let cancelled_at = self.clock.now_utc();
+                cancel_intervention_without_delivery(
+                    &mut intervention,
+                    cancelled_at,
+                    "delivery_cancellation_authority_unavailable",
+                );
+                intervention.revision += 1;
+                intervention.updated_at = cancelled_at;
+                self.commit(self.daemon_context(), |events| {
+                    self.persist_intervention_transition(
+                        &intervention,
+                        1,
+                        AuditKind::InterventionDelivery,
+                        AuditDetails::new(
+                            vec!["delivery_cancellation_authority_unavailable".to_owned()],
+                            BTreeSet::new(),
+                        )
+                        .with_policy_trace(decision.policy_trace.clone()),
+                        None,
+                    )?;
+                    Self::push_intervention_update(
+                        events,
+                        &intervention,
+                        InterventionHistoryViewChange::Updated,
+                    );
+                    Ok(())
+                })?;
+                return Ok(ReasoningCycleResult::Silence {
+                    reason_code: "delivery_cancellation_authority_unavailable".to_owned(),
+                });
+            }
+        };
+        let mut cancelled_before_submission = false;
+        if notification_available {
+            // `Delivering` is the durable pre-attempt marker. No notification
+            // port call is permitted until this intervention revision and its
+            // content-free delivery audit commit together.
+            let expected = intervention.revision;
+            intervention.state = InterventionState::Delivering;
+            intervention.revision += 1;
+            intervention.updated_at = self.clock.now_utc();
+            self.commit(self.daemon_context(), |events| {
+                self.persist_intervention_transition(
+                    &intervention,
+                    expected,
+                    AuditKind::InterventionDelivery,
+                    AuditDetails::new(vec!["delivery_attempt_started".to_owned()], BTreeSet::new())
+                        .with_policy_trace(decision.policy_trace.clone()),
+                    None,
+                )?;
+                Self::push_intervention_update(
+                    events,
+                    &intervention,
+                    InterventionHistoryViewChange::Updated,
+                );
+                Ok(())
+            })?;
+            cancelled_before_submission = delivery_cancellation.is_cancelled()
+                || !self.delivery_authority_is_current(&decision, session.goal_id, intervention.id);
+        }
+        let acknowledgement = if notification_available && !cancelled_before_submission {
             Some(
                 tokio::time::timeout(
                     self.config.notification_attempt_deadline,
@@ -4520,6 +4983,7 @@ impl SecondMindRuntime {
         }
         let authority_after_attempt = !delivery_cancellation.is_cancelled()
             && self.delivery_authority_is_current(&decision, session.goal_id, intervention.id);
+        let expected_delivery_revision = intervention.revision;
         let delivery_transition = match acknowledgement {
             Some(Ok(Ok(ChannelAcknowledgement::AcceptedByChannel))) => {
                 intervention.state = InterventionState::AcceptedByChannel;
@@ -4536,8 +5000,11 @@ impl SecondMindRuntime {
             }
             Some(Ok(Ok(ChannelAcknowledgement::DeliveryFailed))) | Some(Ok(Err(_))) => {
                 if !authority_after_attempt {
-                    intervention.state = InterventionState::Cancelled;
-                    scrub_intervention(&mut intervention);
+                    cancel_intervention_without_delivery(
+                        &mut intervention,
+                        self.clock.now_utc(),
+                        "authority_changed_during_failed_delivery",
+                    );
                 } else {
                     intervention.state = InterventionState::DeliveryFailed;
                 }
@@ -4545,12 +5012,25 @@ impl SecondMindRuntime {
                 intervention.updated_at = self.clock.now_utc();
                 None
             }
-            None if authority_after_attempt => self
+            None if cancelled_before_submission => {
+                cancel_intervention_without_delivery(
+                    &mut intervention,
+                    self.clock.now_utc(),
+                    "authority_changed_before_submission",
+                );
+                intervention.revision += 1;
+                intervention.updated_at = self.clock.now_utc();
+                None
+            }
+            None if !notification_available && authority_after_attempt => self
                 .queue_intervention(&mut intervention, &decision, notification_grant, &delivery)?
                 .map(PendingDeliveryTransition::Enqueue),
             None => {
-                intervention.state = InterventionState::Cancelled;
-                scrub_intervention(&mut intervention);
+                cancel_intervention_without_delivery(
+                    &mut intervention,
+                    self.clock.now_utc(),
+                    "authority_unavailable_before_queue",
+                );
                 intervention.revision += 1;
                 intervention.updated_at = self.clock.now_utc();
                 None
@@ -4560,10 +5040,22 @@ impl SecondMindRuntime {
             intervention.state,
             InterventionState::AcceptedByChannel | InterventionState::DeliveryUnknown
         );
+        let queued_delivery =
+            delivery_transition
+                .as_ref()
+                .and_then(|transition| match transition {
+                    PendingDeliveryTransition::Enqueue(delivery) => Some(delivery.clone()),
+                    PendingDeliveryTransition::Update { .. }
+                    | PendingDeliveryTransition::ReconcileLegacy { .. } => None,
+                });
+        #[cfg(test)]
+        if queued_delivery.is_some() {
+            self.run_before_queue_commit_hook();
+        }
         self.commit(self.daemon_context(), |events| {
             self.persist_intervention_transition(
                 &intervention,
-                1,
+                expected_delivery_revision,
                 AuditKind::InterventionDelivery,
                 AuditDetails::new(
                     vec![format!("delivery_{:?}", intervention.state).to_lowercase()],
@@ -4592,6 +5084,47 @@ impl SecondMindRuntime {
             });
             Ok(())
         })?;
+        if let Some(mut queued_delivery) = queued_delivery
+            && (delivery_cancellation.is_cancelled()
+                || !self.delivery_authority_is_current(&decision, session.goal_id, intervention.id))
+        {
+            let expected_delivery_state = queued_delivery.state;
+            queued_delivery.state = OutboxState::Cancelled;
+            queued_delivery.user_visible_text.clear();
+            let expected = intervention.revision;
+            intervention.state = InterventionState::Cancelled;
+            intervention.outcome = InterventionOutcome::Expired;
+            intervention.outcome_at = Some(self.clock.now_utc());
+            intervention.reason_code = "authority_changed_after_enqueue".to_owned();
+            scrub_intervention(&mut intervention);
+            intervention.revision = intervention.revision.saturating_add(1);
+            intervention.updated_at = self.clock.now_utc();
+            self.commit(self.daemon_context(), |events| {
+                self.persist_intervention_transition(
+                    &intervention,
+                    expected,
+                    AuditKind::InterventionDelivery,
+                    AuditDetails::new(
+                        vec!["authority_changed_after_enqueue".to_owned()],
+                        BTreeSet::new(),
+                    )
+                    .with_policy_trace(decision.policy_trace.clone()),
+                    Some(PendingDeliveryTransition::Update {
+                        delivery: queued_delivery.clone(),
+                        expected_state: expected_delivery_state,
+                    }),
+                )?;
+                Self::push_intervention_update(
+                    events,
+                    &intervention,
+                    InterventionHistoryViewChange::Updated,
+                );
+                Ok(())
+            })?;
+            return Ok(ReasoningCycleResult::Silence {
+                reason_code: "authority_changed_after_enqueue".to_owned(),
+            });
+        }
         let channel_status = tokio::time::timeout(
             self.config.notification_attempt_deadline,
             self.notification.status(),
@@ -4640,14 +5173,12 @@ impl SecondMindRuntime {
             .count()
             >= self.config.outbox_capacity_per_session;
         if duplicate_exists || user_full || session_full {
-            intervention.state = InterventionState::DeliveryFailed;
-            intervention.reason_code = if duplicate_exists {
+            let reason_code = if duplicate_exists {
                 "delivery_deduplicated"
             } else {
                 "outbox_capacity"
-            }
-            .to_owned();
-            scrub_intervention(intervention);
+            };
+            cancel_intervention_without_delivery(intervention, self.clock.now_utc(), reason_code);
             intervention.revision += 1;
             intervention.updated_at = self.clock.now_utc();
             return Ok(None);
@@ -5011,7 +5542,9 @@ impl SecondMindRuntime {
             };
             let expected = intervention.revision;
             intervention.policy_decision_id = new_decision.id;
-            intervention.state = InterventionState::Delivering;
+            // Revalidation and its audit commit before an attempt marker. A
+            // crash here is still a queued, definitely unattempted delivery.
+            intervention.state = InterventionState::Queued;
             intervention.revision = intervention.revision.saturating_add(1);
             intervention.updated_at = now;
             let evidence_categories = intervention
@@ -5045,6 +5578,8 @@ impl SecondMindRuntime {
                 drop(publication_fence);
                 continue;
             }
+            #[cfg(test)]
+            self.run_after_recovery_revalidation_commit_hook();
             if !self.delivery_authority_is_current(
                 &new_decision,
                 intervention.goal_id,
@@ -5052,7 +5587,6 @@ impl SecondMindRuntime {
             ) {
                 let expected_delivery_state = entry.state;
                 entry.state = OutboxState::Cancelled;
-                entry.policy_decision_id = new_decision.id;
                 entry.user_visible_text.clear();
                 let expected = intervention.revision;
                 intervention.state = InterventionState::Cancelled;
@@ -5095,12 +5629,80 @@ impl SecondMindRuntime {
                     entry: Some(intervention.clone()),
                 }]);
             }
+            let delivery_cancellation = self.proactive_cancellation(session.id)?;
             entry.state = OutboxState::Delivering;
             entry.attempt_count = entry.attempt_count.saturating_add(1);
             entry.last_attempt_at = Some(now);
             entry.policy_decision_id = new_decision.id;
-            self.repository.save_delivery(&entry)?;
-            let delivery_cancellation = self.proactive_cancellation(session.id)?;
+            let expected_intervention_revision = intervention.revision;
+            intervention.state = InterventionState::Delivering;
+            intervention.revision = intervention.revision.saturating_add(1);
+            intervention.updated_at = self.clock.now_utc();
+            self.commit(self.daemon_context(), |events| {
+                self.persist_intervention_transition(
+                    &intervention,
+                    expected_intervention_revision,
+                    AuditKind::InterventionDelivery,
+                    AuditDetails::new(
+                        vec!["recovery_delivery_attempt_started".to_owned()],
+                        BTreeSet::new(),
+                    )
+                    .with_policy_trace(new_decision.policy_trace.clone()),
+                    Some(PendingDeliveryTransition::Update {
+                        delivery: entry.clone(),
+                        expected_state: OutboxState::Queued,
+                    }),
+                )?;
+                Self::push_intervention_update(
+                    events,
+                    &intervention,
+                    InterventionHistoryViewChange::Updated,
+                );
+                Ok(())
+            })?;
+            if delivery_cancellation.is_cancelled()
+                || !self.delivery_authority_is_current(
+                    &new_decision,
+                    intervention.goal_id,
+                    intervention.id,
+                )
+            {
+                let expected_delivery_state = entry.state;
+                entry.state = OutboxState::Cancelled;
+                entry.user_visible_text.clear();
+                let expected = intervention.revision;
+                intervention.state = InterventionState::Cancelled;
+                intervention.outcome = InterventionOutcome::Expired;
+                intervention.outcome_at = Some(self.clock.now_utc());
+                intervention.reason_code = "authority_changed_before_recovery_delivery".to_owned();
+                scrub_intervention(&mut intervention);
+                intervention.revision = intervention.revision.saturating_add(1);
+                intervention.updated_at = self.clock.now_utc();
+                self.commit(self.daemon_context(), |events| {
+                    self.persist_intervention_transition(
+                        &intervention,
+                        expected,
+                        AuditKind::InterventionDelivery,
+                        AuditDetails::new(
+                            vec!["authority_changed_after_delivery_marker".to_owned()],
+                            BTreeSet::new(),
+                        )
+                        .with_policy_trace(new_decision.policy_trace.clone()),
+                        Some(PendingDeliveryTransition::Update {
+                            delivery: entry.clone(),
+                            expected_state: expected_delivery_state,
+                        }),
+                    )?;
+                    Self::push_intervention_update(
+                        events,
+                        &intervention,
+                        InterventionHistoryViewChange::Updated,
+                    );
+                    Ok(())
+                })?;
+                changed.push(intervention);
+                continue;
+            }
             let result = tokio::time::timeout(
                 self.config.notification_attempt_deadline,
                 self.notification.deliver(
@@ -5142,17 +5744,27 @@ impl SecondMindRuntime {
                 }
             };
             entry.user_visible_text.clear();
-            intervention.state = match entry.state {
-                OutboxState::AcceptedByChannel => InterventionState::AcceptedByChannel,
-                OutboxState::DeliveryUnknown => InterventionState::DeliveryUnknown,
-                OutboxState::Cancelled => InterventionState::Cancelled,
-                _ => InterventionState::DeliveryFailed,
-            };
+            let terminal_at = self.clock.now_utc();
+            match entry.state {
+                OutboxState::AcceptedByChannel => {
+                    intervention.state = InterventionState::AcceptedByChannel;
+                    intervention.delivered_at = Some(terminal_at);
+                }
+                OutboxState::DeliveryUnknown => {
+                    intervention.state = InterventionState::DeliveryUnknown;
+                }
+                OutboxState::Cancelled => cancel_intervention_without_delivery(
+                    &mut intervention,
+                    terminal_at,
+                    "authority_changed_during_failed_delivery",
+                ),
+                _ => {
+                    intervention.state = InterventionState::DeliveryFailed;
+                }
+            }
             let expected = intervention.revision;
             intervention.revision += 1;
-            intervention.updated_at = now;
-            intervention.delivered_at =
-                (entry.state == OutboxState::AcceptedByChannel).then_some(now);
+            intervention.updated_at = terminal_at;
             self.commit(self.daemon_context(), |events| {
                 self.persist_intervention_transition(
                     &intervention,
@@ -5230,7 +5842,17 @@ impl SecondMindRuntime {
         grant.revoked_at = Some(self.clock.now_utc());
         grant.revocation_reason = Some(bound_text(reason, 120));
         grant.revision += 1;
-        self.commit(self.daemon_context(), |events| {
+        let focus_session_id = grant.focus_session_id;
+        // Fence fresh model and delivery submissions before the durable
+        // transition. The root observation/status token stays live until the
+        // revocation commits, so a failed repository write cannot strand an
+        // Active session behind an irrearmable cancelled lifecycle token.
+        if let Some(session_id) = focus_session_id {
+            self.cancel_proactive_cancellation(session_id)?;
+        }
+        #[cfg(test)]
+        self.run_before_permission_revocation_commit_hook();
+        let save_result = self.commit(self.daemon_context(), |events| {
             self.persist_permission_revocation(
                 &grant,
                 expected,
@@ -5244,40 +5866,64 @@ impl SecondMindRuntime {
                 permission: PermissionRecord::SessionGrant(grant.clone()),
             });
             Ok(())
-        })?;
-
-        if let Some(session_id) = grant.focus_session_id {
-            if let Ok(mut state) = self.ephemeral.lock()
-                && let Some(ephemeral) = state.sessions.get_mut(&session_id)
+        });
+        if let Err(error) = save_result {
+            if let Some(session_id) = focus_session_id
+                && let (Ok(session), Ok(preferences)) = (
+                    find_session(&*self.repository, session_id),
+                    self.effective_preferences(owner),
+                )
             {
-                ephemeral.cancellation.cancel();
-                ephemeral
-                    .observations
-                    .retain(|observation| observation.grant_id != grant_id);
+                let _ = self.reconcile_proactive_cancellation_for_session(&session, &preferences);
             }
-            let _ = self.observation.stop(session_id, grant_id).await;
-            if grant.scope.is_observation() {
-                let remaining_observation =
-                    self.repository.load_grants(owner)?.iter().any(|other| {
-                        other.focus_session_id == Some(session_id)
-                            && other.scope.is_observation()
-                            && other.is_current_at(self.clock.now_utc())
-                    });
-                if !remaining_observation {
-                    let session = find_session(&*self.repository, session_id)?;
-                    let stopping = self.end_focus_session(
-                        ClientAssurance::NativeEmergencyControl,
-                        owner,
-                        session_id,
-                        session.revision,
-                        EndFocusReason::RequiredPermissionRevoked,
-                    )?;
-                    self.finish_end_focus_session(owner, session_id, stopping.revision)
-                        .await?;
-                }
-            }
+            return Err(error);
         }
-        self.cancel_outbox_for_grant(owner, grant_id)?;
+
+        // Durable revocation now owns the fail-closed authority boundary. Stop
+        // every raw observation/status producer and discard the revoked
+        // grant's transient observations before any fallible cleanup follows.
+        if let Some(session_id) = focus_session_id
+            && let Ok(mut state) = self.ephemeral.lock()
+            && let Some(ephemeral) = state.sessions.get_mut(&session_id)
+        {
+            ephemeral.cancellation.cancel();
+            ephemeral
+                .observations
+                .retain(|observation| observation.grant_id != grant_id);
+        }
+
+        if let Some(session_id) = focus_session_id {
+            // Every ID bound into a focus session is required authority, not a
+            // best-effort source. Revoking any one ends the session now; it is
+            // never left Active because another observation grant remains.
+            // The durable Stopping transition precedes fallible queue scrub,
+            // so a scrub failure is restart-recoverable rather than leaving an
+            // Active session behind a revoked required grant.
+            let session = find_session(&*self.repository, session_id)?;
+            let stopping = if session.state == FocusSessionState::Stopping {
+                session
+            } else {
+                self.end_focus_session(
+                    ClientAssurance::NativeEmergencyControl,
+                    owner,
+                    session_id,
+                    session.revision,
+                    EndFocusReason::RequiredPermissionRevoked,
+                )?
+            };
+            if stopping.state == FocusSessionState::Stopping {
+                self.finish_end_focus_session(owner, session_id, stopping.revision)
+                    .await?;
+            }
+        } else {
+            self.cancel_queued_interventions(
+                owner,
+                None,
+                Some(grant_id),
+                "permission_revoked",
+                self.daemon_context(),
+            )?;
+        }
         Ok(grant)
     }
 
@@ -5337,6 +5983,7 @@ impl SecondMindRuntime {
             self.cancel_queued_interventions(
                 owner,
                 Some(session_id),
+                None,
                 "interventions_muted",
                 context,
             )?;
@@ -5457,28 +6104,55 @@ impl SecondMindRuntime {
         session.failure_reason = Some(format!("ending_{reason:?}").to_lowercase());
         session.updated_at = self.clock.now_utc();
         session.revision += 1;
-        self.commit(self.daemon_context(), |events| {
+        // Fence model and delivery submission before the durable lifecycle
+        // transition, but do not cancel the irrearmable observation/status
+        // root until Stopping commits. A failed repository write can therefore
+        // restore proactive authority without stranding an Active session.
+        self.cancel_proactive_cancellation(session_id)?;
+        let save_result = self.commit(self.daemon_context(), |events| {
             self.persist_focus_lifecycle_transition(
                 &session,
                 expected,
                 AuditDetails::new(vec!["focus_session_stopping".to_owned()], BTreeSet::new()),
             )?;
-            if let Ok(mut state) = self.ephemeral.lock()
-                && let Some(ephemeral) = state.sessions.get_mut(&session_id)
-            {
-                ephemeral.cancellation.cancel();
-                ephemeral.observations.clear();
-                let now = self.clock.now_utc();
-                for status in ephemeral.source_health.values_mut() {
-                    status.health = crate::SourceHealth::Paused;
-                    status.detail = "Capture authority was revoked before adapter cleanup.";
-                    status.observed_at = now;
-                }
-            }
             self.push_focus_and_capture(events, FocusSessionViewChange::Stopping, &session);
             Ok(())
-        })?;
-        self.cancel_outbox_for_session(owner, session_id)?;
+        });
+        if let Err(error) = save_result {
+            if let (Ok(current), Ok(preferences)) = (
+                find_session(&*self.repository, session_id),
+                self.effective_preferences(owner),
+            ) {
+                let _ = self.reconcile_proactive_cancellation_for_session(&current, &preferences);
+            }
+            return Err(error);
+        }
+
+        // Stopping is now the durable authority boundary. Cancel all raw
+        // producers and erase transient observations before fallible cleanup.
+        if let Ok(mut state) = self.ephemeral.lock()
+            && let Some(ephemeral) = state.sessions.get_mut(&session_id)
+        {
+            ephemeral.cancellation.cancel();
+            ephemeral.observations.clear();
+            let now = self.clock.now_utc();
+            for status in ephemeral.source_health.values_mut() {
+                status.health = crate::SourceHealth::Paused;
+                status.detail = "Capture authority was revoked before adapter cleanup.";
+                status.observed_at = now;
+            }
+        }
+        self.cancel_queued_interventions(
+            owner,
+            Some(session_id),
+            None,
+            if reason == EndFocusReason::RequiredPermissionRevoked {
+                "permission_revoked"
+            } else {
+                "focus_session_stopping"
+            },
+            self.daemon_context(),
+        )?;
         Ok(session)
     }
 
@@ -5509,7 +6183,13 @@ impl SecondMindRuntime {
         // This is idempotent and intentionally repeated during restart
         // recovery: a crash after Stopping committed but before the original
         // caller scrubbed the outbox must not preserve actionable text.
-        self.cancel_outbox_for_session(owner, session_id)?;
+        self.cancel_queued_interventions(
+            owner,
+            Some(session_id),
+            None,
+            "focus_session_stopping",
+            self.daemon_context(),
+        )?;
         let grants = self.repository.load_grants(owner)?;
         let mut cleanup_incomplete = false;
         for grant_id in &session.permission_grant_ids {
@@ -5606,6 +6286,28 @@ impl SecondMindRuntime {
         if intervention.revision != expected_revision {
             return Err(SecondMindError::conflict(intervention.revision));
         }
+        let eligible_delivery_state = match intervention.state {
+            InterventionState::AcceptedByChannel => intervention.delivered_at.is_some(),
+            // A capability-bound user action on an ambiguous/history record is
+            // stronger evidence than the lost channel acknowledgement (for
+            // example, a crash-recovered toast activation).
+            InterventionState::DeliveryUnknown => true,
+            _ => false,
+        };
+        if !eligible_delivery_state
+            || intervention.outcome != InterventionOutcome::Unacknowledged
+            || intervention.outcome_at.is_some()
+            || !matches!(
+                outcome,
+                InterventionOutcome::Accepted
+                    | InterventionOutcome::Dismissed
+                    | InterventionOutcome::Corrected
+            )
+        {
+            return Err(SecondMindError::invalid(
+                "Feedback requires an accepted or delivery-unknown intervention with no prior outcome.",
+            ));
+        }
         let policy_trace = self.persisted_policy_trace(intervention.policy_decision_id)?;
         intervention.outcome = outcome;
         intervention.outcome_at = Some(self.clock.now_utc());
@@ -5641,6 +6343,258 @@ impl SecondMindRuntime {
             Ok(())
         })?;
         Ok(intervention)
+    }
+
+    /// Closes delivery records whose process died before their terminal outcome
+    /// could be committed. This method never calls a notification adapter:
+    /// once a durable attempt marker exists, losing the native result can only
+    /// be reported as unknown, never retried.
+    pub fn reconcile_interrupted_deliveries(
+        &self,
+        owner: ActorId,
+    ) -> Result<Vec<Intervention>, SecondMindError> {
+        let now = self.clock.now_utc();
+        let mut interventions = self.repository.load_interventions(owner)?;
+        interventions.sort_by_key(|intervention| (intervention.updated_at, intervention.id));
+        let deliveries = self.repository.load_pending_deliveries(owner)?;
+        let mut changed = Vec::new();
+
+        for mut intervention in interventions.into_iter().filter(|intervention| {
+            matches!(
+                intervention.state,
+                InterventionState::Allowed
+                    | InterventionState::Queued
+                    | InterventionState::Delivering
+            )
+        }) {
+            let mut matching = deliveries
+                .iter()
+                .filter(|delivery| delivery.intervention_id == intervention.id);
+            let delivery = matching.next().cloned();
+            if matching.next().is_some() {
+                return Err(SecondMindError::unavailable(
+                    "An interrupted intervention has multiple delivery records.",
+                ));
+            }
+
+            let expected = intervention.revision;
+            let policy_trace = self.persisted_policy_trace(intervention.policy_decision_id)?;
+            let (reason_code, delivery_transition) = match (intervention.state, delivery) {
+                (InterventionState::Allowed, None) => {
+                    intervention.state = InterventionState::Cancelled;
+                    intervention.outcome = InterventionOutcome::Expired;
+                    intervention.outcome_at = Some(now);
+                    intervention.reason_code = "delivery_not_started_after_restart".to_owned();
+                    scrub_intervention(&mut intervention);
+                    ("delivery_not_started_after_restart", None)
+                }
+                (InterventionState::Allowed, Some(mut delivery))
+                    if delivery.state == OutboxState::Queued =>
+                {
+                    let expected_state = delivery.state;
+                    delivery.state = OutboxState::Cancelled;
+                    delivery.user_visible_text.clear();
+                    intervention.state = InterventionState::Cancelled;
+                    intervention.outcome = InterventionOutcome::Expired;
+                    intervention.outcome_at = Some(now);
+                    intervention.reason_code = "delivery_not_started_after_restart".to_owned();
+                    scrub_intervention(&mut intervention);
+                    (
+                        "delivery_not_started_after_restart",
+                        Some(PendingDeliveryTransition::Update {
+                            delivery,
+                            expected_state,
+                        }),
+                    )
+                }
+                (InterventionState::Queued, None) => {
+                    intervention.state = InterventionState::Cancelled;
+                    intervention.outcome = InterventionOutcome::Expired;
+                    intervention.outcome_at = Some(now);
+                    intervention.reason_code = "delivery_not_started_after_restart".to_owned();
+                    scrub_intervention(&mut intervention);
+                    ("delivery_not_started_after_restart", None)
+                }
+                (InterventionState::Queued, Some(mut delivery))
+                    if delivery.state == OutboxState::Queued =>
+                {
+                    let authority_is_current = self
+                        .repository
+                        .find_policy_decision(delivery.policy_decision_id)?
+                        .as_ref()
+                        .is_some_and(|decision| {
+                            decision.id == intervention.policy_decision_id
+                                && self.durable_delivery_authority_is_current(
+                                    decision,
+                                    intervention.goal_id,
+                                    intervention.id,
+                                )
+                        });
+                    if authority_is_current {
+                        // This is the only restart state that remains eligible
+                        // for fresh policy revalidation and a later marker.
+                        continue;
+                    }
+                    let expected_state = delivery.state;
+                    delivery.state = OutboxState::Cancelled;
+                    delivery.user_visible_text.clear();
+                    intervention.state = InterventionState::Cancelled;
+                    intervention.outcome = InterventionOutcome::Expired;
+                    intervention.outcome_at = Some(now);
+                    intervention.reason_code = "queued_authority_invalid_after_restart".to_owned();
+                    scrub_intervention(&mut intervention);
+                    (
+                        "queued_authority_invalid_after_restart",
+                        Some(PendingDeliveryTransition::Update {
+                            delivery,
+                            expected_state,
+                        }),
+                    )
+                }
+                (InterventionState::Queued, Some(mut delivery))
+                    if matches!(
+                        delivery.state,
+                        OutboxState::Delivering | OutboxState::DeliveryUnknown
+                    ) =>
+                {
+                    // An outbox attempt marker is authoritative even if an
+                    // older implementation failed to update the intervention.
+                    let expected_state = delivery.state;
+                    delivery.state = OutboxState::DeliveryUnknown;
+                    delivery.user_visible_text.clear();
+                    intervention.state = InterventionState::DeliveryUnknown;
+                    (
+                        "delivery_unknown_after_restart",
+                        Some(PendingDeliveryTransition::ReconcileLegacy {
+                            delivery,
+                            expected_state,
+                        }),
+                    )
+                }
+                (InterventionState::Queued, Some(mut delivery))
+                    if delivery.state == OutboxState::AcceptedByChannel =>
+                {
+                    let expected_state = delivery.state;
+                    delivery.user_visible_text.clear();
+                    intervention.state = InterventionState::AcceptedByChannel;
+                    intervention.delivered_at = Some(now);
+                    (
+                        "delivery_state_reconciled_after_restart",
+                        Some(PendingDeliveryTransition::ReconcileLegacy {
+                            delivery,
+                            expected_state,
+                        }),
+                    )
+                }
+                (InterventionState::Queued, Some(mut delivery))
+                    if delivery.state == OutboxState::DeliveryFailed =>
+                {
+                    let expected_state = delivery.state;
+                    delivery.user_visible_text.clear();
+                    intervention.state = InterventionState::DeliveryFailed;
+                    (
+                        "delivery_state_reconciled_after_restart",
+                        Some(PendingDeliveryTransition::ReconcileLegacy {
+                            delivery,
+                            expected_state,
+                        }),
+                    )
+                }
+                (InterventionState::Queued, Some(mut delivery))
+                    if matches!(
+                        delivery.state,
+                        OutboxState::Expired | OutboxState::Cancelled
+                    ) =>
+                {
+                    let expected_state = delivery.state;
+                    delivery.user_visible_text.clear();
+                    intervention.state = match delivery.state {
+                        OutboxState::Expired => InterventionState::Expired,
+                        OutboxState::Cancelled => InterventionState::Cancelled,
+                        _ => unreachable!("matched terminal non-delivery state"),
+                    };
+                    intervention.outcome = InterventionOutcome::Expired;
+                    intervention.outcome_at = Some(now);
+                    intervention.reason_code = "missed_intervention".to_owned();
+                    scrub_intervention(&mut intervention);
+                    (
+                        "delivery_state_reconciled_after_restart",
+                        Some(PendingDeliveryTransition::ReconcileLegacy {
+                            delivery,
+                            expected_state,
+                        }),
+                    )
+                }
+                (InterventionState::Delivering, None) => {
+                    intervention.state = InterventionState::DeliveryUnknown;
+                    ("delivery_unknown_after_restart", None)
+                }
+                (InterventionState::Delivering, Some(mut delivery))
+                    if matches!(
+                        delivery.state,
+                        OutboxState::Delivering | OutboxState::DeliveryUnknown
+                    ) =>
+                {
+                    let expected_state = delivery.state;
+                    delivery.state = OutboxState::DeliveryUnknown;
+                    delivery.user_visible_text.clear();
+                    intervention.state = InterventionState::DeliveryUnknown;
+                    (
+                        "delivery_unknown_after_restart",
+                        Some(PendingDeliveryTransition::Update {
+                            delivery,
+                            expected_state,
+                        }),
+                    )
+                }
+                (InterventionState::Delivering, Some(mut delivery))
+                    if delivery.state == OutboxState::Queued =>
+                {
+                    // The recovery decision committed, but the atomic attempt
+                    // marker did not. No adapter call was possible.
+                    let expected_state = delivery.state;
+                    delivery.state = OutboxState::Cancelled;
+                    delivery.user_visible_text.clear();
+                    intervention.state = InterventionState::Cancelled;
+                    intervention.outcome = InterventionOutcome::Expired;
+                    intervention.outcome_at = Some(now);
+                    intervention.reason_code = "delivery_not_started_after_restart".to_owned();
+                    scrub_intervention(&mut intervention);
+                    (
+                        "delivery_not_started_after_restart",
+                        Some(PendingDeliveryTransition::Update {
+                            delivery,
+                            expected_state,
+                        }),
+                    )
+                }
+                _ => {
+                    return Err(SecondMindError::unavailable(
+                        "An interrupted intervention and delivery record disagree.",
+                    ));
+                }
+            };
+            intervention.revision = intervention.revision.saturating_add(1);
+            intervention.updated_at = now;
+            self.commit(self.daemon_context(), |events| {
+                self.persist_intervention_transition(
+                    &intervention,
+                    expected,
+                    AuditKind::InterventionDelivery,
+                    AuditDetails::new(vec![reason_code.to_owned()], BTreeSet::new())
+                        .with_optional_policy_trace(policy_trace),
+                    delivery_transition,
+                )?;
+                Self::push_intervention_update(
+                    events,
+                    &intervention,
+                    InterventionHistoryViewChange::Updated,
+                );
+                Ok(())
+            })?;
+            changed.push(intervention);
+        }
+        Ok(changed)
     }
 
     pub fn recover_owner(&self, owner: ActorId) -> Result<Vec<FocusSession>, SecondMindError> {
@@ -5961,6 +6915,7 @@ impl SecondMindRuntime {
         &self,
         owner: ActorId,
         session_filter: Option<FocusSessionId>,
+        grant_filter: Option<PermissionGrantId>,
         reason_code: &'static str,
         context: EventContext,
     ) -> Result<(), SecondMindError> {
@@ -5970,18 +6925,15 @@ impl SecondMindRuntime {
             if entry.state != OutboxState::Queued {
                 continue;
             }
+            if grant_filter.is_some_and(|grant_id| !entry.permission_grant_ids.contains(&grant_id))
+            {
+                continue;
+            }
             let Some(mut intervention) = interventions
                 .iter()
                 .find(|intervention| intervention.id == entry.intervention_id)
                 .cloned()
             else {
-                if session_filter.is_some() {
-                    continue;
-                }
-                // The delivery payload is the most sensitive retained copy;
-                // clear it even if the corresponding history record is
-                // unavailable, then surface the repository inconsistency.
-                self.repository.save_delivery(&entry)?;
                 return Err(SecondMindError::unavailable(
                     "A queued intervention is unavailable.",
                 ));
@@ -5990,6 +6942,7 @@ impl SecondMindRuntime {
             {
                 continue;
             }
+            let policy_trace = self.persisted_policy_trace(intervention.policy_decision_id)?;
             let expected_delivery_state = entry.state;
             entry.state = OutboxState::Cancelled;
             entry.user_visible_text.clear();
@@ -6006,7 +6959,8 @@ impl SecondMindRuntime {
                     &intervention,
                     expected,
                     AuditKind::InterventionDelivery,
-                    AuditDetails::new(vec![reason_code.to_owned()], BTreeSet::new()),
+                    AuditDetails::new(vec![reason_code.to_owned()], BTreeSet::new())
+                        .with_optional_policy_trace(policy_trace.clone()),
                     Some(PendingDeliveryTransition::Update {
                         delivery: entry.clone(),
                         expected_state: expected_delivery_state,
@@ -6019,22 +6973,6 @@ impl SecondMindRuntime {
                 );
                 Ok(())
             })?;
-        }
-        Ok(())
-    }
-
-    fn cancel_outbox_for_grant(
-        &self,
-        owner: ActorId,
-        grant_id: PermissionGrantId,
-    ) -> Result<(), SecondMindError> {
-        for mut entry in self.repository.load_pending_deliveries(owner)? {
-            if entry.state == OutboxState::Queued && entry.permission_grant_ids.contains(&grant_id)
-            {
-                entry.state = OutboxState::Cancelled;
-                entry.user_visible_text.clear();
-                self.repository.save_delivery(&entry)?;
-            }
         }
         Ok(())
     }
@@ -6052,30 +6990,6 @@ impl SecondMindRuntime {
             .ok_or_else(|| {
                 SecondMindError::unavailable("The session has no live cancellation authority.")
             })
-    }
-
-    fn cancel_outbox_for_session(
-        &self,
-        owner: ActorId,
-        session_id: FocusSessionId,
-    ) -> Result<(), SecondMindError> {
-        let intervention_ids: BTreeSet<_> = self
-            .repository
-            .load_interventions(owner)?
-            .into_iter()
-            .filter(|value| value.focus_session_id == session_id)
-            .map(|value| value.id)
-            .collect();
-        for mut entry in self.repository.load_pending_deliveries(owner)? {
-            if entry.state == OutboxState::Queued
-                && intervention_ids.contains(&entry.intervention_id)
-            {
-                entry.state = OutboxState::Cancelled;
-                entry.user_visible_text.clear();
-                self.repository.save_delivery(&entry)?;
-            }
-        }
-        Ok(())
     }
 
     fn replayed_result(
@@ -6330,6 +7244,18 @@ fn scrub_intervention(intervention: &mut Intervention) {
     intervention.user_visible_text.clear();
     intervention.evidence_summary.clear();
     intervention.evidence.clear();
+}
+
+fn cancel_intervention_without_delivery(
+    intervention: &mut Intervention,
+    cancelled_at: OffsetDateTime,
+    reason_code: &str,
+) {
+    intervention.state = InterventionState::Cancelled;
+    intervention.outcome = InterventionOutcome::Expired;
+    intervention.outcome_at = Some(cancelled_at);
+    intervention.reason_code = reason_code.to_owned();
+    scrub_intervention(intervention);
 }
 
 fn reconcile_proactive_cancellation(ephemeral: &mut EphemeralSession, allowed: bool) {
@@ -6925,7 +7851,8 @@ mod tests {
     use crate::{
         EmergencyControlPort, IdempotencyKey, InterventionTone, ManualClock, MemoryRepository,
         ModelHandlingProfile, ModelPlacement, ObservationPortError, ObservationSourceStatus,
-        PlatformPortAvailability, ResourceId, SourceHealth,
+        PlatformPortAvailability, ResourceId, SourceHealth, UnavailableEmergencyControlPort,
+        UnavailableNativeStatusPort, UnavailableNotificationPort,
     };
 
     fn idempotency(seed: u8) -> IdempotencyContext {
@@ -7478,6 +8405,7 @@ mod tests {
         calls: AtomicUsize,
         cancellation_observed: Arc<AtomicBool>,
         audit_seen_before_delivery: AtomicBool,
+        attempt_marker_seen_before_delivery: AtomicBool,
         repository: MemoryRepository,
         owner: ActorId,
         revoke_on_delivery: Mutex<Option<PermissionGrant>>,
@@ -7497,7 +8425,7 @@ mod tests {
 
         fn deliver<'a>(
             &'a self,
-            _delivery: &'a NotificationDelivery,
+            delivery: &'a NotificationDelivery,
             cancellation: CancellationToken,
         ) -> crate::PortFuture<'a, Result<ChannelAcknowledgement, crate::NotificationPortError>>
         {
@@ -7523,6 +8451,32 @@ mod tests {
                 .any(|record| record.kind == AuditKind::InterventionDecision);
             self.audit_seen_before_delivery
                 .store(audit_exists, Ordering::SeqCst);
+            let attempt_audit_exists = self
+                .repository
+                .load_audit(self.owner, OffsetDateTime::UNIX_EPOCH, 100)
+                .unwrap()
+                .iter()
+                .any(|record| {
+                    record.kind == AuditKind::InterventionDelivery
+                        && record.subject_id == delivery.intervention_id.as_uuid()
+                        && record
+                            .reason_codes
+                            .iter()
+                            .any(|reason| reason == "delivery_attempt_started")
+                });
+            let delivering_is_durable = self
+                .repository
+                .load_interventions(self.owner)
+                .unwrap()
+                .iter()
+                .any(|intervention| {
+                    intervention.id == delivery.intervention_id
+                        && intervention.state == InterventionState::Delivering
+                });
+            self.attempt_marker_seen_before_delivery.store(
+                attempt_audit_exists && delivering_is_durable,
+                Ordering::SeqCst,
+            );
             if let Some(mut grant) = self
                 .revoke_on_delivery
                 .lock()
@@ -7797,6 +8751,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             cancellation_observed: Arc::new(AtomicBool::new(false)),
             audit_seen_before_delivery: AtomicBool::new(false),
+            attempt_marker_seen_before_delivery: AtomicBool::new(false),
             repository: repository.clone(),
             owner,
             revoke_on_delivery: Mutex::new(None),
@@ -8600,6 +9555,35 @@ mod tests {
                     .with_policy_trace(decision.policy_trace.clone()),
                 pending.map(PendingDeliveryTransition::Enqueue),
             )
+            .unwrap();
+        intervention
+    }
+
+    fn allowed_synthetic_clone(
+        active: &ActiveFixture,
+        template: &Intervention,
+        template_decision: &PolicyDecision,
+    ) -> Intervention {
+        let candidate_id = CandidateId::new_v7();
+        let mut decision = template_decision.clone();
+        decision.id = PolicyDecisionId::new_v7();
+        decision.candidate_id = candidate_id;
+        active
+            .fixture
+            .repository
+            .save_policy_decision(&decision)
+            .unwrap();
+        let mut intervention = template.clone();
+        intervention.id = InterventionId::new_v7();
+        intervention.candidate_id = candidate_id;
+        intervention.policy_decision_id = decision.id;
+        intervention.revision = 1;
+        intervention.state = InterventionState::Allowed;
+        intervention.updated_at = active.fixture.clock.now_utc();
+        active
+            .fixture
+            .repository
+            .save_intervention(&intervention, None)
             .unwrap();
         intervention
     }
@@ -10011,11 +10995,40 @@ mod tests {
             other => panic!("expected an intervention, got {other:?}"),
         };
         assert_eq!(intervention.state, InterventionState::AcceptedByChannel);
+        let model_receipt = active
+            .fixture
+            .runtime
+            .latest_model_request_receipt(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+                active.fixture.session,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            model_receipt.outcome,
+            ModelRequestReceiptOutcome::CompletedStrictCandidate
+        );
+        assert_eq!(
+            model_receipt.model_route_approval_id,
+            find_session(&active.fixture.repository, active.fixture.session)
+                .unwrap()
+                .model_route_approval_id
+        );
+        assert_eq!(model_receipt.model_route_revision, 1);
+        assert!(model_receipt.completed_at.is_some());
         assert!(
             active
                 .fixture
                 .notification
                 .audit_seen_before_delivery
+                .load(Ordering::SeqCst)
+        );
+        assert!(
+            active
+                .fixture
+                .notification
+                .attempt_marker_seen_before_delivery
                 .load(Ordering::SeqCst)
         );
         let policy_decision = active
@@ -10120,6 +11133,77 @@ mod tests {
         .unwrap();
         assert!(!bounded_policy.contains("release ledger"));
         assert!(!bounded_policy.contains("selected-workspace activity"));
+    }
+
+    #[tokio::test]
+    async fn feedback_is_rejected_before_an_eligible_terminal_delivery_state() {
+        let active = start(fixture(vec![candidate()], false)).await;
+        observe(&active);
+        let queued = match active
+            .fixture
+            .runtime
+            .run_reasoning_cycle(active.fixture.session)
+            .await
+            .unwrap()
+        {
+            ReasoningCycleResult::Intervention(intervention) => *intervention,
+            other => panic!("expected queued intervention, got {other:?}"),
+        };
+        assert_eq!(queued.state, InterventionState::Queued);
+        let error = active
+            .fixture
+            .runtime
+            .record_feedback(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+                queued.id,
+                queued.revision,
+                InterventionOutcome::Accepted,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, SecondMindErrorCode::InvalidArgument);
+        assert_eq!(
+            active
+                .fixture
+                .repository
+                .load_interventions(active.fixture.owner)
+                .unwrap()[0],
+            queued
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_feedback_can_resolve_a_delivery_unknown_record() {
+        let active = start(fixture(vec![candidate()], true)).await;
+        *active.fixture.notification.acknowledgement.lock().unwrap() =
+            ChannelAcknowledgement::DeliveryUnknown;
+        observe(&active);
+        let unknown = match active
+            .fixture
+            .runtime
+            .run_reasoning_cycle(active.fixture.session)
+            .await
+            .unwrap()
+        {
+            ReasoningCycleResult::Intervention(intervention) => *intervention,
+            other => panic!("expected delivery-unknown intervention, got {other:?}"),
+        };
+        assert_eq!(unknown.state, InterventionState::DeliveryUnknown);
+        let accepted = active
+            .fixture
+            .runtime
+            .record_feedback(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+                unknown.id,
+                unknown.revision,
+                InterventionOutcome::Accepted,
+                None,
+            )
+            .unwrap();
+        assert_eq!(accepted.outcome, InterventionOutcome::Accepted);
+        assert!(accepted.outcome_at.is_some());
     }
 
     #[tokio::test]
@@ -10494,6 +11578,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn equally_permissive_preference_revision_rotates_the_in_flight_token() {
+        let active = start(fixture(Vec::new(), true)).await;
+        observe(&active);
+        active.fixture.model.hang.store(true, Ordering::SeqCst);
+        let runtime = active.fixture.runtime.clone();
+        let session_id = active.fixture.session;
+        let cycle = tokio::spawn(async move { runtime.run_reasoning_cycle(session_id).await });
+        wait_for_model_calls(&active.fixture.model, 1).await;
+
+        let mut preferences = active
+            .fixture
+            .runtime
+            .user_preferences(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+            )
+            .unwrap();
+        let expected = preferences.revision;
+        preferences.preferred_form_of_address = Some("Synthetic operator".to_owned());
+        active
+            .fixture
+            .runtime
+            .save_preferences(
+                ClientAssurance::PrivateCapabilityBound,
+                preferences,
+                Some(expected),
+            )
+            .unwrap();
+
+        wait_for_cancellation_observation(&active.fixture.model.cancellation_observed).await;
+        assert!(matches!(
+            cycle.await.unwrap().unwrap(),
+            ReasoningCycleResult::Silence { ref reason_code }
+                if reason_code == "reasoning_cancelled_or_timed_out"
+        ));
+        let ephemeral = active.fixture.runtime.ephemeral.lock().unwrap();
+        let session = ephemeral.sessions.get(&active.fixture.session).unwrap();
+        assert!(!session.cancellation.is_cancelled());
+        assert!(
+            !session.proactive_cancellation.is_cancelled(),
+            "a successful permissive revision must rotate fresh authority"
+        );
+        assert_eq!(
+            session
+                .latest_model_request_receipt
+                .as_ref()
+                .unwrap()
+                .outcome,
+            ModelRequestReceiptOutcome::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_edit_cancels_an_in_flight_model_before_the_revision_commit() {
+        let active = start(fixture(Vec::new(), true)).await;
+        observe(&active);
+        active.fixture.model.hang.store(true, Ordering::SeqCst);
+        let runtime = active.fixture.runtime.clone();
+        let session_id = active.fixture.session;
+        let cycle = tokio::spawn(async move { runtime.run_reasoning_cycle(session_id).await });
+        wait_for_model_calls(&active.fixture.model, 1).await;
+
+        let goal = active
+            .fixture
+            .runtime
+            .get_goal(active.fixture.owner, active.grants[0].goal_id)
+            .unwrap();
+        active
+            .fixture
+            .runtime
+            .update_goal(
+                ClientAssurance::PrivateCapabilityBound,
+                UpdateGoal {
+                    actor: active.fixture.owner,
+                    id: goal.id,
+                    expected_revision: goal.revision,
+                    patch: GoalPatch {
+                        title: Some("Revised synthetic focus".to_owned()),
+                        success_statement: None,
+                        deadline: None,
+                    },
+                },
+            )
+            .unwrap();
+
+        wait_for_cancellation_observation(&active.fixture.model.cancellation_observed).await;
+        assert!(matches!(
+            cycle.await.unwrap().unwrap(),
+            ReasoningCycleResult::Silence { ref reason_code }
+                if reason_code == "reasoning_cancelled_or_timed_out"
+        ));
+        let ephemeral = active.fixture.runtime.ephemeral.lock().unwrap();
+        assert!(
+            ephemeral
+                .sessions
+                .get(&active.fixture.session)
+                .unwrap()
+                .proactive_cancellation
+                .is_cancelled(),
+            "the old session cannot be rearmed against a new goal revision"
+        );
+    }
+
+    #[tokio::test]
     async fn zero_user_intervention_cap_avoids_model_cost() {
         let active = start(fixture(vec![candidate()], true)).await;
         let mut preferences = active
@@ -10530,7 +11718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deadline_outside_risk_horizon_stays_silent() {
+    async fn goal_revision_change_fences_the_old_session_before_model_use() {
         let active = start(fixture(vec![candidate()], true)).await;
         let goal = active
             .fixture
@@ -10565,7 +11753,7 @@ mod tests {
                 .await
                 .unwrap(),
             ReasoningCycleResult::Silence { ref reason_code }
-                if reason_code == "outside_deadline_risk_horizon"
+                if reason_code == "reasoning_authority_unavailable"
         ));
         assert_eq!(active.fixture.model.calls.load(Ordering::SeqCst), 0);
     }
@@ -10645,7 +11833,7 @@ mod tests {
             ReasoningCycleResult::Intervention(intervention) => *intervention,
             other => panic!("expected delivered intervention, got {other:?}"),
         };
-        let original = active
+        let delivered = active
             .fixture
             .repository
             .load_interventions(active.fixture.owner)
@@ -10653,6 +11841,24 @@ mod tests {
             .into_iter()
             .find(|value| value.id == intervention.id)
             .unwrap();
+        let delivered_decision = active
+            .fixture
+            .repository
+            .find_policy_decision(delivered.policy_decision_id)
+            .unwrap()
+            .unwrap();
+        let notification_grant = active
+            .grants
+            .iter()
+            .find(|grant| grant.scope == PermissionScope::InterveneDesktopNotification)
+            .unwrap();
+        let original = queue_synthetic_clone(
+            &active,
+            &delivered,
+            &delivered_decision,
+            notification_grant,
+            active.fixture.session,
+        );
         let mut decision = active
             .fixture
             .repository
@@ -10669,13 +11875,14 @@ mod tests {
         );
         let mut attempted = original.clone();
         attempted.policy_decision_id = decision.id;
-        attempted.state = InterventionState::Delivering;
-        attempted.revision = attempted.revision.saturating_add(1);
+        let stale_expected = original.revision.saturating_add(99);
+        attempted.revision = stale_expected.saturating_add(1);
+        attempted.updated_at = active.fixture.clock.now_utc();
         let write = InterventionDecisionWrite {
             decision: decision.clone(),
             audit: audit.clone(),
             intervention: Some(attempted),
-            expected_intervention_revision: Some(original.revision.saturating_add(99)),
+            expected_intervention_revision: Some(stale_expected),
         };
         assert_eq!(
             active
@@ -10737,6 +11944,21 @@ mod tests {
                 if reason_code == "reasoning_cancelled_or_timed_out"
         ));
         assert_eq!(active.fixture.model.calls.load(Ordering::SeqCst), 1);
+        let receipt = active
+            .fixture
+            .runtime
+            .latest_model_request_receipt(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+                active.fixture.session,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receipt.outcome,
+            ModelRequestReceiptOutcome::DeadlineExceeded
+        );
+        assert!(receipt.completed_at.is_some());
         assert!(
             !active
                 .fixture
@@ -10756,6 +11978,211 @@ mod tests {
                 .load_interventions(active.fixture.owner)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_model_request_receipt_is_private_ephemeral_and_route_exact() {
+        let active = start(fixture(
+            vec![ModelReasoningOutput::Silence {
+                reason_code: "synthetic_strict_silence".to_owned(),
+            }],
+            true,
+        ))
+        .await;
+        assert!(
+            active
+                .fixture
+                .runtime
+                .latest_model_request_receipt(
+                    ClientAssurance::PrivateCapabilityBound,
+                    active.fixture.owner,
+                    active.fixture.session,
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            active
+                .fixture
+                .runtime
+                .latest_model_request_receipt(
+                    ClientAssurance::Diagnostic,
+                    active.fixture.owner,
+                    active.fixture.session,
+                )
+                .is_err()
+        );
+
+        observe(&active);
+        assert!(matches!(
+            active
+                .fixture
+                .runtime
+                .run_reasoning_cycle(active.fixture.session)
+                .await
+                .unwrap(),
+            ReasoningCycleResult::Silence { ref reason_code }
+                if reason_code == "synthetic_strict_silence"
+        ));
+        let session = find_session(&active.fixture.repository, active.fixture.session).unwrap();
+        let receipt = active
+            .fixture
+            .runtime
+            .latest_model_request_receipt(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+                active.fixture.session,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.focus_session_id, session.id);
+        assert_eq!(
+            receipt.model_route_approval_id,
+            session.model_route_approval_id
+        );
+        assert_eq!(receipt.model_route_revision, 1);
+        assert_eq!(
+            receipt.outcome,
+            ModelRequestReceiptOutcome::CompletedStrictSilence
+        );
+        assert!(receipt.completed_at.is_some());
+
+        let restarted = SecondMindRuntime::new(
+            SecondMindConfig::default(),
+            SecondMindPorts {
+                repository: Arc::new(active.fixture.repository.clone()),
+                clock: active.fixture.clock.clone(),
+                observation: Arc::new(UnavailableObservationPort),
+                model: Arc::new(UnavailableModelGateway),
+                notification: Arc::new(UnavailableNotificationPort),
+                native_status: Arc::new(UnavailableNativeStatusPort),
+                emergency_control: Arc::new(UnavailableEmergencyControlPort),
+                secret_store: Arc::new(crate::UnavailableSecretStore::default()),
+                resource_selection: Arc::new(crate::UnavailableResourceSelectionPort),
+            },
+        )
+        .unwrap();
+        assert!(
+            restarted
+                .latest_model_request_receipt(
+                    ClientAssurance::PrivateCapabilityBound,
+                    active.fixture.owner,
+                    active.fixture.session,
+                )
+                .unwrap()
+                .is_none(),
+            "a daemon restart must not reconstruct an ephemeral model receipt"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_model_candidate_closes_as_failed_never_strict_candidate() {
+        let mut invalid_candidate = candidate();
+        let ModelReasoningOutput::Candidate {
+            user_visible_text, ..
+        } = &mut invalid_candidate
+        else {
+            unreachable!("the synthetic candidate helper returns a candidate")
+        };
+        user_visible_text.clear();
+        let active = start(fixture(vec![invalid_candidate], true)).await;
+        observe(&active);
+
+        let error = active
+            .fixture
+            .runtime
+            .run_reasoning_cycle(active.fixture.session)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, SecondMindErrorCode::InvalidArgument);
+        let receipt = active
+            .fixture
+            .runtime
+            .latest_model_request_receipt(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+                active.fixture.session,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.outcome, ModelRequestReceiptOutcome::Failed);
+        assert!(receipt.completed_at.is_some());
+        assert!(
+            active
+                .fixture
+                .repository
+                .load_interventions(active.fixture.owner)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn model_receipt_start_racing_session_end_never_recreates_ephemeral_state() {
+        let active = start(fixture(Vec::new(), true)).await;
+        let session = find_session(&active.fixture.repository, active.fixture.session).unwrap();
+        let route = find_route(
+            &active.fixture.repository,
+            active.fixture.owner,
+            session.model_route_approval_id,
+        )
+        .unwrap();
+        let stopping = active
+            .fixture
+            .runtime
+            .end_focus_session(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+                session.id,
+                session.revision,
+                EndFocusReason::UserRequested,
+            )
+            .unwrap();
+        active
+            .fixture
+            .runtime
+            .finish_end_focus_session(active.fixture.owner, stopping.id, stopping.revision)
+            .await
+            .unwrap();
+
+        assert!(
+            !active
+                .fixture
+                .runtime
+                .record_model_request_started(ModelRequestReceipt {
+                    request_id: Uuid::now_v7(),
+                    focus_session_id: session.id,
+                    model_route_approval_id: route.id,
+                    model_route_revision: route.revision,
+                    started_at: active.fixture.clock.now_utc(),
+                    completed_at: None,
+                    outcome: ModelRequestReceiptOutcome::InFlight,
+                })
+                .unwrap()
+        );
+        assert!(
+            !active
+                .fixture
+                .runtime
+                .ephemeral
+                .lock()
+                .unwrap()
+                .sessions
+                .contains_key(&session.id)
+        );
+        assert!(
+            active
+                .fixture
+                .runtime
+                .latest_model_request_receipt(
+                    ClientAssurance::PrivateCapabilityBound,
+                    active.fixture.owner,
+                    session.id,
+                )
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -10793,6 +12220,323 @@ mod tests {
         );
         assert_eq!(active.fixture.notification.calls.load(Ordering::SeqCst), 1);
         wait_for_cancellation_observation(&active.fixture.notification.cancellation_observed).await;
+    }
+
+    #[tokio::test]
+    async fn interrupted_direct_delivery_recovers_as_unknown_without_resubmission() {
+        let active = start(fixture(vec![candidate()], false)).await;
+        observe(&active);
+        let queued = match active
+            .fixture
+            .runtime
+            .run_reasoning_cycle(active.fixture.session)
+            .await
+            .unwrap()
+        {
+            ReasoningCycleResult::Intervention(intervention) => *intervention,
+            other => panic!("expected a queued intervention, got {other:?}"),
+        };
+        let decision = active
+            .fixture
+            .repository
+            .find_policy_decision(queued.policy_decision_id)
+            .unwrap()
+            .unwrap();
+        let mut direct = allowed_synthetic_clone(&active, &queued, &decision);
+        let expected = direct.revision;
+        direct.state = InterventionState::Delivering;
+        direct.revision += 1;
+        direct.updated_at = active.fixture.clock.now_utc();
+        active
+            .fixture
+            .runtime
+            .persist_intervention_transition(
+                &direct,
+                expected,
+                AuditKind::InterventionDelivery,
+                AuditDetails::new(vec!["delivery_attempt_started".to_owned()], BTreeSet::new())
+                    .with_policy_trace(decision.policy_trace.clone()),
+                None,
+            )
+            .unwrap();
+
+        let recovered = active
+            .fixture
+            .runtime
+            .reconcile_interrupted_deliveries(active.fixture.owner)
+            .unwrap();
+        let recovered_direct = recovered
+            .iter()
+            .find(|intervention| intervention.id == direct.id)
+            .unwrap();
+        assert_eq!(recovered_direct.state, InterventionState::DeliveryUnknown);
+        assert_eq!(active.fixture.notification.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            !active
+                .fixture
+                .repository
+                .load_pending_deliveries(active.fixture.owner)
+                .unwrap()
+                .iter()
+                .any(|delivery| delivery.intervention_id == direct.id)
+        );
+        assert!(
+            active
+                .fixture
+                .runtime
+                .reconcile_interrupted_deliveries(active.fixture.owner)
+                .unwrap()
+                .is_empty()
+        );
+        let audit = active
+            .fixture
+            .repository
+            .load_audit(active.fixture.owner, OffsetDateTime::UNIX_EPOCH, 200)
+            .unwrap();
+        assert!(audit.iter().any(|record| {
+            record.subject_id == direct.id.as_uuid()
+                && record.kind == AuditKind::InterventionDelivery
+                && record
+                    .reason_codes
+                    .iter()
+                    .any(|reason| reason == "delivery_unknown_after_restart")
+        }));
+        assert!(
+            !serde_json::to_string(&audit)
+                .unwrap()
+                .contains(&direct.user_visible_text)
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_allowed_intervention_is_scrubbed_without_submission_on_recovery() {
+        let active = start(fixture(vec![candidate()], false)).await;
+        observe(&active);
+        let queued = match active
+            .fixture
+            .runtime
+            .run_reasoning_cycle(active.fixture.session)
+            .await
+            .unwrap()
+        {
+            ReasoningCycleResult::Intervention(intervention) => *intervention,
+            other => panic!("expected a queued intervention, got {other:?}"),
+        };
+        let decision = active
+            .fixture
+            .repository
+            .find_policy_decision(queued.policy_decision_id)
+            .unwrap()
+            .unwrap();
+        let orphan = allowed_synthetic_clone(&active, &queued, &decision);
+
+        let recovered = active
+            .fixture
+            .runtime
+            .reconcile_interrupted_deliveries(active.fixture.owner)
+            .unwrap();
+        let recovered_orphan = recovered
+            .iter()
+            .find(|intervention| intervention.id == orphan.id)
+            .unwrap();
+        assert_eq!(recovered_orphan.state, InterventionState::Cancelled);
+        assert_eq!(recovered_orphan.outcome, InterventionOutcome::Expired);
+        assert!(recovered_orphan.user_visible_text.is_empty());
+        assert!(recovered_orphan.evidence_summary.is_empty());
+        assert!(recovered_orphan.evidence.is_empty());
+        assert_eq!(active.fixture.notification.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn restart_scrubs_a_queued_pair_when_its_durable_grant_revision_is_stale() {
+        let active = start(fixture(vec![candidate()], false)).await;
+        observe(&active);
+        let queued = match active
+            .fixture
+            .runtime
+            .run_reasoning_cycle(active.fixture.session)
+            .await
+            .unwrap()
+        {
+            ReasoningCycleResult::Intervention(intervention) => *intervention,
+            other => panic!("expected a queued intervention, got {other:?}"),
+        };
+        let mut notification_grant = active
+            .fixture
+            .repository
+            .load_grants(active.fixture.owner)
+            .unwrap()
+            .into_iter()
+            .find(|grant| grant.scope == PermissionScope::InterveneDesktopNotification)
+            .unwrap();
+        let expected_grant_revision = notification_grant.revision;
+        notification_grant.revision = notification_grant.revision.saturating_add(1);
+        notification_grant.purpose = "Synthetic post-crash authority revision".to_owned();
+        active
+            .fixture
+            .repository
+            .save_grant(&notification_grant, Some(expected_grant_revision))
+            .unwrap();
+
+        let restarted = SecondMindRuntime::new(
+            active.fixture.runtime.config.clone(),
+            SecondMindPorts {
+                repository: Arc::new(active.fixture.repository.clone()),
+                clock: active.fixture.clock.clone(),
+                observation: active.fixture.observation.clone(),
+                model: active.fixture.model.clone(),
+                notification: active.fixture.notification.clone(),
+                native_status: active.fixture.status.clone(),
+                emergency_control: active.fixture.emergency.clone(),
+                secret_store: Arc::new(crate::UnavailableSecretStore::default()),
+                resource_selection: Arc::new(crate::UnavailableResourceSelectionPort),
+            },
+        )
+        .unwrap();
+        let changed = restarted
+            .reconcile_interrupted_deliveries(active.fixture.owner)
+            .unwrap();
+
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].id, queued.id);
+        assert_eq!(changed[0].state, InterventionState::Cancelled);
+        assert_eq!(changed[0].outcome, InterventionOutcome::Expired);
+        assert_eq!(
+            changed[0].reason_code,
+            "queued_authority_invalid_after_restart"
+        );
+        assert!(changed[0].user_visible_text.is_empty());
+        let delivery = active
+            .fixture
+            .repository
+            .load_pending_deliveries(active.fixture.owner)
+            .unwrap()
+            .into_iter()
+            .find(|delivery| delivery.intervention_id == queued.id)
+            .unwrap();
+        assert_eq!(delivery.state, OutboxState::Cancelled);
+        assert!(delivery.user_visible_text.is_empty());
+        assert_eq!(active.fixture.notification.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn queued_interventions_reconcile_terminal_outbox_states_without_retry() {
+        let active = start(fixture(vec![candidate()], false)).await;
+        observe(&active);
+        let base = match active
+            .fixture
+            .runtime
+            .run_reasoning_cycle(active.fixture.session)
+            .await
+            .unwrap()
+        {
+            ReasoningCycleResult::Intervention(intervention) => *intervention,
+            other => panic!("expected a queued intervention, got {other:?}"),
+        };
+        let decision = active
+            .fixture
+            .repository
+            .find_policy_decision(base.policy_decision_id)
+            .unwrap()
+            .unwrap();
+        let notification_grant = active
+            .grants
+            .iter()
+            .find(|grant| grant.scope == PermissionScope::InterveneDesktopNotification)
+            .unwrap();
+        let mut interventions = vec![base.clone()];
+        for _ in 0..4 {
+            interventions.push(queue_synthetic_clone(
+                &active,
+                &base,
+                &decision,
+                notification_grant,
+                active.fixture.session,
+            ));
+        }
+        let terminal_states = [
+            OutboxState::AcceptedByChannel,
+            OutboxState::DeliveryUnknown,
+            OutboxState::DeliveryFailed,
+            OutboxState::Expired,
+            OutboxState::Cancelled,
+        ];
+
+        for (intervention, terminal_state) in interventions.iter().zip(terminal_states) {
+            let mut delivery = active
+                .fixture
+                .repository
+                .load_pending_deliveries(active.fixture.owner)
+                .unwrap()
+                .into_iter()
+                .find(|delivery| delivery.intervention_id == intervention.id)
+                .unwrap();
+            if matches!(
+                terminal_state,
+                OutboxState::AcceptedByChannel
+                    | OutboxState::DeliveryUnknown
+                    | OutboxState::DeliveryFailed
+            ) {
+                delivery.state = OutboxState::Delivering;
+                delivery.attempt_count += 1;
+                delivery.last_attempt_at = Some(active.fixture.clock.now_utc());
+                active.fixture.repository.save_delivery(&delivery).unwrap();
+            }
+            delivery.state = terminal_state;
+            delivery.user_visible_text.clear();
+            active.fixture.repository.save_delivery(&delivery).unwrap();
+        }
+
+        let reconciled = active
+            .fixture
+            .runtime
+            .reconcile_interrupted_deliveries(active.fixture.owner)
+            .unwrap();
+        assert_eq!(reconciled.len(), terminal_states.len());
+        let durable_interventions = active
+            .fixture
+            .repository
+            .load_interventions(active.fixture.owner)
+            .unwrap();
+        let durable_deliveries = active
+            .fixture
+            .repository
+            .load_pending_deliveries(active.fixture.owner)
+            .unwrap();
+        for ((intervention, outbox_state), expected_intervention_state) in
+            interventions.iter().zip(terminal_states).zip([
+                InterventionState::AcceptedByChannel,
+                InterventionState::DeliveryUnknown,
+                InterventionState::DeliveryFailed,
+                InterventionState::Expired,
+                InterventionState::Cancelled,
+            ])
+        {
+            assert_eq!(
+                durable_interventions
+                    .iter()
+                    .find(|durable| durable.id == intervention.id)
+                    .unwrap()
+                    .state,
+                expected_intervention_state
+            );
+            let delivery = durable_deliveries
+                .iter()
+                .find(|delivery| delivery.intervention_id == intervention.id)
+                .unwrap();
+            assert_eq!(delivery.state, outbox_state);
+            assert!(delivery.user_visible_text.is_empty());
+        }
+        assert!(
+            active
+                .fixture
+                .runtime
+                .revalidate_pending_deliveries(active.fixture.owner)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(active.fixture.notification.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -10903,6 +12647,189 @@ mod tests {
             .unwrap();
         assert_eq!(outbox[0].state, OutboxState::AcceptedByChannel);
         assert!(outbox[0].user_visible_text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn authority_change_during_recovered_failed_delivery_cancels_and_scrubs() {
+        let active = start(fixture(vec![candidate()], false)).await;
+        observe(&active);
+        let queued = match active
+            .fixture
+            .runtime
+            .run_reasoning_cycle(active.fixture.session)
+            .await
+            .unwrap()
+        {
+            ReasoningCycleResult::Intervention(intervention) => *intervention,
+            other => panic!("expected a queued intervention, got {other:?}"),
+        };
+        let notification_grant = active
+            .grants
+            .iter()
+            .find(|grant| grant.scope == PermissionScope::InterveneDesktopNotification)
+            .unwrap()
+            .clone();
+        *active
+            .fixture
+            .notification
+            .revoke_on_delivery
+            .lock()
+            .unwrap() = Some(notification_grant);
+        *active.fixture.notification.acknowledgement.lock().unwrap() =
+            ChannelAcknowledgement::DeliveryFailed;
+        active
+            .fixture
+            .notification
+            .available
+            .store(true, Ordering::SeqCst);
+
+        let changed = active
+            .fixture
+            .runtime
+            .revalidate_pending_deliveries(active.fixture.owner)
+            .await
+            .unwrap();
+
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].id, queued.id);
+        assert_eq!(changed[0].state, InterventionState::Cancelled);
+        assert_eq!(changed[0].outcome, InterventionOutcome::Expired);
+        assert_eq!(
+            changed[0].reason_code,
+            "authority_changed_during_failed_delivery"
+        );
+        assert!(changed[0].user_visible_text.is_empty());
+        assert!(changed[0].evidence_summary.is_empty());
+        assert!(changed[0].evidence.is_empty());
+        let delivery = active
+            .fixture
+            .repository
+            .load_pending_deliveries(active.fixture.owner)
+            .unwrap()
+            .into_iter()
+            .find(|delivery| delivery.intervention_id == queued.id)
+            .unwrap();
+        assert_eq!(delivery.state, OutboxState::Cancelled);
+        assert!(delivery.user_visible_text.is_empty());
+        assert_eq!(active.fixture.notification.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn authority_change_after_revalidation_cancels_without_repointing_the_queued_record() {
+        let active = start(fixture(vec![candidate()], false)).await;
+        observe(&active);
+        let queued = match active
+            .fixture
+            .runtime
+            .run_reasoning_cycle(active.fixture.session)
+            .await
+            .unwrap()
+        {
+            ReasoningCycleResult::Intervention(intervention) => *intervention,
+            other => panic!("expected a queued intervention, got {other:?}"),
+        };
+        let original_decision_id = queued.policy_decision_id;
+        active
+            .fixture
+            .runtime
+            .set_after_recovery_revalidation_commit_hook({
+                let repository = active.fixture.repository.clone();
+                let clock = active.fixture.clock.clone();
+                let session_id = active.fixture.session;
+                move || {
+                    let mut session = find_session(&repository, session_id).unwrap();
+                    let expected = session.revision;
+                    session.muted = true;
+                    session.revision = session.revision.saturating_add(1);
+                    session.updated_at = clock.now_utc();
+                    repository
+                        .save_focus_session(&session, Some(expected))
+                        .unwrap();
+                }
+            });
+        active
+            .fixture
+            .notification
+            .available
+            .store(true, Ordering::SeqCst);
+
+        let changed = active
+            .fixture
+            .runtime
+            .revalidate_pending_deliveries(active.fixture.owner)
+            .await
+            .unwrap();
+
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].state, InterventionState::Cancelled);
+        assert_eq!(changed[0].outcome, InterventionOutcome::Expired);
+        assert!(changed[0].user_visible_text.is_empty());
+        assert_ne!(changed[0].policy_decision_id, original_decision_id);
+        let delivery = active
+            .fixture
+            .repository
+            .load_pending_deliveries(active.fixture.owner)
+            .unwrap()
+            .into_iter()
+            .find(|delivery| delivery.intervention_id == queued.id)
+            .unwrap();
+        assert_eq!(delivery.state, OutboxState::Cancelled);
+        assert_eq!(delivery.policy_decision_id, original_decision_id);
+        assert!(delivery.user_visible_text.is_empty());
+        assert_eq!(active.fixture.notification.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn mute_between_unavailable_check_and_enqueue_cancels_the_late_queue() {
+        let active = start(fixture(vec![candidate()], false)).await;
+        let runtime = active.fixture.runtime.clone();
+        let repository = active.fixture.repository.clone();
+        let session_id = active.fixture.session;
+        runtime.set_before_queue_commit_hook({
+            let runtime = runtime.clone();
+            move || {
+                runtime.cancel_proactive_cancellation(session_id).unwrap();
+                let mut session = find_session(&repository, session_id).unwrap();
+                let expected = session.revision;
+                session.muted = true;
+                session.revision = session.revision.saturating_add(1);
+                session.updated_at = OffsetDateTime::now_utc();
+                repository
+                    .save_focus_session(&session, Some(expected))
+                    .unwrap();
+            }
+        });
+        observe(&active);
+
+        assert!(matches!(
+            active
+                .fixture
+                .runtime
+                .run_reasoning_cycle(active.fixture.session)
+                .await
+                .unwrap(),
+            ReasoningCycleResult::Silence { ref reason_code }
+                if reason_code == "authority_changed_after_enqueue"
+        ));
+        let intervention = active
+            .fixture
+            .repository
+            .load_interventions(active.fixture.owner)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(intervention.state, InterventionState::Cancelled);
+        assert!(intervention.user_visible_text.is_empty());
+        let delivery = active
+            .fixture
+            .repository
+            .load_pending_deliveries(active.fixture.owner)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(delivery.state, OutboxState::Cancelled);
+        assert!(delivery.user_visible_text.is_empty());
+        assert_eq!(active.fixture.notification.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -11027,9 +12954,21 @@ mod tests {
             .revalidate_pending_deliveries(active.fixture.owner)
             .await
             .unwrap();
-        assert_eq!(changed.len(), 1);
-        assert_eq!(changed[0].state, InterventionState::Expired);
-        assert!(changed[0].user_visible_text.is_empty());
+        assert!(changed.is_empty());
+        let durable = active
+            .fixture
+            .repository
+            .load_interventions(active.fixture.owner)
+            .unwrap();
+        assert_eq!(durable[0].state, InterventionState::Cancelled);
+        assert!(durable[0].user_visible_text.is_empty());
+        let outbox = active
+            .fixture
+            .repository
+            .load_pending_deliveries(active.fixture.owner)
+            .unwrap();
+        assert_eq!(outbox[0].state, OutboxState::Cancelled);
+        assert!(outbox[0].user_visible_text.is_empty());
         assert_eq!(active.fixture.notification.calls.load(Ordering::SeqCst), 0);
     }
 
@@ -11110,7 +13049,7 @@ mod tests {
             notification_grant,
             active.fixture.session,
         );
-        assert_eq!(session_rejected.state, InterventionState::DeliveryFailed);
+        assert_eq!(session_rejected.state, InterventionState::Cancelled);
         assert_eq!(session_rejected.reason_code, "outbox_capacity");
         assert!(session_rejected.user_visible_text.is_empty());
 
@@ -11127,7 +13066,7 @@ mod tests {
             notification_grant,
             FocusSessionId::new_v7(),
         );
-        assert_eq!(user_rejected.state, InterventionState::DeliveryFailed);
+        assert_eq!(user_rejected.state, InterventionState::Cancelled);
         assert_eq!(user_rejected.reason_code, "outbox_capacity");
         assert_eq!(
             active
@@ -11310,6 +13249,115 @@ mod tests {
         assert_eq!(outbox.len(), 1);
         assert_eq!(outbox[0].state, OutboxState::Cancelled);
         assert!(outbox[0].user_visible_text.is_empty());
+        let intervention = active
+            .fixture
+            .repository
+            .load_interventions(active.fixture.owner)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(intervention.state, InterventionState::Cancelled);
+        assert_eq!(intervention.outcome, InterventionOutcome::Expired);
+        assert!(intervention.user_visible_text.is_empty());
+        assert!(
+            active
+                .fixture
+                .repository
+                .load_audit(active.fixture.owner, OffsetDateTime::UNIX_EPOCH, 200)
+                .unwrap()
+                .iter()
+                .any(|record| {
+                    record.subject_id == intervention.id.as_uuid()
+                        && record.kind == AuditKind::InterventionDelivery
+                        && record
+                            .reason_codes
+                            .iter()
+                            .any(|reason| reason == "permission_revoked")
+                })
+        );
+        assert_eq!(
+            find_session(&active.fixture.repository, active.fixture.session)
+                .unwrap()
+                .state,
+            FocusSessionState::Ended,
+            "revoking a required delivery grant must end the bound session"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_permission_revocation_rearms_proactive_work_without_cancelling_session_root() {
+        let active = start(fixture(vec![candidate()], true)).await;
+        let notification_grant = active
+            .grants
+            .iter()
+            .find(|grant| grant.scope == PermissionScope::InterveneDesktopNotification)
+            .unwrap()
+            .clone();
+        let concurrent_grant_id = notification_grant.id;
+        let (root_before, proactive_before) = {
+            let state = active.fixture.runtime.ephemeral.lock().unwrap();
+            let ephemeral = state.sessions.get(&active.fixture.session).unwrap();
+            (
+                ephemeral.cancellation.clone(),
+                ephemeral.proactive_cancellation.clone(),
+            )
+        };
+        active
+            .fixture
+            .runtime
+            .set_before_permission_revocation_commit_hook({
+                let repository = active.fixture.repository.clone();
+                let owner = active.fixture.owner;
+                move || {
+                    let mut concurrent = repository
+                        .load_grants(owner)
+                        .unwrap()
+                        .into_iter()
+                        .find(|grant| grant.id == concurrent_grant_id)
+                        .unwrap();
+                    let expected = concurrent.revision;
+                    concurrent.revision = concurrent.revision.saturating_add(1);
+                    concurrent.purpose = "Synthetic concurrent active grant update".to_owned();
+                    repository.save_grant(&concurrent, Some(expected)).unwrap();
+                }
+            });
+
+        let error = active
+            .fixture
+            .runtime
+            .revoke_permission(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+                notification_grant.id,
+                notification_grant.revision,
+                "Synthetic conflicting revocation".to_owned(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, SecondMindErrorCode::Conflict);
+        assert!(proactive_before.is_cancelled());
+        assert!(!root_before.is_cancelled());
+        let durable_grant = active
+            .fixture
+            .repository
+            .load_grants(active.fixture.owner)
+            .unwrap()
+            .into_iter()
+            .find(|grant| grant.id == notification_grant.id)
+            .unwrap();
+        assert_eq!(durable_grant.state, GrantState::Active);
+        assert_eq!(
+            find_session(&active.fixture.repository, active.fixture.session)
+                .unwrap()
+                .state,
+            FocusSessionState::Active
+        );
+        let state = active.fixture.runtime.ephemeral.lock().unwrap();
+        let ephemeral = state.sessions.get(&active.fixture.session).unwrap();
+        assert!(!ephemeral.cancellation.is_cancelled());
+        assert!(!ephemeral.proactive_cancellation.is_cancelled());
     }
 
     #[tokio::test]

@@ -103,6 +103,77 @@ fn policy_trace_is_additive_and_legacy_decisions_remain_readable() {
 }
 
 #[test]
+fn model_request_receipt_is_additive_query_only_and_content_free() {
+    let bodies = fixture::<Vec<ResponseBody>>(PHASE_2_RESPONSE_FIXTURE);
+    let response = bodies
+        .iter()
+        .find_map(|body| match body {
+            ResponseBody::GetFocusSessionView(response) => Some(response),
+            _ => None,
+        })
+        .expect("focus-session response fixture should exist");
+    let receipt = response
+        .latest_model_request_receipt
+        .as_ref()
+        .expect("protocol 1.2 fixture should carry a receipt");
+    assert_eq!(
+        receipt.focus_session_id,
+        response.focus_session.focus_session_id
+    );
+    assert_eq!(
+        receipt.model_route_approval_id,
+        response.focus_session.model_route_approval_id
+    );
+    assert_eq!(receipt.model_route_revision, 1);
+    assert_eq!(
+        receipt.outcome,
+        ModelRequestReceiptOutcome::CompletedStrictCandidate
+    );
+    assert!(receipt.completed_at.is_some());
+
+    let encoded = serde_json::to_value(receipt).unwrap();
+    let keys = encoded
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        BTreeSet::from([
+            "completed_at",
+            "focus_session_id",
+            "model_route_approval_id",
+            "model_route_revision",
+            "outcome",
+            "request_id",
+            "started_at",
+        ])
+    );
+
+    let mut legacy = serde_json::to_value(
+        bodies
+            .iter()
+            .find(|body| matches!(body, ResponseBody::GetFocusSessionView(_)))
+            .unwrap(),
+    )
+    .unwrap();
+    legacy["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("latest_model_request_receipt");
+    let decoded: ResponseBody = serde_json::from_value(legacy.clone()).unwrap();
+    let ResponseBody::GetFocusSessionView(decoded) = decoded else {
+        unreachable!();
+    };
+    assert!(decoded.latest_model_request_receipt.is_none());
+    assert_eq!(
+        serde_json::to_value(ResponseBody::GetFocusSessionView(decoded)).unwrap(),
+        legacy
+    );
+}
+
+#[test]
 fn all_checked_in_fixtures_round_trip_without_shape_changes() {
     for name in CLIENT_FIXTURES {
         let source: Value = serde_json::from_str(&fixture_text(name)).unwrap();

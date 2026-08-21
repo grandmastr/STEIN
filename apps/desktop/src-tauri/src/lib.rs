@@ -14,11 +14,11 @@ use view::{
     EffectivePolicyView, EndFocusSessionInput, ExplainInterventionInput, FocusSessionView,
     GoalDeletionView, GoalRevisionInput, GoalView, GrantPermissionInput,
     InterventionExplanationView, InterventionFeedbackInput, InterventionHistoryInput,
-    InterventionHistoryView, InterventionView, ModelRouteView, PublicErrorView,
-    RegisterSelectedResourceInput, RemoveSelectedResourceInput, ResourceView,
-    RevokePermissionInput, SelectedResourceDeletionView, SessionGrantView, SetMutedInput,
-    StartFocusSessionInput, SteinIdentityView, UpdateGoalInput, UpdateUserPreferencesInput,
-    UserPreferencesUpdateView, UserPreferencesView,
+    InterventionHistoryView, InterventionView, LatestModelRequestReceiptInput,
+    ModelRequestReceiptView, ModelRouteView, PublicErrorView, RegisterSelectedResourceInput,
+    RemoveSelectedResourceInput, ResourceView, RevokePermissionInput, SelectedResourceDeletionView,
+    SessionGrantView, SetMutedInput, StartFocusSessionInput, SteinIdentityView, UpdateGoalInput,
+    UpdateUserPreferencesInput, UserPreferencesUpdateView, UserPreferencesView,
 };
 
 #[tauri::command]
@@ -255,6 +255,16 @@ async fn desktop_get_intervention_history(
     bridge.inner().get_intervention_history(input).await
 }
 
+/// Read-only evidence for the daemon-owned scheduler path. This query cannot
+/// start, retry, or otherwise authorize a model request.
+#[tauri::command]
+async fn desktop_get_latest_model_request_receipt(
+    bridge: State<'_, CoreBridge>,
+    input: LatestModelRequestReceiptInput,
+) -> Result<Option<ModelRequestReceiptView>, PublicErrorView> {
+    bridge.inner().get_latest_model_request_receipt(input).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(windows)]
@@ -299,6 +309,7 @@ pub fn run() {
             desktop_record_intervention_feedback,
             desktop_explain_intervention,
             desktop_get_intervention_history,
+            desktop_get_latest_model_request_receipt,
         ]);
 
     #[cfg(windows)]
