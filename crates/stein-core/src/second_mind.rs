@@ -8429,7 +8429,6 @@ mod tests {
             cancellation: CancellationToken,
         ) -> crate::PortFuture<'a, Result<ChannelAcknowledgement, crate::NotificationPortError>>
         {
-            self.calls.fetch_add(1, Ordering::SeqCst);
             let hang = self.hang.load(Ordering::SeqCst);
             if hang {
                 let watcher_cancellation = cancellation.clone();
@@ -8443,12 +8442,36 @@ mod tests {
                 .acknowledgement
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let audit_exists = self
+            let persisted_intervention = self
                 .repository
-                .load_audit(self.owner, OffsetDateTime::UNIX_EPOCH, 100)
+                .load_interventions(self.owner)
                 .unwrap()
-                .iter()
-                .any(|record| record.kind == AuditKind::InterventionDecision);
+                .into_iter()
+                .find(|intervention| intervention.id == delivery.intervention_id);
+            let persisted_decision = self
+                .repository
+                .find_policy_decision(delivery.policy_decision_id)
+                .unwrap();
+            let audit_exists = persisted_intervention
+                .as_ref()
+                .zip(persisted_decision.as_ref())
+                .is_some_and(|(intervention, decision)| {
+                    intervention.policy_decision_id == decision.id
+                        && intervention.candidate_id == decision.candidate_id
+                        && decision.outcome == PolicyOutcome::Allow
+                        && decision.policy_trace.is_complete()
+                        && self
+                            .repository
+                            .load_audit(self.owner, OffsetDateTime::UNIX_EPOCH, 100)
+                            .unwrap()
+                            .iter()
+                            .any(|record| {
+                                record.kind == AuditKind::InterventionDecision
+                                    && record.subject_id == decision.candidate_id.as_uuid()
+                                    && record.reason_codes == decision.reason_codes
+                                    && record.policy_trace.as_ref() == Some(&decision.policy_trace)
+                            })
+                });
             self.audit_seen_before_delivery
                 .store(audit_exists, Ordering::SeqCst);
             let attempt_audit_exists = self
@@ -8459,6 +8482,9 @@ mod tests {
                 .any(|record| {
                     record.kind == AuditKind::InterventionDelivery
                         && record.subject_id == delivery.intervention_id.as_uuid()
+                        && persisted_decision.as_ref().is_some_and(|decision| {
+                            record.policy_trace.as_ref() == Some(&decision.policy_trace)
+                        })
                         && record
                             .reason_codes
                             .iter()
@@ -8471,12 +8497,14 @@ mod tests {
                 .iter()
                 .any(|intervention| {
                     intervention.id == delivery.intervention_id
+                        && intervention.policy_decision_id == delivery.policy_decision_id
                         && intervention.state == InterventionState::Delivering
                 });
             self.attempt_marker_seen_before_delivery.store(
                 attempt_audit_exists && delivering_is_durable,
                 Ordering::SeqCst,
             );
+            self.calls.fetch_add(1, Ordering::SeqCst);
             if let Some(mut grant) = self
                 .revoke_on_delivery
                 .lock()
@@ -8714,6 +8742,26 @@ mod tests {
         resource: ResourceId,
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct DurableIdentityPreferencesSnapshot {
+        identity_revision: u64,
+        preferences_revision: u64,
+        canonical_json: Vec<u8>,
+    }
+
+    fn identity_preferences_snapshot(
+        repository: &MemoryRepository,
+        owner: ActorId,
+    ) -> DurableIdentityPreferencesSnapshot {
+        let identity = repository.load_identity(owner).unwrap().unwrap();
+        let preferences = repository.load_preferences(owner).unwrap().unwrap();
+        DurableIdentityPreferencesSnapshot {
+            identity_revision: identity.revision,
+            preferences_revision: preferences.revision,
+            canonical_json: serde_json::to_vec(&(identity, preferences)).unwrap(),
+        }
+    }
+
     fn candidate() -> ModelReasoningOutput {
         ModelReasoningOutput::Candidate {
             candidate_id: CandidateId::new_v7(),
@@ -8723,6 +8771,20 @@ mod tests {
             reason_code: "recent_relevant_progress".to_owned(),
             evidence_summary: "Fresh selected-workspace activity aligns with the active goal."
                 .to_owned(),
+            urgency: Urgency::Normal,
+            confidence_basis_points: 8_000,
+        }
+    }
+
+    const NEAR_DEADLINE_QUALIFIED_TEXT: &str = "The deadline is near, but I have not observed a success-confirmation signal; consider checking the synthetic release ledger.";
+    const NEAR_DEADLINE_EVIDENCE_SUMMARY: &str = "Fresh selected-workspace activity exists, but it does not confirm the goal's success condition.";
+
+    fn near_deadline_uncertainty_candidate(candidate_id: CandidateId) -> ModelReasoningOutput {
+        ModelReasoningOutput::Candidate {
+            candidate_id,
+            user_visible_text: NEAR_DEADLINE_QUALIFIED_TEXT.to_owned(),
+            reason_code: "success_condition_unobserved".to_owned(),
+            evidence_summary: NEAR_DEADLINE_EVIDENCE_SUMMARY.to_owned(),
             urgency: Urgency::Normal,
             confidence_basis_points: 8_000,
         }
@@ -10222,6 +10284,105 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn phase2_retention_context_is_erased_at_session_end_and_restart() {
+        let active = start(fixture(Vec::new(), true)).await;
+        observe(&active);
+        let session = find_session(&active.fixture.repository, active.fixture.session).unwrap();
+        let route = find_route(
+            &active.fixture.repository,
+            active.fixture.owner,
+            session.model_route_approval_id,
+        )
+        .unwrap();
+        let context = active
+            .fixture
+            .runtime
+            .assemble_context(&session, &route, &active.grants)
+            .unwrap()
+            .0;
+        assert!(!context.is_empty());
+        assert!(
+            active
+                .fixture
+                .runtime
+                .ephemeral
+                .lock()
+                .unwrap()
+                .sessions
+                .contains_key(&session.id)
+        );
+
+        let stopping = active
+            .fixture
+            .runtime
+            .end_focus_session(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+                session.id,
+                session.revision,
+                EndFocusReason::UserRequested,
+            )
+            .unwrap();
+        let ended = active
+            .fixture
+            .runtime
+            .finish_end_focus_session(active.fixture.owner, stopping.id, stopping.revision)
+            .await
+            .unwrap();
+        assert_eq!(ended.state, FocusSessionState::Ended);
+        assert!(
+            !active
+                .fixture
+                .runtime
+                .ephemeral
+                .lock()
+                .unwrap()
+                .sessions
+                .contains_key(&session.id)
+        );
+        assert!(
+            active
+                .fixture
+                .runtime
+                .assemble_context(&ended, &route, &active.grants)
+                .is_err()
+        );
+
+        let restarted = SecondMindRuntime::new(
+            SecondMindConfig::default(),
+            SecondMindPorts {
+                repository: Arc::new(active.fixture.repository.clone()),
+                clock: active.fixture.clock.clone(),
+                observation: Arc::new(UnavailableObservationPort),
+                model: Arc::new(UnavailableModelGateway),
+                notification: Arc::new(UnavailableNotificationPort),
+                native_status: Arc::new(UnavailableNativeStatusPort),
+                emergency_control: Arc::new(UnavailableEmergencyControlPort),
+                secret_store: Arc::new(crate::UnavailableSecretStore::default()),
+                resource_selection: Arc::new(crate::UnavailableResourceSelectionPort),
+            },
+        )
+        .unwrap();
+        assert!(
+            restarted
+                .recover_owner(active.fixture.owner)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(restarted.ephemeral.lock().unwrap().sessions.is_empty());
+        assert!(
+            restarted
+                .latest_model_request_receipt(
+                    ClientAssurance::PrivateCapabilityBound,
+                    active.fixture.owner,
+                    session.id,
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn retention_sweep_physically_purges_audit_at_the_expiry_boundary() {
         let fixture = fixture(Vec::new(), true);
@@ -10978,6 +11139,245 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn phase2_intervention_source_fixture_proves_validated_audited_policy_allow_once() {
+        let candidate_id = CandidateId::new_v7();
+        assert!(
+            validate_candidate(
+                NEAR_DEADLINE_QUALIFIED_TEXT,
+                "success_condition_unobserved",
+                NEAR_DEADLINE_EVIDENCE_SUMMARY,
+                8_000,
+            )
+            .is_ok()
+        );
+        let active = start(fixture(
+            vec![near_deadline_uncertainty_candidate(candidate_id)],
+            true,
+        ))
+        .await;
+        let now = active.fixture.clock.now_utc();
+        let goal = active
+            .fixture
+            .repository
+            .load_goals(active.fixture.owner)
+            .unwrap()
+            .into_iter()
+            .find(|goal| {
+                goal.id
+                    == find_session(&active.fixture.repository, active.fixture.session)
+                        .unwrap()
+                        .goal_id
+            })
+            .unwrap();
+        let remaining = goal.deadline.unwrap() - now;
+        assert_eq!(remaining, time::Duration::minutes(20));
+        assert!(
+            remaining
+                <= time::Duration::try_from(active.fixture.runtime.config.deadline_risk_horizon)
+                    .unwrap()
+        );
+
+        observe(&active);
+        let intervention = match active
+            .fixture
+            .runtime
+            .run_reasoning_cycle(active.fixture.session)
+            .await
+            .unwrap()
+        {
+            ReasoningCycleResult::Intervention(value) => *value,
+            other => panic!("expected one intervention, got {other:?}"),
+        };
+
+        assert_eq!(intervention.candidate_id, candidate_id);
+        assert_eq!(intervention.candidate_revision, 1);
+        assert_eq!(intervention.focus_session_id, active.fixture.session);
+        assert_eq!(intervention.goal_id, goal.id);
+        assert_eq!(intervention.state, InterventionState::AcceptedByChannel);
+        assert_eq!(intervention.user_visible_text, NEAR_DEADLINE_QUALIFIED_TEXT);
+        assert_eq!(intervention.reason_code, "success_condition_unobserved");
+        assert_eq!(
+            intervention.evidence_summary,
+            NEAR_DEADLINE_EVIDENCE_SUMMARY
+        );
+        assert_eq!(intervention.evidence.len(), 1);
+        assert_eq!(
+            intervention.evidence[0].category,
+            DataCategory::WorkspaceActivity
+        );
+        assert_eq!(
+            intervention.evidence[0].role,
+            crate::EvidenceRole::SupportsDeadlineRisk
+        );
+        assert_eq!(intervention.evidence[0].confidence_basis_points, 9_000);
+
+        let model_receipt = active
+            .fixture
+            .runtime
+            .latest_model_request_receipt(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+                active.fixture.session,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            model_receipt.outcome,
+            ModelRequestReceiptOutcome::CompletedStrictCandidate
+        );
+        assert!(model_receipt.completed_at.is_some());
+
+        let decision = active
+            .fixture
+            .repository
+            .find_policy_decision(intervention.policy_decision_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decision.candidate_id, candidate_id);
+        assert_eq!(decision.candidate_revision, 1);
+        assert_eq!(decision.focus_session_id, active.fixture.session);
+        assert_eq!(decision.outcome, PolicyOutcome::Allow);
+        assert_eq!(
+            decision.reason_codes,
+            vec![
+                format!("policy_profile:{POLICY_PROFILE_ID}"),
+                "policy_checks_passed".to_owned(),
+            ]
+        );
+        assert_eq!(decision.policy_version, POLICY_PROFILE_ID);
+        assert_eq!(decision.channel, NATIVE_NOTIFICATION_CHANNEL);
+        assert!(decision.policy_trace.is_complete());
+
+        let baseline_audit = active
+            .fixture
+            .repository
+            .load_audit(active.fixture.owner, OffsetDateTime::UNIX_EPOCH, 200)
+            .unwrap();
+        let significance_audits: Vec<_> = baseline_audit
+            .iter()
+            .filter(|record| record.kind == AuditKind::SignificanceDecision)
+            .collect();
+        assert_eq!(significance_audits.len(), 1);
+        let significance_audit = significance_audits[0];
+        assert_eq!(
+            significance_audit.subject_id,
+            active.fixture.session.as_uuid()
+        );
+        assert_eq!(
+            significance_audit.reason_codes,
+            vec!["significance_policy_passed".to_owned()]
+        );
+        assert_eq!(
+            significance_audit.evidence_categories,
+            BTreeSet::from([DataCategory::WorkspaceActivity])
+        );
+        assert!(
+            significance_audit
+                .policy_trace
+                .as_ref()
+                .is_some_and(PolicyTrace::is_complete)
+        );
+
+        let decision_audits: Vec<_> = baseline_audit
+            .iter()
+            .filter(|record| record.kind == AuditKind::InterventionDecision)
+            .collect();
+        assert_eq!(decision_audits.len(), 1);
+        let decision_audit = decision_audits[0];
+        assert_eq!(decision_audit.subject_id, candidate_id.as_uuid());
+        assert_eq!(decision_audit.reason_codes, decision.reason_codes);
+        assert_eq!(
+            decision_audit.evidence_categories,
+            BTreeSet::from([DataCategory::WorkspaceActivity])
+        );
+        assert_eq!(decision_audit.evidence_age_ms, Some(0));
+        assert_eq!(decision_audit.confidence_basis_points, Some(8_000));
+        assert_eq!(
+            decision_audit.policy_trace.as_ref(),
+            Some(&decision.policy_trace)
+        );
+        let policy_audit_json =
+            serde_json::to_string(&(significance_audit, decision_audit, &decision.policy_trace))
+                .unwrap();
+        assert!(!policy_audit_json.contains(NEAR_DEADLINE_QUALIFIED_TEXT));
+        assert!(!policy_audit_json.contains(NEAR_DEADLINE_EVIDENCE_SUMMARY));
+        assert!(!policy_audit_json.contains("synthetic release ledger"));
+        assert!(
+            active
+                .fixture
+                .notification
+                .audit_seen_before_delivery
+                .load(Ordering::SeqCst)
+        );
+        assert!(
+            active
+                .fixture
+                .notification
+                .attempt_marker_seen_before_delivery
+                .load(Ordering::SeqCst)
+        );
+        assert_eq!(active.fixture.model.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(active.fixture.notification.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            active
+                .fixture
+                .repository
+                .load_interventions(active.fixture.owner)
+                .unwrap(),
+            vec![intervention]
+        );
+        assert_eq!(
+            active
+                .fixture
+                .repository
+                .load_owner_state(active.fixture.owner)
+                .unwrap()
+                .policy_decisions,
+            vec![decision]
+        );
+
+        assert!(matches!(
+            active
+                .fixture
+                .runtime
+                .run_reasoning_cycle(active.fixture.session)
+                .await
+                .unwrap(),
+            ReasoningCycleResult::Silence { ref reason_code }
+                if reason_code == "no_relevant_state_change"
+        ));
+        assert_eq!(active.fixture.model.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(active.fixture.notification.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            active
+                .fixture
+                .repository
+                .load_interventions(active.fixture.owner)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            active
+                .fixture
+                .repository
+                .load_owner_state(active.fixture.owner)
+                .unwrap()
+                .policy_decisions
+                .len(),
+            1
+        );
+        assert_eq!(
+            active
+                .fixture
+                .repository
+                .load_audit(active.fixture.owner, OffsetDateTime::UNIX_EPOCH, 200)
+                .unwrap(),
+            baseline_audit
+        );
     }
 
     #[tokio::test]
@@ -13012,6 +13412,216 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn phase2_retention_outbox_scrubs_at_exact_actionability_boundary() {
+        const INTERVENTION_MARKER: &str = "Synthetic retention intervention marker v1.";
+        const EVIDENCE_MARKER: &str = "Synthetic retention evidence marker v1.";
+        let candidate = || ModelReasoningOutput::Candidate {
+            candidate_id: CandidateId::new_v7(),
+            user_visible_text: INTERVENTION_MARKER.to_owned(),
+            reason_code: "synthetic_retention_boundary".to_owned(),
+            evidence_summary: EVIDENCE_MARKER.to_owned(),
+            urgency: Urgency::Normal,
+            confidence_basis_points: 8_000,
+        };
+        let before_active = start(fixture(vec![candidate()], false)).await;
+        observe(&before_active);
+        let queued = match before_active
+            .fixture
+            .runtime
+            .run_reasoning_cycle(before_active.fixture.session)
+            .await
+            .unwrap()
+        {
+            ReasoningCycleResult::Intervention(intervention) => *intervention,
+            other => panic!("expected a queued intervention, got {other:?}"),
+        };
+        assert_eq!(queued.state, InterventionState::Queued);
+        assert_eq!(queued.user_visible_text, INTERVENTION_MARKER);
+        assert_eq!(queued.evidence_summary, EVIDENCE_MARKER);
+        let delivery = before_active
+            .fixture
+            .repository
+            .load_pending_deliveries(before_active.fixture.owner)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(delivery.state, OutboxState::Queued);
+        assert_eq!(delivery.user_visible_text, INTERVENTION_MARKER);
+        assert_eq!(
+            delivery.expires_at - before_active.fixture.clock.now_utc(),
+            time::Duration::seconds(30)
+        );
+
+        let before_session = find_session(
+            &before_active.fixture.repository,
+            before_active.fixture.session,
+        )
+        .unwrap();
+        let before_route = find_route(
+            &before_active.fixture.repository,
+            before_active.fixture.owner,
+            before_session.model_route_approval_id,
+        )
+        .unwrap();
+        let context_before = before_active
+            .fixture
+            .runtime
+            .assemble_context(&before_session, &before_route, &before_active.grants)
+            .unwrap()
+            .0;
+        assert!(!context_before.is_empty());
+        assert!(context_before.iter().all(|item| {
+            item.value.expose() != INTERVENTION_MARKER && item.value.expose() != EVIDENCE_MARKER
+        }));
+
+        before_active
+            .fixture
+            .clock
+            .advance(Duration::from_secs(29) + Duration::from_nanos(999_999_999));
+        assert!(
+            before_active
+                .fixture
+                .runtime
+                .revalidate_pending_deliveries(before_active.fixture.owner)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let immediately_before = before_active
+            .fixture
+            .repository
+            .load_owner_state(before_active.fixture.owner)
+            .unwrap();
+        assert_eq!(immediately_before.interventions.len(), 1);
+        assert_eq!(
+            immediately_before.interventions[0].user_visible_text,
+            INTERVENTION_MARKER
+        );
+        assert_eq!(immediately_before.pending_deliveries.len(), 1);
+        assert_eq!(
+            immediately_before.pending_deliveries[0].user_visible_text,
+            INTERVENTION_MARKER
+        );
+
+        // Use a fresh owner/runtime at the exact boundary so the public
+        // recovery-batch throttle does not turn the immediately-before probe
+        // into an artificial ten-second delay.
+        let active = start(fixture(vec![candidate()], false)).await;
+        observe(&active);
+        let queued = match active
+            .fixture
+            .runtime
+            .run_reasoning_cycle(active.fixture.session)
+            .await
+            .unwrap()
+        {
+            ReasoningCycleResult::Intervention(intervention) => *intervention,
+            other => panic!("expected a queued intervention, got {other:?}"),
+        };
+        let delivery = active
+            .fixture
+            .repository
+            .load_pending_deliveries(active.fixture.owner)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(queued.state, InterventionState::Queued);
+        assert_eq!(delivery.state, OutboxState::Queued);
+        assert_eq!(
+            delivery.expires_at - active.fixture.clock.now_utc(),
+            time::Duration::seconds(30)
+        );
+        let session = find_session(&active.fixture.repository, active.fixture.session).unwrap();
+        let route = find_route(
+            &active.fixture.repository,
+            active.fixture.owner,
+            session.model_route_approval_id,
+        )
+        .unwrap();
+        active.fixture.clock.advance(Duration::from_secs(30));
+        assert_eq!(active.fixture.clock.now_utc(), delivery.expires_at);
+        let expired = active
+            .fixture
+            .runtime
+            .revalidate_pending_deliveries(active.fixture.owner)
+            .await
+            .unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].state, InterventionState::Expired);
+        assert_eq!(expired[0].outcome, InterventionOutcome::Expired);
+        assert!(expired[0].user_visible_text.is_empty());
+        assert!(expired[0].evidence_summary.is_empty());
+        assert!(expired[0].evidence.is_empty());
+
+        let assert_all_reads_scrubbed = || {
+            let interventions = active
+                .fixture
+                .repository
+                .load_interventions(active.fixture.owner)
+                .unwrap();
+            assert_eq!(interventions.len(), 1);
+            assert_eq!(interventions[0].state, InterventionState::Expired);
+            assert!(interventions[0].user_visible_text.is_empty());
+            assert!(interventions[0].evidence_summary.is_empty());
+            assert!(interventions[0].evidence.is_empty());
+
+            let deliveries = active
+                .fixture
+                .repository
+                .load_pending_deliveries(active.fixture.owner)
+                .unwrap();
+            assert_eq!(deliveries.len(), 1);
+            assert_eq!(deliveries[0].state, OutboxState::Expired);
+            assert!(deliveries[0].user_visible_text.is_empty());
+
+            for snapshot in [
+                active
+                    .fixture
+                    .repository
+                    .load_owner_state(active.fixture.owner)
+                    .unwrap(),
+                active
+                    .fixture
+                    .runtime
+                    .owner_state_snapshot(
+                        ClientAssurance::PrivateCapabilityBound,
+                        active.fixture.owner,
+                    )
+                    .unwrap(),
+            ] {
+                assert_eq!(snapshot.interventions, interventions);
+                assert_eq!(snapshot.pending_deliveries, deliveries);
+            }
+
+            let context = active
+                .fixture
+                .runtime
+                .assemble_context(&session, &route, &active.grants)
+                .unwrap()
+                .0;
+            assert!(context.iter().all(|item| {
+                item.value.expose() != INTERVENTION_MARKER && item.value.expose() != EVIDENCE_MARKER
+            }));
+        };
+        assert_all_reads_scrubbed();
+
+        active.fixture.clock.advance(Duration::from_nanos(1));
+        assert!(
+            active
+                .fixture
+                .runtime
+                .revalidate_pending_deliveries(active.fixture.owner)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_all_reads_scrubbed();
+        assert_eq!(active.fixture.notification.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn outbox_enforces_per_session_and_per_user_capacity_without_eviction() {
         let config = SecondMindConfig {
             outbox_capacity_per_user: 2,
@@ -13512,6 +14122,192 @@ mod tests {
             .unwrap();
         assert_eq!(retried.state, FocusSessionState::Active);
         assert_eq!(recovered_observation.start_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn phase2_identity_revision_conflict_preserves_current_preferences() {
+        let fixture = fixture(Vec::new(), true);
+        let original = fixture
+            .runtime
+            .user_preferences(ClientAssurance::PrivateCapabilityBound, fixture.owner)
+            .unwrap();
+        let mut winning = original.clone();
+        winning.preferred_form_of_address = Some("Current synthetic value".to_owned());
+        let winning = fixture
+            .runtime
+            .save_preferences(
+                ClientAssurance::PrivateCapabilityBound,
+                winning,
+                Some(original.revision),
+            )
+            .unwrap();
+        let winning_json = serde_json::to_vec(&winning).unwrap();
+        let stale_revision = original.revision;
+
+        let mut stale = original;
+        stale.preferred_form_of_address = Some("Stale synthetic value".to_owned());
+        let error = fixture
+            .runtime
+            .save_preferences(
+                ClientAssurance::PrivateCapabilityBound,
+                stale,
+                Some(stale_revision),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, SecondMindErrorCode::Conflict);
+        let durable = fixture
+            .repository
+            .load_preferences(fixture.owner)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.revision, winning.revision);
+        assert_eq!(serde_json::to_vec(&durable).unwrap(), winning_json);
+    }
+
+    #[test]
+    fn phase2_identity_stricter_preferences_produce_quieter_effective_policy() {
+        let fixture = fixture(Vec::new(), true);
+        let defaults = fixture
+            .runtime
+            .user_preferences(ClientAssurance::PrivateCapabilityBound, fixture.owner)
+            .unwrap();
+        let mut permissive = defaults.clone();
+        permissive.proactive_interventions_enabled = true;
+        permissive.remote_processing_enabled = true;
+        permissive.restart_continuity_default = true;
+        let permissive = fixture
+            .runtime
+            .save_preferences(
+                ClientAssurance::PrivateCapabilityBound,
+                permissive,
+                Some(defaults.revision),
+            )
+            .unwrap();
+        let permissive_policy = fixture
+            .runtime
+            .effective_policy_view(ClientAssurance::PrivateCapabilityBound, fixture.owner)
+            .unwrap();
+
+        let mut stricter = permissive.clone();
+        stricter.maximum_interventions_per_session = 1;
+        stricter.maximum_model_requests_per_hour = 2;
+        stricter.minimum_intervention_cooldown_seconds += 60;
+        stricter.proactive_interventions_muted = true;
+        stricter.allowed_delivery_channels.clear();
+        stricter.remote_processing_enabled = false;
+        stricter.restart_continuity_default = false;
+        let stricter = fixture
+            .runtime
+            .save_preferences(
+                ClientAssurance::PrivateCapabilityBound,
+                stricter,
+                Some(permissive.revision),
+            )
+            .unwrap();
+        let stricter_policy = fixture
+            .runtime
+            .effective_policy_view(ClientAssurance::PrivateCapabilityBound, fixture.owner)
+            .unwrap();
+
+        assert_eq!(stricter_policy.user_preferences_revision, stricter.revision);
+        assert!(stricter_policy.proactive_interventions_muted);
+        assert!(
+            stricter_policy.maximum_interventions_per_session
+                < permissive_policy.maximum_interventions_per_session
+        );
+        assert!(
+            stricter_policy.maximum_model_requests_per_hour
+                < permissive_policy.maximum_model_requests_per_hour
+        );
+        assert!(stricter_policy.intervention_cooldown > permissive_policy.intervention_cooldown);
+        assert!(stricter_policy.allowed_delivery_channels.is_empty());
+        assert!(!stricter_policy.remote_processing_enabled);
+        assert!(!stricter_policy.restart_continuity_default);
+
+        let mut diagnostic_attempt = stricter.clone();
+        diagnostic_attempt.preferred_form_of_address = Some("Diagnostic mutation".to_owned());
+        let error = fixture
+            .runtime
+            .save_preferences(
+                ClientAssurance::Diagnostic,
+                diagnostic_attempt,
+                Some(stricter.revision),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, SecondMindErrorCode::PermissionDenied);
+        assert_eq!(
+            fixture.repository.load_preferences(fixture.owner).unwrap(),
+            Some(stricter)
+        );
+    }
+
+    #[tokio::test]
+    async fn phase2_identity_observation_model_and_feedback_do_not_mutate_durable_records() {
+        let mut model_candidate = candidate();
+        let ModelReasoningOutput::Candidate {
+            user_visible_text, ..
+        } = &mut model_candidate
+        else {
+            unreachable!("the synthetic model fixture must produce a candidate")
+        };
+        *user_visible_text =
+            "The synthetic activity suggests you prefer to be called Commander.".to_owned();
+        let active = start(fixture(vec![model_candidate], true)).await;
+        active
+            .fixture
+            .runtime
+            .stein_identity(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+            )
+            .unwrap();
+        let before =
+            identity_preferences_snapshot(&active.fixture.repository, active.fixture.owner);
+
+        observe(&active);
+        assert_eq!(
+            identity_preferences_snapshot(&active.fixture.repository, active.fixture.owner),
+            before,
+            "accepted observations must preserve both revisions and canonical values"
+        );
+
+        let intervention = match active
+            .fixture
+            .runtime
+            .run_reasoning_cycle(active.fixture.session)
+            .await
+            .unwrap()
+        {
+            ReasoningCycleResult::Intervention(value) => *value,
+            other => panic!("expected an intervention, got {other:?}"),
+        };
+        assert_eq!(intervention.state, InterventionState::AcceptedByChannel);
+        assert_eq!(
+            identity_preferences_snapshot(&active.fixture.repository, active.fixture.owner),
+            before,
+            "model output must preserve both revisions and canonical values"
+        );
+
+        active
+            .fixture
+            .runtime
+            .record_feedback(
+                ClientAssurance::PrivateCapabilityBound,
+                active.fixture.owner,
+                intervention.id,
+                intervention.revision,
+                InterventionOutcome::Corrected,
+                Some(SensitiveText::new(
+                    "For this session, call the synthetic operator Commander.",
+                )),
+            )
+            .unwrap();
+        assert_eq!(
+            identity_preferences_snapshot(&active.fixture.repository, active.fixture.owner),
+            before,
+            "corrective feedback must preserve both revisions and canonical values"
+        );
     }
 
     #[test]

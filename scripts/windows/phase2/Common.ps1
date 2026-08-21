@@ -15,6 +15,14 @@ $script:SteinPhase2MigrationReadiness = "durable_persistence_healthy_startup_int
 
 $script:SteinPhase2PackagingRoot = (Resolve-Path -LiteralPath (
     Join-Path $PSScriptRoot "..\..\..\packaging\windows-msix") -ErrorAction Stop).Path
+if ($null -eq (Get-Variable `
+        -Name SteinPhase2MsixVerifierPath `
+        -Scope Script `
+        -ErrorAction SilentlyContinue)) {
+    $script:SteinPhase2MsixVerifierPath = Join-Path `
+        $script:SteinPhase2PackagingRoot `
+        "Verify-Msix.ps1"
+}
 . (Join-Path $script:SteinPhase2PackagingRoot "PackageTools.ps1")
 
 function Assert-SteinPhase2WindowsHost {
@@ -375,7 +383,7 @@ function Get-SteinPhase2ReleaseBundle {
         -Path $cliPath `
         -CertificateThumbprint $normalizedThumbprint `
         -Publisher $Publisher
-    $verification = & (Join-Path $script:SteinPhase2PackagingRoot "Verify-Msix.ps1") `
+    $verification = & $script:SteinPhase2MsixVerifierPath `
         -PackagePath $resolvedPackage `
         -CertificateThumbprint $normalizedThumbprint `
         -Publisher $Publisher `

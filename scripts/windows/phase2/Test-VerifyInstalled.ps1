@@ -374,7 +374,9 @@ foreach ($required in @(
         "Resolve-SteinInstalledWindowsPowerShell",
         "[Environment+SpecialFolder]::System",
         "windows_powershell_host_unavailable",
-        "Get-SteinInstalledBootstrapFileRecord",
+        "Open-SteinInstalledBootstrapFileBinding",
+        "Get-SteinInstalledLockedStreamSha256",
+        "SteinInstalledRuntimeSourceBindings",
         "runtime_source_files",
         "evidence-generator-stability",
         "An evidence output escaped its timestamped directory.",
@@ -519,6 +521,77 @@ if ($launcher -match '(?im)^\s*powershell\.exe(?:\s|$)' -or
     throw "Verify-Installed.cmd permits PATH-based Windows PowerShell resolution."
 }
 
+foreach ($functionName in @(
+        "Get-SteinInstalledLockedStreamSha256",
+        "Open-SteinInstalledBootstrapFileBinding")) {
+    $functionAst = @($ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq $functionName
+            }, $true))
+    if ($functionAst.Count -ne 1) {
+        throw "The installed collector runtime-source lock helper is not uniquely defined."
+    }
+    . ([scriptblock]::Create($functionAst[0].Extent.Text))
+}
+$runtimeLockProbeRoot = Join-Path ([IO.Path]::GetTempPath()) (
+    "stein-installed-runtime-lock-" + [Guid]::NewGuid().ToString("N"))
+$runtimeLockProbeCanonical = [IO.Path]::GetFullPath($runtimeLockProbeRoot)
+try {
+    $null = New-Item -ItemType Directory -Path $runtimeLockProbeCanonical -ErrorAction Stop
+    $runtimeLockProbePath = Join-Path $runtimeLockProbeCanonical "source.ps1"
+    $runtimeLockReplacementPath = Join-Path $runtimeLockProbeCanonical "replacement.ps1"
+    [IO.File]::WriteAllText($runtimeLockProbePath, "locked-installed-source")
+    [IO.File]::WriteAllText($runtimeLockReplacementPath, "replacement-installed-source")
+    $runtimeLockBinding = Open-SteinInstalledBootstrapFileBinding `
+        -Role "lock-probe" `
+        -Path $runtimeLockProbePath `
+        -RepositoryRoot $runtimeLockProbeCanonical
+    try {
+        $runtimeWriteRejected = $false
+        try {
+            [IO.File]::WriteAllText($runtimeLockProbePath, "mutated-installed-source")
+        }
+        catch {
+            $runtimeWriteRejected = $true
+        }
+        $runtimeReplacementRejected = $false
+        try {
+            Move-Item `
+                -LiteralPath $runtimeLockReplacementPath `
+                -Destination $runtimeLockProbePath `
+                -Force `
+                -ErrorAction Stop
+        }
+        catch {
+            $runtimeReplacementRejected = $true
+        }
+        $runtimeSameHandleSha256 = Get-SteinInstalledLockedStreamSha256 `
+            -Stream $runtimeLockBinding.stream `
+            -FailureCode "runtime_source_set_changed"
+        if (-not $runtimeWriteRejected -or -not $runtimeReplacementRejected -or
+            $runtimeSameHandleSha256 -cne [string]$runtimeLockBinding.record.sha256) {
+            throw "The installed collector runtime-source lock allowed a swap or changed bytes."
+        }
+    }
+    finally {
+        $runtimeLockBinding.stream.Dispose()
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $runtimeLockProbeCanonical) {
+        if ([IO.Path]::GetFileName($runtimeLockProbeCanonical) -cnotmatch
+            '^stein-installed-runtime-lock-[0-9a-f]{32}$') {
+            throw "Refusing to remove an unverified runtime lock probe path."
+        }
+        Remove-Item `
+            -LiteralPath $runtimeLockProbeCanonical `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+}
+
 [pscustomobject]@{
     verified = $true
     harness = Split-Path -Leaf $harnessPath
@@ -534,5 +607,6 @@ if ($launcher -match '(?im)^\s*powershell\.exe(?:\s|$)' -or
     evidence_spec_swap_rejected = $specificationSwapRejected
     closed_runner_order_enforced = $runnerOrderRejected
     no_leaks_pair_mismatch_rejected = $noLeaksPairMismatchRejected
+    runtime_source_swap_rejected = $true
     exact_gate_evidence_contract = $true
 }

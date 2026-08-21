@@ -3087,6 +3087,143 @@ mod implementation {
         }
 
         #[tokio::test]
+        async fn phase2_source_fixture_phase1_regression_requires_confirmed_client_cancellation() {
+            async fn begin_cancelled_request(
+                client: Client,
+                messages: &mut mpsc::Receiver<ClientMessage>,
+                cancellation: &CancellationToken,
+            ) -> (
+                tokio::task::JoinHandle<Result<DelayEchoResponse, ClientError>>,
+                RequestEnvelope,
+                CancelRequest,
+            ) {
+                let request_cancellation = cancellation.clone();
+                let request = tokio::spawn(async move {
+                    client
+                        .delay_echo(3_000, "synthetic", Some(request_cancellation))
+                        .await
+                });
+                let ClientMessage::Request(envelope) = messages
+                    .recv()
+                    .await
+                    .expect("delay request must enter the writer queue")
+                else {
+                    panic!("expected delay request");
+                };
+                cancellation.cancel();
+                let ClientMessage::Cancel(cancel) = messages
+                    .recv()
+                    .await
+                    .expect("cancellation must enter the writer queue")
+                else {
+                    panic!("expected cancellation request");
+                };
+                assert_eq!(cancel.target_request_id, envelope.request_id);
+                assert_eq!(
+                    Some(cancel.cancellation_id),
+                    envelope.metadata.cancellation_id
+                );
+                assert_eq!(cancel.correlation_id, envelope.metadata.correlation_id);
+                (request, envelope, cancel)
+            }
+
+            fn terminal_cancelled_response(
+                request: &RequestEnvelope,
+                actor: ActorReference,
+            ) -> ResponseEnvelope {
+                ResponseEnvelope {
+                    request_id: request.request_id,
+                    metadata: stein_protocol::ResponseMetadata::for_request(
+                        &request.metadata,
+                        actor,
+                    ),
+                    outcome: ResponseOutcome::Error(PublicError {
+                        code: ErrorCode::Cancelled,
+                        category: stein_protocol::ErrorCategory::Cancelled,
+                        summary: "The synthetic request was cancelled.".into(),
+                        retryable: false,
+                        correlation_id: request.metadata.correlation_id,
+                        details: None,
+                    }),
+                }
+            }
+
+            async fn send_matching_acknowledgement(inner: &ClientInner, cancel: &CancelRequest) {
+                let waiter = inner
+                    .cancellation_waiters
+                    .lock()
+                    .await
+                    .remove(&cancel.cancellation_id)
+                    .expect("matching cancellation waiter");
+                assert_eq!(waiter.target_request_id, cancel.target_request_id);
+                assert_eq!(waiter.correlation_id, cancel.correlation_id);
+                assert_eq!(waiter.causation_id, cancel.message_id);
+                waiter
+                    .sender
+                    .send(Ok(CancellationStatus::CancellationRequested))
+                    .expect("client must still await the acknowledgement");
+            }
+
+            async fn send_terminal_response(
+                inner: &ClientInner,
+                session: &SessionOpened,
+                request: &RequestEnvelope,
+            ) {
+                inner
+                    .pending
+                    .lock()
+                    .await
+                    .remove(&request.request_id)
+                    .expect("matching response waiter")
+                    .send(Ok(terminal_cancelled_response(
+                        request,
+                        session.authenticated_actor.clone(),
+                    )))
+                    .expect("client must still await the terminal response");
+            }
+
+            let (_, session) = fixture_session();
+            let (inner, mut messages) = fixture_inner(session.clone());
+            let client = Client {
+                owner: Arc::new(ClientOwner {
+                    inner: inner.clone(),
+                }),
+            };
+
+            let cancellation = CancellationToken::new();
+            let (response_first, request, cancel) =
+                begin_cancelled_request(client.clone(), &mut messages, &cancellation).await;
+            send_terminal_response(&inner, &session, &request).await;
+            tokio::task::yield_now().await;
+            assert!(
+                !response_first.is_finished(),
+                "a terminal cancelled response alone must not report cancellation"
+            );
+            send_matching_acknowledgement(&inner, &cancel).await;
+            assert!(matches!(
+                response_first.await.expect("request task must finish"),
+                Err(ClientError::Cancelled)
+            ));
+
+            let cancellation = CancellationToken::new();
+            let (acknowledgement_first, request, cancel) =
+                begin_cancelled_request(client, &mut messages, &cancellation).await;
+            send_matching_acknowledgement(&inner, &cancel).await;
+            tokio::task::yield_now().await;
+            assert!(
+                !acknowledgement_first.is_finished(),
+                "a matching acknowledgement alone must not report cancellation"
+            );
+            send_terminal_response(&inner, &session, &request).await;
+            assert!(matches!(
+                acknowledgement_first
+                    .await
+                    .expect("request task must finish"),
+                Err(ClientError::Cancelled)
+            ));
+        }
+
+        #[tokio::test]
         async fn an_older_snapshot_cannot_overwrite_later_applied_state() {
             let (_, session) = fixture_session();
             let (inner, _messages) = fixture_inner(session.clone());

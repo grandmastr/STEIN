@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::task::{Context, Poll, Waker};
 
@@ -515,6 +516,39 @@ fn append_graph_audit(repository: &dyn DurableRepository, graph: &SyntheticGraph
     }
 }
 
+fn sqlite_artifact_paths(path: &Path) -> Vec<PathBuf> {
+    ["", "-wal", "-shm", "-journal"]
+        .into_iter()
+        .map(|suffix| {
+            let mut artifact = path.as_os_str().to_os_string();
+            artifact.push(suffix);
+            PathBuf::from(artifact)
+        })
+        .collect()
+}
+
+fn artifact_contains(bytes: &[u8], marker: &str) -> bool {
+    bytes
+        .windows(marker.len())
+        .any(|window| window == marker.as_bytes())
+}
+
+fn assert_sqlite_artifacts_exclude(path: &Path, markers: &[&str]) {
+    for artifact in sqlite_artifact_paths(path) {
+        if !artifact.exists() {
+            continue;
+        }
+        let bytes = fs::read(&artifact).unwrap();
+        for marker in markers {
+            assert!(
+                !artifact_contains(&bytes, marker),
+                "{} retained synthetic marker {marker}",
+                artifact.display()
+            );
+        }
+    }
+}
+
 fn downgrade_current_database_to_v1(path: &std::path::Path) {
     let connection = Connection::open(path).unwrap();
     connection
@@ -730,6 +764,61 @@ fn revisions_and_goal_receipt_are_atomic() {
     let stale = repository.update_goal(&updated, 1).unwrap_err();
     assert_eq!(stale.kind, RepositoryErrorKind::Conflict);
     assert_eq!(repository.load_goals(actor()).unwrap(), vec![updated]);
+}
+
+#[test]
+fn phase2_identity_sqlite_revision_conflicts_preserve_identity_and_preferences() {
+    let directory = tempdir().unwrap();
+    let repository =
+        SqliteRepository::open(directory.path().join("identity-revisions.db")).unwrap();
+
+    let identity_v1 = SteinIdentity::shipped_v1(actor(), now());
+    let identity_v1_revision = identity_v1.revision;
+    repository.save_identity(&identity_v1, None).unwrap();
+    let mut winning_identity = identity_v1.clone();
+    winning_identity.revision = 2;
+    winning_identity.updated_at += Duration::seconds(1);
+    winning_identity.provenance.recorded_at = winning_identity.updated_at;
+    repository
+        .save_identity(&winning_identity, Some(identity_v1_revision))
+        .unwrap();
+
+    let mut stale_identity = identity_v1;
+    stale_identity.revision = 2;
+    stale_identity.updated_at += Duration::seconds(2);
+    stale_identity.provenance.recorded_at = stale_identity.updated_at;
+    let identity_error = repository
+        .save_identity(&stale_identity, Some(identity_v1_revision))
+        .unwrap_err();
+    assert_eq!(identity_error.kind, RepositoryErrorKind::Conflict);
+    assert_eq!(
+        repository.load_identity(actor()).unwrap(),
+        Some(winning_identity)
+    );
+
+    let preferences_v1 = ExplicitPreferences::phase2_defaults(actor(), now());
+    let preferences_v1_revision = preferences_v1.revision;
+    repository.save_preferences(&preferences_v1, None).unwrap();
+    let mut winning_preferences = preferences_v1.clone();
+    winning_preferences.revision = 2;
+    winning_preferences.proactive_interventions_muted = true;
+    winning_preferences.updated_at += Duration::seconds(1);
+    repository
+        .save_preferences(&winning_preferences, Some(preferences_v1_revision))
+        .unwrap();
+
+    let mut stale_preferences = preferences_v1;
+    stale_preferences.revision = 2;
+    stale_preferences.preferred_form_of_address = Some("Stale synthetic value".to_owned());
+    stale_preferences.updated_at += Duration::seconds(2);
+    let preferences_error = repository
+        .save_preferences(&stale_preferences, Some(preferences_v1_revision))
+        .unwrap_err();
+    assert_eq!(preferences_error.kind, RepositoryErrorKind::Conflict);
+    assert_eq!(
+        repository.load_preferences(actor()).unwrap(),
+        Some(winning_preferences)
+    );
 }
 
 #[test]
@@ -2621,6 +2710,152 @@ fn goal_delete_cascades_private_graph_but_preserves_identity_and_route() {
 }
 
 #[test]
+fn phase2_retention_sqlite_delete_scrubs_all_reads_restart_and_recovery_copy() {
+    const INTERVENTION_MARKER: &str = "synthetic-retention-private-intervention-v1";
+    const EVIDENCE_MARKER: &str = "synthetic-retention-private-evidence-v1";
+    const OUTBOX_MARKER: &str = "synthetic-retention-private-outbox-v1";
+    const MARKERS: &[&str] = &[INTERVENTION_MARKER, EVIDENCE_MARKER, OUTBOX_MARKER];
+
+    let directory = tempdir().unwrap();
+    let database_path = directory.path().join("retention-delete.db");
+    let recovery_path = directory.path().join("retention-delete-recovery.db");
+    let mut graph = synthetic_graph(actor(), 0xe90);
+    graph.intervention.user_visible_text = INTERVENTION_MARKER.to_owned();
+    graph.intervention.evidence_summary = EVIDENCE_MARKER.to_owned();
+    graph.delivery.user_visible_text = OUTBOX_MARKER.to_owned();
+
+    {
+        let repository = SqliteRepository::open(&database_path).unwrap();
+        install_graph(&repository, &graph, true, true);
+        let encoded = serde_json::to_vec(&(
+            repository.load_interventions(actor()).unwrap(),
+            repository.load_pending_deliveries(actor()).unwrap(),
+        ))
+        .unwrap();
+        for marker in MARKERS {
+            assert!(artifact_contains(&encoded, marker));
+        }
+    }
+
+    let bytes_before_delete = fs::read(&database_path).unwrap();
+    for marker in MARKERS {
+        assert!(
+            artifact_contains(&bytes_before_delete, marker),
+            "the pre-delete database did not contain synthetic marker {marker}"
+        );
+    }
+
+    let assert_deleted_reads = |repository: &dyn DurableRepository| {
+        let snapshot = repository.load_owner_state(actor()).unwrap();
+        assert!(snapshot.goals.is_empty());
+        assert!(snapshot.resources.is_empty());
+        assert!(snapshot.grants.is_empty());
+        assert!(snapshot.focus_sessions.is_empty());
+        assert!(snapshot.interventions.is_empty());
+        assert!(snapshot.policy_decisions.is_empty());
+        assert!(snapshot.pending_deliveries.is_empty());
+        assert_eq!(snapshot.identity.as_ref(), Some(&graph.identity));
+        assert_eq!(snapshot.preferences.as_ref(), Some(&graph.preferences));
+        assert_eq!(snapshot.model_routes, vec![graph.route.clone()]);
+
+        assert!(repository.load_goals(actor()).unwrap().is_empty());
+        assert!(repository.load_resources(actor()).unwrap().is_empty());
+        assert!(repository.load_grants(actor()).unwrap().is_empty());
+        assert!(repository.load_focus_sessions(actor()).unwrap().is_empty());
+        assert!(repository.load_interventions(actor()).unwrap().is_empty());
+        assert!(
+            repository
+                .load_pending_deliveries(actor())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repository
+                .find_policy_decision(graph.policy.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository
+                .find_operation_receipt(
+                    actor(),
+                    OperationKind::StartFocusSession,
+                    graph.start_receipt.idempotency_key,
+                )
+                .unwrap()
+                .is_none()
+        );
+        for receipt in &graph.grant_receipts {
+            assert!(
+                repository
+                    .find_operation_receipt(
+                        actor(),
+                        OperationKind::GrantSessionPermission,
+                        receipt.idempotency_key,
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let audits = repository
+            .load_audit(actor(), OffsetDateTime::UNIX_EPOCH, 100)
+            .unwrap();
+        assert_eq!(audits, vec![graph.route_audit.clone()]);
+        let encoded = serde_json::to_vec(&audits).unwrap();
+        for marker in MARKERS {
+            assert!(!artifact_contains(&encoded, marker));
+        }
+        let replay = repository
+            .delete_goal_with_tombstone(
+                actor(),
+                graph.goal.id,
+                graph.goal.revision.get(),
+                now() + Duration::hours(1),
+            )
+            .unwrap();
+        assert!(replay.already_deleted);
+        assert_eq!(replay.tombstone.goal_id, graph.goal.id);
+        assert_eq!(replay.tombstone.deleted_revision, graph.goal.revision.get());
+        assert_eq!(replay.tombstone.deleted_at, now() + Duration::seconds(3));
+    };
+
+    {
+        let repository = SqliteRepository::open(&database_path).unwrap();
+        let result = repository
+            .delete_goal_with_tombstone(
+                actor(),
+                graph.goal.id,
+                graph.goal.revision.get(),
+                now() + Duration::seconds(3),
+            )
+            .unwrap();
+        assert!(!result.already_deleted);
+        assert_eq!(result.tombstone.summary.goals, 1);
+        assert_eq!(result.tombstone.summary.focus_sessions, 1);
+        assert_eq!(result.tombstone.summary.interventions, 1);
+        assert_eq!(result.tombstone.summary.outbox_entries, 1);
+        assert_deleted_reads(&repository);
+        repository.create_recovery_copy(&recovery_path).unwrap();
+    }
+
+    assert_sqlite_artifacts_exclude(&database_path, MARKERS);
+    assert_sqlite_artifacts_exclude(&recovery_path, MARKERS);
+
+    let restarted = SqliteRepository::open(&database_path).unwrap();
+    restarted.health().unwrap();
+    assert_deleted_reads(&restarted);
+    drop(restarted);
+
+    let recovery = SqliteRepository::open(&recovery_path).unwrap();
+    recovery.health().unwrap();
+    assert_deleted_reads(&recovery);
+    drop(recovery);
+
+    assert_sqlite_artifacts_exclude(&database_path, MARKERS);
+    assert_sqlite_artifacts_exclude(&recovery_path, MARKERS);
+}
+
+#[test]
 fn goal_delete_preserves_a_resource_and_its_audit_while_another_goal_references_it() {
     let directory = tempdir().unwrap();
     let repository = SqliteRepository::open(directory.path().join("shared-resource.db")).unwrap();
@@ -2695,32 +2930,80 @@ fn goal_delete_preserves_a_resource_and_its_audit_while_another_goal_references_
 
 #[test]
 fn audit_expiry_is_exact_and_idempotent() {
+    const AUDIT_MARKER: &str = "synthetic-retention-audit-marker-v1";
     let directory = tempdir().unwrap();
-    let repository = SqliteRepository::open(directory.path().join("audit-expiry.db")).unwrap();
-    let graph = synthetic_graph(actor(), 0xf00);
-    install_graph(&repository, &graph, false, true);
-    let count = repository
-        .load_audit(actor(), OffsetDateTime::UNIX_EPOCH, 100)
-        .unwrap()
-        .len() as u64;
-    assert_eq!(
+    let database_path = directory.path().join("audit-expiry.db");
+    let recovery_path = directory.path().join("audit-expiry-recovery.db");
+    let count = {
+        let repository = SqliteRepository::open(&database_path).unwrap();
+        let graph = synthetic_graph(actor(), 0xf00);
+        install_graph(&repository, &graph, false, true);
+        let mut marker = creation_audit(
+            actor(),
+            0xff0,
+            AuditKind::FocusSessionStateChanged,
+            uuid(0xff1),
+        );
+        marker.reason_codes = vec![AUDIT_MARKER.to_owned()];
+        repository.append_audit(&marker).unwrap();
         repository
-            .purge_expired_audit(now() + Duration::days(30) - Duration::nanoseconds(1))
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        repository
-            .purge_expired_audit(now() + Duration::days(30))
-            .unwrap(),
-        count
-    );
-    assert_eq!(
-        repository
-            .purge_expired_audit(now() + Duration::days(31))
-            .unwrap(),
-        0
-    );
+            .load_audit(actor(), OffsetDateTime::UNIX_EPOCH, 100)
+            .unwrap()
+            .len() as u64
+    };
+    assert!(artifact_contains(
+        &fs::read(&database_path).unwrap(),
+        AUDIT_MARKER
+    ));
+
+    {
+        let repository = SqliteRepository::open(&database_path).unwrap();
+        assert_eq!(
+            repository
+                .purge_expired_audit(now() + Duration::days(30) - Duration::nanoseconds(1))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            repository
+                .load_audit(actor(), OffsetDateTime::UNIX_EPOCH, 100)
+                .unwrap()
+                .len() as u64,
+            count
+        );
+        assert_eq!(
+            repository
+                .purge_expired_audit(now() + Duration::days(30))
+                .unwrap(),
+            count
+        );
+        assert!(
+            repository
+                .load_audit(actor(), OffsetDateTime::UNIX_EPOCH, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            repository
+                .purge_expired_audit(now() + Duration::days(31))
+                .unwrap(),
+            0
+        );
+        repository.create_recovery_copy(&recovery_path).unwrap();
+    }
+
+    assert_sqlite_artifacts_exclude(&database_path, &[AUDIT_MARKER]);
+    assert_sqlite_artifacts_exclude(&recovery_path, &[AUDIT_MARKER]);
+    for path in [&database_path, &recovery_path] {
+        let repository = SqliteRepository::open(path).unwrap();
+        repository.health().unwrap();
+        assert!(
+            repository
+                .load_audit(actor(), OffsetDateTime::UNIX_EPOCH, 100)
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
 
 #[test]

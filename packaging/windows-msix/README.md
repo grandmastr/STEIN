@@ -144,13 +144,25 @@ worktree and ignored stale renderer/target outputs are never build inputs. The s
 generate, import, trust, install, or remove a certificate or package. Missing
 identity, provenance, or trust prerequisites fail closed.
 
-This is deliberately not a hermetic native-toolchain claim. The selected
+Before signing, packaging validates the frozen source-fixture registry
+(`SHA-256
+d2414e552dfbc00b3ecf5837cfc431c64f670508ae4e8696b9fce4f85a75c5c5`),
+all 13 receipts/71 ordered subchecks, their exact commands and locked binaries,
+the suite index, and all 140 invocation mappings. It grounds every semantic
+source size/SHA-256/Git blob plus the receipt's tree count/manifest against the
+locked candidate snapshot. The installed reviewer then rehashes the signed
+schema-3 package's bound source report and receipts; it does not substitute the
+operator's mutable checkout for that signer-grounded candidate.
+
+The source contract has 44 checks: 38 required `pass` and six exact frozen
+`not_run`, with seventeen generator files. This is deliberately not a hermetic
+native-toolchain claim. The selected
 VS/MSVC compiler, linker, assembler, librarian and library catalogs, Windows
 SDK resource/libraries, and MakeAppx/SignTool payloads are not yet represented
 by a closed signer-attested toolchain manifest. Packaging also validates the
 source report's exact check catalog, shapes, statuses, log bytes, generator
-files and integrity digests, but does not independently reconstruct every
-check's executable/argument/working-directory semantics. Therefore
+files and integrity digests. Non-fixture checks still do not have independently
+attested executable/argument/working-directory semantics. Therefore
 `native-toolchain-provenance`, `source-report-command-provenance`, and the
 independent `pinned-clean-build-environment` receipt remain explicit P2-BUILD
 NOT RUN obligations. This slice cannot promote P2-BUILD until dedicated closed

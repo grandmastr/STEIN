@@ -14,6 +14,9 @@ $reviewerTestPath = Join-Path $PSScriptRoot "Test-ReviewInstalled.ps1"
 $commonPath = Join-Path $PSScriptRoot "Common.ps1"
 $evidenceSpecPath = Join-Path $PSScriptRoot "Evidence-Spec.json"
 $evidenceContractPath = Join-Path $PSScriptRoot "Evidence-Contract.ps1"
+$sourceFixtureRegistryPath = Join-Path $PSScriptRoot "Source-Fixture-Registry.json"
+$sourceFixtureRunnerPath = Join-Path $PSScriptRoot "Run-Source-Fixture.ps1"
+$sourceFixtureTestPath = Join-Path $PSScriptRoot "Test-SourceFixture.ps1"
 $noLeaksScannerPath = Join-Path $PSScriptRoot "Scan-NoLeaks.ps1"
 $noLeaksScannerLauncherPath = Join-Path $PSScriptRoot "Scan-NoLeaks.cmd"
 $noLeaksScannerTestPath = Join-Path $PSScriptRoot "Test-ScanNoLeaks.ps1"
@@ -28,6 +31,9 @@ foreach ($path in @(
         $commonPath,
         $evidenceSpecPath,
         $evidenceContractPath,
+        $sourceFixtureRegistryPath,
+        $sourceFixtureRunnerPath,
+        $sourceFixtureTestPath,
         $noLeaksScannerPath,
         $noLeaksScannerLauncherPath,
         $noLeaksScannerTestPath,
@@ -69,10 +75,35 @@ foreach ($required in @(
         'Test-ScanNoLeaks.ps1',
         'no-leaks-producer-workflow',
         'Candidate-owned installed artifact producer is not implemented.',
-        'Test-ReviewInstalled.ps1')) {
+        'Test-ReviewInstalled.ps1',
+        'Open-SteinSourceBootstrapBinding',
+        'Get-SteinSourceBootstrapStreamSha256',
+        'SteinSourceBootstrapBindings',
+        'source_generator_differs_from_loaded_bootstrap',
+        '$launchArguments[5] = [string]$sourceFixtureRunnerBootstrapBinding[0].full_path')) {
     if ($verifySource.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
         throw "Verify-Source.ps1 is missing a source-evidence invariant."
     }
+}
+$bootstrapRoles = @(
+    [regex]::Matches(
+        $verifySource,
+        "role = '(?<role>harness|package-tools|source-evidence|source-fixture-runner)'") |
+        ForEach-Object { [string]$_.Groups['role'].Value })
+$expectedBootstrapRoles = @(
+    'harness', 'package-tools', 'source-evidence', 'source-fixture-runner')
+if ($bootstrapRoles.Count -ne 4 -or
+    @(Compare-Object `
+        -ReferenceObject $expectedBootstrapRoles `
+        -DifferenceObject $bootstrapRoles `
+        -CaseSensitive).Count -ne 0 -or
+    $verifySource.IndexOf(
+        '$script:SteinSourceBootstrapBindings = @(',
+        [StringComparison]::Ordinal) -gt
+        $verifySource.IndexOf(
+            '. $sourceEvidenceBootstrapBinding[0].full_path',
+            [StringComparison]::Ordinal)) {
+    throw "Verify-Source.ps1 does not lock its exact bootstrap dependencies before import."
 }
 $generatorMatch = [regex]::Match(
     $verifySource,
@@ -96,6 +127,9 @@ $expectedGeneratorRelativePaths = @(
     "scripts/windows/phase2/Verify-Source.ps1",
     "scripts/windows/phase2/Verify-Source.cmd",
     "scripts/windows/phase2/Source-Evidence.ps1",
+    "scripts/windows/phase2/Source-Fixture-Registry.json",
+    "scripts/windows/phase2/Run-Source-Fixture.ps1",
+    "scripts/windows/phase2/Test-SourceFixture.ps1",
     "scripts/windows/phase2/Test-VerifySource.ps1",
     "scripts/windows/phase2/Review-Installed.ps1",
     "scripts/windows/phase2/Review-Installed.cmd",
@@ -117,6 +151,17 @@ if ($generatorRelativePaths.Count -ne $expectedGeneratorRelativePaths.Count -or
 }
 $evidenceSpec = Get-Content -LiteralPath $evidenceSpecPath -Raw -Encoding UTF8 |
     ConvertFrom-Json -ErrorAction Stop
+$sourceFixtureRegistry = Get-Content `
+    -LiteralPath $sourceFixtureRegistryPath `
+    -Raw `
+    -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+$sourceFixtureRegistrySha256 = Get-SteinSourceEvidenceSha256 `
+    -Path $sourceFixtureRegistryPath
+if ([string]$evidenceSpec.source_report_contract.source_fixture_registry_sha256 -cne
+        $sourceFixtureRegistrySha256 -or
+    @($sourceFixtureRegistry.fixtures).Count -ne 13) {
+    throw "The evidence specification does not freeze the exact source-fixture registry."
+}
 $contractGeneratorPaths = @(
     $evidenceSpec.source_report_contract.required_generator_paths)
 if ($contractGeneratorPaths.Count -ne $expectedGeneratorRelativePaths.Count -or
@@ -132,6 +177,9 @@ $implementedSourceCheckIds = @(
         '(?ms)(?:Invoke-SteinSourceCheck|Add-SteinNotRunCheck)\s+`?\s*-Id\s+"(?<id>[a-z][a-z0-9-]+)"') |
         ForEach-Object { [string]$_.Groups['id'].Value }
     'source-provenance-stability'
+    @($sourceFixtureRegistry.fixtures | ForEach-Object {
+            [string]$_.source_check_id
+        })
 ) | Sort-Object -Unique
 $contractSourceCheckIds = @(
     @($evidenceSpec.source_report_contract.required_pass_check_ids) +
@@ -143,13 +191,22 @@ if ($implementedSourceCheckIds.Count -ne $contractSourceCheckIds.Count -or
         -CaseSensitive).Count -ne 0) {
     throw "The evidence specification and source check implementations disagree."
 }
-$gateSpecificPlaceholderIds = @(
-    $evidenceSpec.source_report_contract.allowed_not_run_check_ids |
+$gateSpecificFixtureIds = @(
+    $sourceFixtureRegistry.fixtures | ForEach-Object {
+        [string]$_.source_check_id
+    })
+$requiredFixtureIds = @(
+    $evidenceSpec.source_report_contract.required_pass_check_ids |
         Where-Object { [string]$_ -cmatch '^phase2-source-fixture-' })
-if ($gateSpecificPlaceholderIds.Count -ne 13) {
-    throw "The exact gate-specific source-fixture placeholder set is invalid."
+if ($gateSpecificFixtureIds.Count -ne 13 -or
+    $requiredFixtureIds.Count -ne 13 -or
+    @(Compare-Object `
+            -ReferenceObject ($gateSpecificFixtureIds | Sort-Object) `
+            -DifferenceObject ($requiredFixtureIds | Sort-Object) `
+            -CaseSensitive).Count -ne 0) {
+    throw "The exact required gate-specific source-fixture set is invalid."
 }
-$mappedGateSpecificPlaceholderIds = New-Object Collections.Generic.List[string]
+$mappedGateSpecificFixtureIds = New-Object Collections.Generic.List[string]
 foreach ($gate in @($evidenceSpec.gates | Where-Object {
             $null -ne $_.PSObject.Properties['source_subcheck_check_ids']
         })) {
@@ -163,13 +220,13 @@ foreach ($gate in @($evidenceSpec.gates | Where-Object {
         foreach ($mappedId in @($mappedIds | Where-Object {
                     [string]$_ -cmatch '^phase2-source-fixture-'
                 })) {
-            $mappedGateSpecificPlaceholderIds.Add([string]$mappedId)
+            $mappedGateSpecificFixtureIds.Add([string]$mappedId)
         }
     }
 }
 if (@(Compare-Object `
-        -ReferenceObject ($gateSpecificPlaceholderIds | Sort-Object -Unique) `
-        -DifferenceObject ($mappedGateSpecificPlaceholderIds | Sort-Object -Unique) `
+        -ReferenceObject ($gateSpecificFixtureIds | Sort-Object -Unique) `
+        -DifferenceObject ($mappedGateSpecificFixtureIds | Sort-Object -Unique) `
         -CaseSensitive).Count -ne 0) {
     throw "The gate-specific source-fixture mappings are incomplete."
 }
@@ -409,6 +466,9 @@ $generator = Get-SteinSourceEvidenceGenerator `
         $verifyPath,
         $launcherPath,
         $helperPath,
+        $sourceFixtureRegistryPath,
+        $sourceFixtureRunnerPath,
+        $sourceFixtureTestPath,
         $PSCommandPath,
         $reviewerPath,
         $reviewerLauncherPath,
@@ -422,7 +482,7 @@ $generator = Get-SteinSourceEvidenceGenerator `
         $packageToolsPath)
 $generatorJson = $generator | ConvertTo-Json -Depth 8 -Compress
 if ([int]$generator.schema_version -ne 1 -or
-    @($generator.files).Count -ne 14 -or
+    @($generator.files).Count -ne 17 -or
     [string]$generator.digest_sha256 -notmatch '^[0-9a-f]{64}$' -or
     $generatorJson.IndexOf($repoRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
     throw "Source generator provenance is invalid."
@@ -436,6 +496,69 @@ $junctionPath = Join-Path $fixtureRoot "linked-external"
 try {
     $null = New-Item -ItemType Directory -Path $fixtureRoot -ErrorAction Stop
     $null = New-Item -ItemType Directory -Path $externalFixtureRoot -ErrorAction Stop
+    foreach ($functionName in @(
+            'Get-SteinSourceBootstrapStreamSha256',
+            'Open-SteinSourceBootstrapBinding')) {
+        $functionAst = @($verifyAst.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -ceq $functionName
+                }, $true))
+        if ($functionAst.Count -ne 1) {
+            throw "A source bootstrap lock helper is not uniquely defined."
+        }
+        . ([scriptblock]::Create($functionAst[0].Extent.Text))
+    }
+    $bootstrapProbeRoot = Join-Path $fixtureRoot 'bootstrap-lock-probe'
+    $null = New-Item -ItemType Directory -Path $bootstrapProbeRoot -ErrorAction Stop
+    $bootstrapProbePath = Join-Path $bootstrapProbeRoot 'source.ps1'
+    $bootstrapReplacementPath = Join-Path $bootstrapProbeRoot 'replacement.ps1'
+    [IO.File]::WriteAllText($bootstrapProbePath, 'locked-source-bootstrap')
+    [IO.File]::WriteAllText($bootstrapReplacementPath, 'replacement-source-bootstrap')
+    $bootstrapBinding = Open-SteinSourceBootstrapBinding `
+        -Role 'lock-probe' `
+        -Path $bootstrapProbePath `
+        -RepositoryRoot $fixtureRoot
+    try {
+        $bootstrapWriteRejected = $false
+        try {
+            [IO.File]::WriteAllText($bootstrapProbePath, 'mutated-source-bootstrap')
+        }
+        catch {
+            $bootstrapWriteRejected = $true
+        }
+        $bootstrapReplacementRejected = $false
+        try {
+            Move-Item `
+                -LiteralPath $bootstrapReplacementPath `
+                -Destination $bootstrapProbePath `
+                -Force `
+                -ErrorAction Stop
+        }
+        catch {
+            $bootstrapReplacementRejected = $true
+        }
+        $bootstrapSameHandleSha256 = Get-SteinSourceBootstrapStreamSha256 `
+            -Stream $bootstrapBinding.stream `
+            -FailureCode 'source_bootstrap_source_changed'
+        if (-not $bootstrapWriteRejected -or -not $bootstrapReplacementRejected -or
+            $bootstrapSameHandleSha256 -cne [string]$bootstrapBinding.record.sha256) {
+            throw "The source bootstrap lock allowed a write, replacement, or byte change."
+        }
+    }
+    finally {
+        $bootstrapBinding.stream.Dispose()
+    }
+    if (-not [string]::Equals(
+            [IO.Path]::GetFileName($bootstrapProbeRoot),
+            'bootstrap-lock-probe',
+            [StringComparison]::Ordinal) -or
+        -not [IO.Path]::GetFullPath($bootstrapProbeRoot).StartsWith(
+            "$([IO.Path]::GetFullPath($fixtureRoot).TrimEnd('\', '/'))$([IO.Path]::DirectorySeparatorChar)",
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The source bootstrap probe cleanup target is invalid."
+    }
+    [IO.Directory]::Delete($bootstrapProbeRoot, $true)
     $externalSourcePath = Join-Path $externalFixtureRoot "external-source.ps1"
     [IO.File]::WriteAllText(
         $externalSourcePath,
@@ -597,4 +720,6 @@ finally {
     protocol_version = [string]$contracts.protocol.current
     policy_profile = [string]$contracts.policy.profile_id
     deterministic_root_anchor = $true
+    bootstrap_source_swap_rejected = $true
+    bootstrap_role_set_closed = $true
 }

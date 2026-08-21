@@ -60,7 +60,107 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
-. (Join-Path $PSScriptRoot "PackageTools.ps1")
+
+function Get-SteinBuildBootstrapStreamSha256 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [IO.FileStream] $Stream
+    )
+
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $Stream.Position = 0
+        return [BitConverter]::ToString($sha256.ComputeHash($Stream)).Replace(
+            '-',
+            '').ToLowerInvariant()
+    }
+    finally {
+        $Stream.Position = 0
+        $sha256.Dispose()
+    }
+}
+
+function Open-SteinBuildBootstrapScriptBinding {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Path
+    )
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        $item.Length -lt 1 -or
+        $item.Length -gt 4194304) {
+        throw "A signed-build bootstrap script is not a regular bounded file."
+    }
+    $probe = Split-Path -Parent $item.FullName
+    $volume = [IO.Path]::GetPathRoot($probe)
+    while ($probe.Length -ge $volume.Length) {
+        $directory = Get-Item -LiteralPath $probe -Force -ErrorAction Stop
+        if (-not $directory.PSIsContainer -or
+            (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            throw "A signed-build bootstrap script has an unsafe ancestor."
+        }
+        if ([string]::Equals(
+                $probe,
+                $volume,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $probe = Split-Path -Parent $probe
+    }
+
+    $stream = [IO.FileStream]::new(
+        $item.FullName,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read)
+    try {
+        $length = [long]$stream.Length
+        if ($length -ne [long]$item.Length) {
+            throw "A signed-build bootstrap script changed before it was locked."
+        }
+        return [pscustomobject]@{
+            FullPath = $item.FullName
+            Length = $length
+            Sha256 = Get-SteinBuildBootstrapStreamSha256 -Stream $stream
+            Stream = $stream
+        }
+    }
+    catch {
+        $stream.Dispose()
+        throw
+    }
+}
+
+function Assert-SteinBuildBootstrapScriptBindingStable {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Binding
+    )
+
+    if ([long]$Binding.Stream.Length -ne [long]$Binding.Length -or
+        (Get-SteinBuildBootstrapStreamSha256 -Stream $Binding.Stream) -cne
+            [string]$Binding.Sha256) {
+        throw "A signed-build bootstrap script changed while it was in use."
+    }
+}
+
+$buildBootstrapBindings = New-Object Collections.Generic.List[object]
+$buildBootstrapFailure = $null
+try {
+    $buildScriptBootstrapBinding = Open-SteinBuildBootstrapScriptBinding `
+        -Path $PSCommandPath
+    $buildBootstrapBindings.Add($buildScriptBootstrapBinding)
+    $packageToolsBootstrapBinding = Open-SteinBuildBootstrapScriptBinding `
+        -Path (Join-Path $PSScriptRoot "PackageTools.ps1")
+    $buildBootstrapBindings.Add($packageToolsBootstrapBinding)
+
+    . $packageToolsBootstrapBinding.FullPath
+    foreach ($binding in $buildBootstrapBindings) {
+        $null = Assert-SteinBuildBootstrapScriptBindingStable -Binding $binding
+    }
 
 $repoRoot = Resolve-SteinPackageRegularDirectoryWithAncestors `
     -Path (Join-Path $PSScriptRoot "..\..")
@@ -71,7 +171,11 @@ $bootstrapSourceBinding = Get-SteinVerifiedSourceBuildBinding `
     -ExpectedSourceVerificationSha256 $ExpectedSourceVerificationSha256 `
     -ExpectedSourceRootAnchorSha256 $ExpectedSourceRootAnchorSha256 `
     -ExpectedCandidateGitCommit $ExpectedCandidateGitCommit `
-    -ExpectedCandidateGitTree $ExpectedCandidateGitTree
+    -ExpectedCandidateGitTree $ExpectedCandidateGitTree `
+    -BootstrapOnly
+if ([string]$bootstrapSourceBinding.CandidateBindingScope -cne "bootstrap_only") {
+    throw "The initial source binding exceeded its bootstrap-only scope."
+}
 $toolchain = Get-SteinVerifiedBuildToolchain `
     -SourceBinding $bootstrapSourceBinding `
     -WorkingDirectory $repoRoot
@@ -91,15 +195,24 @@ try {
         -ExpectedCommit $ExpectedCandidateGitCommit `
         -ExpectedTree $ExpectedCandidateGitTree `
         -BuildRoot $buildRoot
+    $sourceLocks = Open-SteinExactCandidateSnapshotLocks -Snapshot $snapshot
     $sourceBinding = Get-SteinVerifiedSourceBuildBinding `
         -RepositoryRoot $repoRoot `
         -CandidateRoot $snapshot.Root `
+        -CandidateSnapshot $snapshot `
         -SourceVerificationReportPath $SourceVerificationReportPath `
         -SourceRootAnchorPath $SourceRootAnchorPath `
         -ExpectedSourceVerificationSha256 $ExpectedSourceVerificationSha256 `
         -ExpectedSourceRootAnchorSha256 $ExpectedSourceRootAnchorSha256 `
         -ExpectedCandidateGitCommit $ExpectedCandidateGitCommit `
         -ExpectedCandidateGitTree $ExpectedCandidateGitTree
+    if ([string]$sourceBinding.CandidateBindingScope -cne
+            "authoritative_locked_snapshot" -or
+        [long]$sourceBinding.CandidateTreeFileCount -ne @($snapshot.Files).Count -or
+        -not (Test-SteinPackageSha256Value `
+            -Value ([string]$sourceBinding.CandidateTreeManifestSha256))) {
+        throw "The authoritative source binding did not ground the locked candidate tree."
+    }
     foreach ($bindingProperty in @(
             "GitExecutableSha256", "GitResolvedExecutableSha256",
             "CargoExecutableSha256",
@@ -112,7 +225,6 @@ try {
             throw "The private candidate uses a different source toolchain contract."
         }
     }
-    $sourceLocks = Open-SteinExactCandidateSnapshotLocks -Snapshot $snapshot
     $candidateBuildScript = Resolve-SteinPackageRegularFileUnderRoot `
         -Root $snapshot.Root `
         -Path (Join-Path $snapshot.Root "packaging\windows-msix\Build-Msix.ps1")
@@ -121,25 +233,20 @@ try {
         -Path (Join-Path $snapshot.Root "packaging\windows-msix\PackageTools.ps1")
     $candidateBuildScriptHash = Get-SteinPackageFileSha256 -Path $candidateBuildScript
     $candidatePackageToolsHash = Get-SteinPackageFileSha256 -Path $candidatePackageTools
-    if ((Get-SteinPackageFileSha256 -Path $PSCommandPath) -cne
-            $candidateBuildScriptHash -or
-        (Get-SteinPackageFileSha256 -Path (Join-Path $PSScriptRoot "PackageTools.ps1")) -cne
-            $candidatePackageToolsHash) {
+    if ([long]$buildScriptBootstrapBinding.Length -ne
+            [long](Get-Item -LiteralPath $candidateBuildScript -Force).Length -or
+        [string]$buildScriptBootstrapBinding.Sha256 -cne $candidateBuildScriptHash -or
+        [long]$packageToolsBootstrapBinding.Length -ne
+            [long](Get-Item -LiteralPath $candidatePackageTools -Force).Length -or
+        [string]$packageToolsBootstrapBinding.Sha256 -cne $candidatePackageToolsHash) {
         throw "The running packaging scripts differ from the exact candidate tree."
     }
-    $candidateBuildScriptLock = Open-SteinPackageVerifiedFileLock `
-        -Path $PSCommandPath `
-        -ExpectedSha256 $candidateBuildScriptHash
-    $candidatePackageToolsLock = Open-SteinPackageVerifiedFileLock `
-        -Path (Join-Path $PSScriptRoot "PackageTools.ps1") `
-        -ExpectedSha256 $candidatePackageToolsHash
+    $candidateBuildScriptLock = $buildScriptBootstrapBinding
+    $candidatePackageToolsLock = $packageToolsBootstrapBinding
 }
 catch {
     if ($null -ne $sourceLocks) {
         foreach ($stream in $sourceLocks.Streams) { $stream.Dispose() }
-    }
-    foreach ($lockedScript in @($candidateBuildScriptLock, $candidatePackageToolsLock)) {
-        if ($null -ne $lockedScript) { $lockedScript.Stream.Dispose() }
     }
     foreach ($lockedTool in $toolchain.Locks) { $lockedTool.Stream.Dispose() }
     if (Test-Path -LiteralPath $buildRoot) {
@@ -846,9 +953,6 @@ finally {
     if ($null -ne $sourceLocks) {
         foreach ($stream in $sourceLocks.Streams) { $stream.Dispose() }
     }
-    foreach ($lockedScript in @($candidateBuildScriptLock, $candidatePackageToolsLock)) {
-        if ($null -ne $lockedScript) { $lockedScript.Stream.Dispose() }
-    }
     foreach ($lockedTool in $toolchain.Locks) { $lockedTool.Stream.Dispose() }
     foreach ($environmentName in @($previousEnvironment.Keys)) {
         [Environment]::SetEnvironmentVariable(
@@ -872,4 +976,26 @@ finally {
             -Path $buildRoot `
             -Purpose "build"
     }
+}
+}
+catch {
+    $buildBootstrapFailure = $_
+}
+finally {
+    foreach ($binding in $buildBootstrapBindings) {
+        try {
+            $null = Assert-SteinBuildBootstrapScriptBindingStable -Binding $binding
+        }
+        catch {
+            if ($null -eq $buildBootstrapFailure) {
+                $buildBootstrapFailure = $_
+            }
+        }
+        finally {
+            $binding.Stream.Dispose()
+        }
+    }
+}
+if ($null -ne $buildBootstrapFailure) {
+    throw $buildBootstrapFailure
 }

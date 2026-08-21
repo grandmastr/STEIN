@@ -205,19 +205,28 @@ evidence; the source report remains source-only content-integrity evidence, not
 installed runtime proof.
 
 The contract maps every named source subcheck to its exact check ID set. A broad
-`rust-tests` pass cannot promote a gate-specific deterministic claim. Thirteen
-gate-specific source-fixture checks therefore remain explicit `not_run` rows
-until closed targeted commands/receipts exist. In addition, every
-`source_verification` subcheck has the common required dependency
-`pinned-clean-build-environment` and `source-report-command-provenance`. They
-are currently `not_run` because `Verify-Source.ps1` still executes the mutable
-worktree, may reuse ignored Rust/frontend outputs, and has no independently
-closed command/argument/working-directory registry; consequently no source-
-backed row can promote from the current report. Native-only rows remain
-independently reviewable.
+`rust-tests` pass cannot promote a gate-specific deterministic claim. The frozen
+source-fixture registry (`SHA-256
+d2414e552dfbc00b3ecf5837cfc431c64f670508ae4e8696b9fce4f85a75c5c5`)
+defines 13 fixtures and 71 ordered subchecks. Its runner exports the exact Git
+tree into an owner-only private directory, uses a fresh Cargo home/target,
+compiles eight closed test harnesses, requires exact libtest discovery, then
+invokes only the hash-locked test binaries. The 140 registry mappings collapse
+to 117 per-fixture execution records (107 globally unique test identities), and
+each content-free receipt binds the candidate tree, semantic source files,
+compiler environment, harness binary, exact command, result, and suite index.
 
-The source-report contract fixes 44 exact checks—25 required `pass` rows and 19
-allowed `not_run`/`pass` rows—and fourteen generator files.
+Every `source_verification` subcheck additionally depends on all three frozen
+checks: `native-toolchain-provenance`, `pinned-clean-build-environment`, and
+`source-report-command-provenance`. They remain exact `not_run` rows because
+the full authenticated Rust/Git/native dependency closure, immutable isolated
+execution for every non-fixture source check, and independently attested
+commands are not implemented. Consequently the new fixture passes cannot by
+themselves promote a source-backed gate. Native-only rows remain independently
+reviewable.
+
+The source-report contract fixes 44 exact checks—38 required `pass` rows and six
+exact frozen `not_run` rows—and seventeen generator files.
 Source provenance schema 2 binds launcher and rustup-selected Cargo/rustc
 payloads, the pnpm JavaScript entrypoint, and both the Git-for-Windows launcher
 and resolved `mingw64\bin\git.exe` payload without retaining local paths.
@@ -389,8 +398,9 @@ non-reparse file with a valid Authenticode signature whose exact signer Subject
 is Microsoft Corporation; an unsigned earlier PATH entry is rejected. Its
 validated signer Subject, signature status, version, and executable hash are
 retained in the bounded provenance. The verifier samples provenance before and
-after the suite and fails the run if it changes. Its fourteen-file generator
-binds the source verifier, installed reviewer, fail-closed evidence
+after the suite and fails the run if it changes. Its seventeen-file generator
+also binds the frozen source-fixture registry, runner, and contract test along
+with the source verifier, installed reviewer, fail-closed evidence
 specification/contract, no-leaks scanner/launcher/test, and their runtime
 dependencies. The separate passing `no-leaks-scanner-static` source check
 exercises the scanner contract without claiming that the absent real sentinel
@@ -405,12 +415,8 @@ The root is content-integrity evidence only, not a signature, installed identity
 signed-package claim, authenticated reviewer-identity claim, or Phase 2
 completion claim.
 
-The opt-in ignored Windows fixtures can display native UI and temporarily create
-synthetic current-user OS resources. Run them only in an unlocked disposable
-acceptance session:
-
-```text
-scripts\windows\phase2\Verify-Source.cmd -IncludeInteractiveNative
-```
-
-Omitting that switch records the native fixture as `not_run`, not `pass`.
+Interactive/native Windows fixtures are not part of source verification. The
+legacy `-IncludeInteractiveNative` parameter is rejected until a versioned,
+closed native-fixture receipt validator exists. Run native fixtures only through
+the installed acceptance workflow in an unlocked disposable session; the source
+report retains `windows-native-ignored-fixtures` as exact `not_run` evidence.

@@ -3026,4 +3026,44 @@ mod tests {
         assert_eq!(error.code, wire::ErrorCode::PermissionDenied);
         assert_eq!(error.category, wire::ErrorCategory::PermissionDenied);
     }
+
+    #[tokio::test]
+    async fn phase2_secrets_diagnostic_client_cannot_query_model_route_state() {
+        let runtime = runtime();
+        let actor = actor();
+        let route_id = wire::ModelRouteApprovalId::new_v7();
+        let metadata = wire::RequestMetadata::new(
+            wire::Component::TestFixture,
+            wire::SensitivityClass::Restricted,
+            wire::RetentionClass::TransientProcessing,
+        );
+        let request = wire::RequestEnvelope::new(
+            metadata,
+            wire::RequestBody::GetPermissionView(wire::GetPermissionViewRequest {
+                permission_grant_id: None,
+                model_route_approval_id: Some(route_id),
+            }),
+        );
+        let error = runtime
+            .handle_protocol_request_with_context(
+                ProtocolRequestContext {
+                    actor,
+                    client_id: wire::ClientInstanceId::from_uuid(actor.into_uuid()),
+                    assurance: crate::ClientAssurance::Diagnostic,
+                    negotiated_version: wire::ProtocolVersion::V1_2,
+                },
+                &request,
+                1,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, wire::ErrorCode::PermissionDenied);
+        assert_eq!(error.category, wire::ErrorCategory::PermissionDenied);
+        assert!(error.details.is_none());
+        let encoded = serde_json::to_string(&error).unwrap();
+        assert!(!encoded.contains(&route_id.to_string()));
+        assert!(!encoded.contains("secret_ref"));
+    }
 }

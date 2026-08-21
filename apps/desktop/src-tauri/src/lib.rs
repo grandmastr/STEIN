@@ -21,6 +21,44 @@ use view::{
     UpdateUserPreferencesInput, UserPreferencesUpdateView, UserPreferencesView,
 };
 
+macro_rules! with_desktop_commands {
+    ($consumer:ident) => {
+        $consumer![
+            desktop_bootstrap,
+            desktop_refresh,
+            desktop_reconnect,
+            desktop_create_goal,
+            desktop_update_goal,
+            desktop_complete_goal,
+            desktop_abandon_goal,
+            desktop_delete_goal,
+            desktop_setup_model_route,
+            desktop_grant_permission,
+            desktop_revoke_permission,
+            desktop_start_focus_session,
+            desktop_register_selected_resource,
+            desktop_remove_selected_resource,
+            desktop_update_user_preferences,
+            desktop_get_stein_identity,
+            desktop_get_user_preferences,
+            desktop_get_effective_policy,
+            desktop_get_selected_resources,
+            desktop_set_interventions_muted,
+            desktop_end_focus_session,
+            desktop_record_intervention_feedback,
+            desktop_explain_intervention,
+            desktop_get_intervention_history,
+            desktop_get_latest_model_request_receipt,
+        ]
+    };
+}
+
+macro_rules! generate_desktop_handler {
+    ($($command:ident),* $(,)?) => {
+        tauri::generate_handler![$($command),*]
+    };
+}
+
 #[tauri::command]
 async fn desktop_bootstrap(
     app: AppHandle,
@@ -284,33 +322,7 @@ pub fn run() {
 
     let builder = tauri::Builder::default()
         .manage(CoreBridge::default())
-        .invoke_handler(tauri::generate_handler![
-            desktop_bootstrap,
-            desktop_refresh,
-            desktop_reconnect,
-            desktop_create_goal,
-            desktop_update_goal,
-            desktop_complete_goal,
-            desktop_abandon_goal,
-            desktop_delete_goal,
-            desktop_setup_model_route,
-            desktop_grant_permission,
-            desktop_revoke_permission,
-            desktop_start_focus_session,
-            desktop_register_selected_resource,
-            desktop_remove_selected_resource,
-            desktop_update_user_preferences,
-            desktop_get_stein_identity,
-            desktop_get_user_preferences,
-            desktop_get_effective_policy,
-            desktop_get_selected_resources,
-            desktop_set_interventions_muted,
-            desktop_end_focus_session,
-            desktop_record_intervention_feedback,
-            desktop_explain_intervention,
-            desktop_get_intervention_history,
-            desktop_get_latest_model_request_receipt,
-        ]);
+        .invoke_handler(with_desktop_commands!(generate_desktop_handler));
 
     #[cfg(windows)]
     let builder = builder.setup(move |app| {
@@ -323,4 +335,48 @@ pub fn run() {
     builder
         .run(tauri::generate_context!())
         .expect("failed to run STEIN desktop presentation");
+}
+
+#[cfg(test)]
+mod phase2_secrets_tests {
+    macro_rules! command_names {
+        ($($command:ident),* $(,)?) => {
+            &[$(stringify!($command)),*]
+        };
+    }
+
+    #[test]
+    fn phase2_secrets_tauri_command_surface_is_closed_and_value_free() {
+        let actual = with_desktop_commands!(command_names);
+        assert_eq!(
+            actual,
+            &[
+                "desktop_bootstrap",
+                "desktop_refresh",
+                "desktop_reconnect",
+                "desktop_create_goal",
+                "desktop_update_goal",
+                "desktop_complete_goal",
+                "desktop_abandon_goal",
+                "desktop_delete_goal",
+                "desktop_setup_model_route",
+                "desktop_grant_permission",
+                "desktop_revoke_permission",
+                "desktop_start_focus_session",
+                "desktop_register_selected_resource",
+                "desktop_remove_selected_resource",
+                "desktop_update_user_preferences",
+                "desktop_get_stein_identity",
+                "desktop_get_user_preferences",
+                "desktop_get_effective_policy",
+                "desktop_get_selected_resources",
+                "desktop_set_interventions_muted",
+                "desktop_end_focus_session",
+                "desktop_record_intervention_feedback",
+                "desktop_explain_intervention",
+                "desktop_get_intervention_history",
+                "desktop_get_latest_model_request_receipt",
+            ]
+        );
+    }
 }

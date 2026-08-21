@@ -692,3 +692,151 @@ fn fixtures_and_public_errors_are_privacy_safe() {
     assert!(!display.contains("DO_NOT_ECHO"));
     assert!(display.contains("line"));
 }
+
+#[test]
+fn phase2_secrets_protocol_surface_is_closed_and_value_free() {
+    let actual_request_kinds = RequestKind::ALL
+        .into_iter()
+        .map(|kind| {
+            serde_json::to_value(kind)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<BTreeSet<_>>();
+    let expected_request_kinds = [
+        "abandon_goal",
+        "approve_model_route",
+        "complete_goal",
+        "create_goal",
+        "delay_echo",
+        "delete_goal",
+        "end_focus_session",
+        "explain_intervention",
+        "get_capability_health",
+        "get_effective_policy",
+        "get_focus_session_view",
+        "get_goal",
+        "get_intervention_history",
+        "get_permission_view",
+        "get_runtime_status",
+        "get_selected_resources",
+        "get_snapshot",
+        "get_stein_identity",
+        "get_user_preferences",
+        "grant_session_permission",
+        "record_intervention_feedback",
+        "register_selected_resource",
+        "remove_selected_resource",
+        "revoke_permission",
+        "set_interventions_muted",
+        "shutdown",
+        "start_focus_session",
+        "update_goal",
+        "update_user_preferences",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    assert_eq!(actual_request_kinds, expected_request_kinds);
+
+    let requests = fixture::<Vec<RequestBody>>(PHASE_2_REQUEST_FIXTURE);
+    let RequestBody::ApproveModelRoute(request) = requests
+        .iter()
+        .find(|request| request.kind() == RequestKind::ApproveModelRoute)
+        .expect("model-route approval request fixture")
+    else {
+        unreachable!();
+    };
+    let mut request = request.as_ref().clone();
+    request.fallback = Some(request.route.clone());
+    let ApproveModelRouteRequest {
+        route: _,
+        account_profile: _,
+        allowed_data_categories: _,
+        handling: _,
+        purpose: _,
+        maximum_request_tokens: _,
+        fallback: _,
+        expires_at: _,
+        disclosure_version: _,
+    } = &request;
+    let encoded_request = serde_json::to_value(request).unwrap();
+    let request_fields = encoded_request
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        request_fields,
+        BTreeSet::from([
+            "account_profile",
+            "allowed_data_categories",
+            "disclosure_version",
+            "expires_at",
+            "fallback",
+            "handling",
+            "maximum_request_tokens",
+            "purpose",
+            "route",
+        ])
+    );
+
+    let responses = fixture::<Vec<ResponseBody>>(PHASE_2_RESPONSE_FIXTURE);
+    let ResponseBody::ApproveModelRoute(response) = responses
+        .iter()
+        .find(|response| response.kind() == RequestKind::ApproveModelRoute)
+        .expect("model-route approval response fixture")
+    else {
+        unreachable!();
+    };
+    let mut approval = response.approval.clone();
+    approval.fallback = Some(approval.route.clone());
+    approval.revoked_at = Some(approval.effective_at);
+    let ModelRouteApprovalView {
+        model_route_approval_id: _,
+        revision: _,
+        owner_id: _,
+        route: _,
+        account_profile: _,
+        allowed_data_categories: _,
+        handling: _,
+        purpose: _,
+        maximum_request_tokens: _,
+        fallback: _,
+        state: _,
+        effective_at: _,
+        expires_at: _,
+        revoked_at: _,
+        disclosure_version: _,
+    } = &approval;
+    let encoded_response = serde_json::to_value(&approval).unwrap();
+    let response_fields = encoded_response
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        response_fields,
+        BTreeSet::from([
+            "account_profile",
+            "allowed_data_categories",
+            "disclosure_version",
+            "effective_at",
+            "expires_at",
+            "fallback",
+            "handling",
+            "maximum_request_tokens",
+            "model_route_approval_id",
+            "owner_id",
+            "purpose",
+            "revision",
+            "revoked_at",
+            "route",
+            "state",
+        ])
+    );
+}

@@ -28,7 +28,37 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 3.0
 
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..\..")).Path
-function Get-SteinInstalledBootstrapFileRecord {
+function Get-SteinInstalledLockedStreamSha256 {
+    param(
+        [Parameter(Mandatory = $true)][IO.FileStream] $Stream,
+        [Parameter(Mandatory = $true)][string] $FailureCode
+    )
+
+    if (-not $Stream.CanRead -or -not $Stream.CanSeek) {
+        throw $FailureCode
+    }
+    try {
+        $Stream.Position = 0
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            return [BitConverter]::ToString($sha256.ComputeHash($Stream)).
+                Replace("-", "").ToLowerInvariant()
+        }
+        finally {
+            $sha256.Dispose()
+        }
+    }
+    catch {
+        throw $FailureCode
+    }
+    finally {
+        if ($Stream.CanSeek) {
+            $Stream.Position = 0
+        }
+    }
+}
+
+function Open-SteinInstalledBootstrapFileBinding {
     param(
         [Parameter(Mandatory = $true)][string] $Role,
         [Parameter(Mandatory = $true)][string] $Path,
@@ -43,6 +73,27 @@ function Get-SteinInstalledBootstrapFileRecord {
     if (-not $resolved.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
         throw "A runtime evidence source is outside the repository."
     }
+    $probe = Split-Path -Parent $resolved
+    while ($probe.Length -ge $repository.Length) {
+        $ancestor = Get-Item -LiteralPath $probe -Force -ErrorAction Stop
+        if (-not $ancestor.PSIsContainer -or
+            (($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            throw "A runtime evidence source has an invalid ancestor."
+        }
+        if ([string]::Equals(
+                $probe,
+                $repository,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $parent = Split-Path -Parent $probe
+        if ([string]::IsNullOrWhiteSpace($parent) -or
+            [string]::Equals($parent, $probe, [StringComparison]::OrdinalIgnoreCase) -or
+            -not $parent.StartsWith($repository, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "A runtime evidence source has an invalid ancestor."
+        }
+        $probe = $parent
+    }
     $item = Get-Item -LiteralPath $resolved -Force -ErrorAction Stop
     if ($item.PSIsContainer -or
         (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
@@ -55,23 +106,32 @@ function Get-SteinInstalledBootstrapFileRecord {
         [IO.FileAccess]::Read,
         [IO.FileShare]::Read)
     try {
-        $sha256 = [Security.Cryptography.SHA256]::Create()
-        try {
-            $digest = [BitConverter]::ToString($sha256.ComputeHash($stream))
-            $digest = $digest.Replace("-", "").ToLowerInvariant()
+        if ($stream.Length -ne [long]$item.Length) {
+            throw "A runtime evidence source changed during capture."
         }
-        finally {
-            $sha256.Dispose()
+        $digest = Get-SteinInstalledLockedStreamSha256 `
+            -Stream $stream `
+            -FailureCode "runtime_source_set_changed"
+        $current = Get-Item -LiteralPath $item.FullName -Force -ErrorAction Stop
+        if ($current.PSIsContainer -or
+            (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            [long]$current.Length -ne [long]$item.Length) {
+            throw "A runtime evidence source changed during capture."
+        }
+        return [pscustomobject]@{
+            record = [pscustomobject]@{
+                role = $Role
+                path = $item.FullName.Substring($repository.Length + 1).Replace("\", "/")
+                size = [long]$item.Length
+                sha256 = $digest
+            }
+            full_path = $item.FullName
+            stream = $stream
         }
     }
-    finally {
+    catch {
         $stream.Dispose()
-    }
-    return [pscustomobject]@{
-        role = $Role
-        path = $item.FullName.Substring($repository.Length + 1).Replace("\", "/")
-        size = [long]$item.Length
-        sha256 = $digest
+        throw
     }
 }
 
@@ -87,6 +147,10 @@ $script:SteinInstalledRuntimeSourceDefinitions = @(
         role = "evidence-spec"
         path = (Join-Path $PSScriptRoot "Evidence-Spec.json")
     },
+    [pscustomobject]@{
+        role = "source-fixture-registry"
+        path = (Join-Path $PSScriptRoot "Source-Fixture-Registry.json")
+    },
     [pscustomobject]@{ role = "phase2-status"; path = (Join-Path $PSScriptRoot "Status.ps1") },
     [pscustomobject]@{
         role = "package-tools"
@@ -97,15 +161,36 @@ $script:SteinInstalledRuntimeSourceDefinitions = @(
         path = (Join-Path $repoRoot "packaging\windows-msix\Verify-Msix.ps1")
     }
 ) | Sort-Object role
-$script:SteinInstalledInitialRuntimeSources = @(
+$script:SteinInstalledRuntimeSourceBindings = @(
     $script:SteinInstalledRuntimeSourceDefinitions | ForEach-Object {
-        Get-SteinInstalledBootstrapFileRecord `
+        Open-SteinInstalledBootstrapFileBinding `
             -Role $_.role `
             -Path $_.path `
             -RepositoryRoot $repoRoot
     }
 )
-. (Join-Path $PSScriptRoot "Common.ps1")
+$script:SteinInstalledInitialRuntimeSources = @(
+    $script:SteinInstalledRuntimeSourceBindings | ForEach-Object { $_.record })
+$msixVerifierBinding = @($script:SteinInstalledRuntimeSourceBindings | Where-Object {
+        [string]$_.record.role -ceq "msix-verifier"
+    })
+if ($msixVerifierBinding.Count -ne 1) {
+    throw "runtime_source_set_changed"
+}
+$script:SteinPhase2MsixVerifierPath = [string]$msixVerifierBinding[0].full_path
+$commonBinding = @($script:SteinInstalledRuntimeSourceBindings | Where-Object {
+        [string]$_.record.role -ceq "phase2-common"
+    })
+if ($commonBinding.Count -ne 1) {
+    throw "runtime_source_set_changed"
+}
+. $commonBinding[0].full_path
+if ((Get-SteinInstalledLockedStreamSha256 `
+            -Stream $commonBinding[0].stream `
+            -FailureCode "runtime_source_set_changed") -cne
+        [string]$commonBinding[0].record.sha256) {
+    throw "runtime_source_set_changed"
+}
 
 $script:SteinPhase2GateIds = @(
     "P2-BUILD",
@@ -142,7 +227,19 @@ $script:SteinPhase2GateIds = @(
     "P2-PORTABLE-FIXTURE"
 )
 $script:SteinPhase2ExpectedPolicyProfileId = "phase2-focus-v1"
-. (Join-Path $PSScriptRoot "Evidence-Contract.ps1")
+$evidenceContractBinding = @($script:SteinInstalledRuntimeSourceBindings | Where-Object {
+        [string]$_.record.role -ceq "evidence-contract"
+    })
+if ($evidenceContractBinding.Count -ne 1) {
+    throw "runtime_source_set_changed"
+}
+. $evidenceContractBinding[0].full_path
+if ((Get-SteinInstalledLockedStreamSha256 `
+            -Stream $evidenceContractBinding[0].stream `
+            -FailureCode "runtime_source_set_changed") -cne
+        [string]$evidenceContractBinding[0].record.sha256) {
+    throw "runtime_source_set_changed"
+}
 $script:SteinPhase2EvidenceSpecificationPath = Join-Path $PSScriptRoot "Evidence-Spec.json"
 $initialEvidenceSpecification = @($script:SteinInstalledInitialRuntimeSources | Where-Object {
         [string]$_.role -ceq "evidence-spec"
@@ -156,6 +253,16 @@ $script:SteinPhase2EvidenceSpecification = Read-SteinPhase2EvidenceSpecification
     -Path $script:SteinPhase2EvidenceSpecificationPath `
     -ExpectedGateIds $script:SteinPhase2GateIds `
     -ExpectedSha256 $script:SteinPhase2EvidenceSpecificationSha256
+$initialSourceFixtureRegistry = @(
+    $script:SteinInstalledInitialRuntimeSources | Where-Object {
+        [string]$_.role -ceq 'source-fixture-registry'
+    })
+if ($initialSourceFixtureRegistry.Count -ne 1) {
+    throw 'source_fixture_registry_runtime_source_missing'
+}
+$script:SteinPhase2SourceFixtureRegistry = Read-SteinPhase2SourceFixtureRegistry `
+    -Path (Join-Path $PSScriptRoot 'Source-Fixture-Registry.json') `
+    -ExpectedSha256 ([string]$initialSourceFixtureRegistry[0].sha256)
 $script:SteinInstalledChecks = New-Object Collections.Generic.List[object]
 $script:SteinInstalledAttachments = @()
 $script:SteinInstalledExternalEvidenceFiles = @{}
@@ -218,31 +325,32 @@ function Resolve-SteinInstalledWindowsPowerShell {
     return $item.FullName
 }
 
-function Get-SteinInstalledCurrentRuntimeSources {
-    return @(
-        $script:SteinInstalledRuntimeSourceDefinitions | ForEach-Object {
-            Get-SteinInstalledBootstrapFileRecord `
-                -Role $_.role `
-                -Path $_.path `
-                -RepositoryRoot $repoRoot
-        }
-    )
-}
-
 function Assert-SteinInstalledRuntimeSourcesStable {
-    $current = @(Get-SteinInstalledCurrentRuntimeSources)
+    $bindings = @($script:SteinInstalledRuntimeSourceBindings)
     $expected = @($script:SteinInstalledInitialRuntimeSources)
-    if ($current.Count -ne $expected.Count) {
+    if ($bindings.Count -ne $expected.Count) {
         throw "runtime_source_set_changed"
     }
     for ($index = 0; $index -lt $expected.Count; $index++) {
+        $binding = $bindings[$index]
         foreach ($property in @("role", "path", "size", "sha256")) {
-            if ([string]$current[$index].$property -cne [string]$expected[$index].$property) {
+            if ([string]$binding.record.$property -cne [string]$expected[$index].$property) {
                 throw "runtime_source_set_changed"
             }
         }
+        $item = Get-Item -LiteralPath $binding.full_path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or
+            (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            [long]$item.Length -ne [long]$expected[$index].size -or
+            [long]$binding.stream.Length -ne [long]$expected[$index].size -or
+            (Get-SteinInstalledLockedStreamSha256 `
+                -Stream $binding.stream `
+                -FailureCode "runtime_source_set_changed") -cne
+                [string]$expected[$index].sha256) {
+            throw "runtime_source_set_changed"
+        }
     }
-    return $current
+    return @($script:SteinInstalledInitialRuntimeSources | ForEach-Object { $_ })
 }
 
 function Get-SteinInstalledPathToken {
@@ -853,7 +961,10 @@ function Read-SteinInstalledAttachments {
                 -EvidenceResult $nativeResult `
                 -SourceReport $sourceReport `
                 -SourceRootAnchor $sourceRoot `
-                -EvidenceSpecification $script:SteinPhase2EvidenceSpecification.specification
+                -EvidenceSpecification $script:SteinPhase2EvidenceSpecification.specification `
+                -SourceFixtureRegistry $script:SteinPhase2SourceFixtureRegistry.value `
+                -SourceFixtureRegistrySha256 `
+                    ([string]$script:SteinPhase2SourceFixtureRegistry.sha256)
             if ($gateId -ceq "P2-PORTABLE-FIXTURE") {
                 $linuxPath = $underlyingArtifactPaths[
                     [string]$nativeResult.bindings.linux_artifact.artifact_id]
@@ -1037,7 +1148,13 @@ $hostArtifact = Write-SteinInstalledEvidenceJson -RelativePath "host.json" -Valu
 
 $packagePathToken = Get-SteinInstalledPathToken -Path $PackagePath
 $installRootToken = Get-SteinInstalledPathToken -Path $InstallRoot
-$statusScript = Join-Path $PSScriptRoot "Status.ps1"
+$statusBinding = @($script:SteinInstalledRuntimeSourceBindings | Where-Object {
+        [string]$_.record.role -ceq "phase2-status"
+    })
+if ($statusBinding.Count -ne 1) {
+    throw "runtime_source_set_changed"
+}
+$statusScript = [string]$statusBinding[0].full_path
 $statusScriptToken = Get-SteinInstalledPathToken -Path $statusScript
 
 $preflightCommand = New-SteinInstalledCommandRecord `
@@ -1791,6 +1908,7 @@ $rootAnchorArtifact = Write-SteinInstalledEvidenceJson `
     -Value $rootAnchor
 Assert-SteinInstalledExternalEvidenceFilesStable
 Protect-SteinPhase2OwnerOnlyTree -Root $script:SteinInstalledEvidencePath
+$null = Assert-SteinInstalledRuntimeSourcesStable
 
 $evidenceDisplayPath = $script:SteinInstalledEvidencePath.Substring($repoRoot.Length + 1)
 $evidenceDisplayPath = $evidenceDisplayPath.Replace("\", "/")

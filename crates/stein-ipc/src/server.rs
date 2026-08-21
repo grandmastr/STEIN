@@ -352,7 +352,7 @@ mod implementation {
                     result?;
                     let connected = listener;
                     listener = admission.create_listener(&pipe_name, false)?;
-                    let Ok(permit) = connections.clone().try_acquire_owned() else {
+                    let Some(permit) = try_admit_connection(&connections) else {
                         warn!("connection rejected at configured limit");
                         drop(connected);
                         continue;
@@ -406,6 +406,10 @@ mod implementation {
         }
         info!("local protocol server stopped");
         Ok(())
+    }
+
+    fn try_admit_connection(connections: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+        connections.clone().try_acquire_owned().ok()
     }
 
     fn validate_config(config: &ServerConfig) -> Result<(), ServerError> {
@@ -1638,6 +1642,86 @@ mod implementation {
                 CancellationStatus::CancellationRequested
             );
             assert!(token.is_cancelled());
+        }
+
+        #[test]
+        fn phase2_source_fixture_phase1_regression_preserves_server_contracts() {
+            let negotiated = negotiate_protocol(ProtocolSupport::V1, ProtocolSupport::V1)
+                .expect("the retained protocol range must negotiate");
+            assert_eq!(negotiated, ProtocolVersion::CURRENT);
+            assert!(matches!(
+                negotiate_protocol(
+                    ProtocolSupport {
+                        major: ProtocolSupport::V1.major + 1,
+                        minimum_minor: 0,
+                        maximum_minor: 0,
+                    },
+                    ProtocolSupport::V1,
+                ),
+                Err(stein_protocol::CompatibilityError::MajorVersionMismatch { .. })
+            ));
+
+            let config = ServerConfig::default();
+            assert_eq!(config.maximum_connections, 8);
+            let connections = Arc::new(Semaphore::new(config.maximum_connections));
+            let active_connections = Arc::new(AtomicU32::new(0));
+            let mut admitted = Vec::with_capacity(config.maximum_connections);
+            for _ in 0..config.maximum_connections {
+                let permit = try_admit_connection(&connections)
+                    .expect("every configured connection slot must admit once");
+                admitted.push(ActiveConnectionGuard::new(
+                    active_connections.clone(),
+                    permit,
+                ));
+            }
+            assert_eq!(
+                active_connections.load(Ordering::SeqCst),
+                config.maximum_connections as u32
+            );
+            assert!(
+                try_admit_connection(&connections).is_none(),
+                "the first connection beyond the configured limit must be rejected"
+            );
+
+            drop(admitted.pop().expect("one admitted connection"));
+            assert_eq!(
+                active_connections.load(Ordering::SeqCst),
+                (config.maximum_connections - 1) as u32
+            );
+            let replacement = ActiveConnectionGuard::new(
+                active_connections.clone(),
+                try_admit_connection(&connections)
+                    .expect("a released connection slot must admit a replacement"),
+            );
+            assert_eq!(
+                active_connections.load(Ordering::SeqCst),
+                config.maximum_connections as u32
+            );
+            drop(replacement);
+            drop(admitted);
+            assert_eq!(active_connections.load(Ordering::SeqCst), 0);
+            assert_eq!(connections.available_permits(), config.maximum_connections);
+
+            let request_id = RequestId::new_v7();
+            let cancellation_id = CancellationId::new_v7();
+            let cancellation = CancellationToken::new();
+            let in_flight = HashMap::from([(
+                request_id,
+                InFlightRequest {
+                    cancellation_id: Some(cancellation_id),
+                    token: cancellation.clone(),
+                },
+            )]);
+            assert_eq!(
+                request_cancellation(&in_flight, request_id, CancellationId::new_v7()),
+                CancellationStatus::RequestNotFound
+            );
+            assert!(!cancellation.is_cancelled());
+            assert_eq!(
+                request_cancellation(&in_flight, request_id, cancellation_id),
+                CancellationStatus::CancellationRequested
+            );
+            assert!(cancellation.is_cancelled());
         }
 
         #[test]

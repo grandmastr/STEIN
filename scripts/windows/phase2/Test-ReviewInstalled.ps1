@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([switch] $ReviewTestLibraryOnly)
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 3.0
@@ -9,8 +9,11 @@ $launcherPath = Join-Path $PSScriptRoot "Review-Installed.cmd"
 $commonPath = Join-Path $PSScriptRoot "Common.ps1"
 $contractPath = Join-Path $PSScriptRoot "Evidence-Contract.ps1"
 $specificationPath = Join-Path $PSScriptRoot "Evidence-Spec.json"
+$sourceFixtureRegistryPath = Join-Path $PSScriptRoot "Source-Fixture-Registry.json"
+$sourceFixtureTestPath = Join-Path $PSScriptRoot "Test-SourceFixture.ps1"
 foreach ($requiredPath in @(
-        $reviewerPath, $launcherPath, $commonPath, $contractPath, $specificationPath)) {
+        $reviewerPath, $launcherPath, $commonPath, $contractPath, $specificationPath,
+        $sourceFixtureRegistryPath, $sourceFixtureTestPath)) {
     if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
         throw "The installed evidence reviewer fixture is incomplete."
     }
@@ -130,6 +133,9 @@ foreach ($requiredLiteral in @(
         "Assert-SteinPhase2NoLeaksReceiptPair",
         "Read-SteinReviewJsonFile",
         "[IO.FileShare]::Read",
+        "Open-SteinReviewBootstrapFileBinding",
+        "Get-SteinReviewLockedStreamSha256",
+        "SteinReviewRuntimeSourceBindings",
         "review_underlying_artifact_hash_or_size_mismatch",
         "source_check_ids",
         "cli_executable_size",
@@ -177,6 +183,7 @@ if ($launcher -match '(?im)^\s*powershell\.exe(?:\s|$)' -or
 
 . $commonPath
 . (Join-Path $PSScriptRoot "Evidence-Contract.ps1")
+. $sourceFixtureTestPath -FixtureTestLibraryOnly
 $evidenceSpecificationPath = Join-Path $PSScriptRoot "Evidence-Spec.json"
 $evidenceSpecificationSha256 = Get-SteinPhase2Sha256 -Path $evidenceSpecificationPath
 $evidenceSpecification = Read-SteinPhase2EvidenceSpecification `
@@ -265,6 +272,10 @@ function Get-SteinReviewTestCollectorRuntimeSources {
             path = "scripts/windows/phase2/Evidence-Spec.json"
         },
         [pscustomobject]@{
+            role = "source-fixture-registry"
+            path = "scripts/windows/phase2/Source-Fixture-Registry.json"
+        },
+        [pscustomobject]@{
             role = "phase2-status"
             path = "scripts/windows/phase2/Status.ps1"
         }
@@ -293,7 +304,9 @@ function New-SteinReviewSyntheticFixture {
         [switch] $PinnedExecutionNotRun,
         [switch] $CommandProvenanceNotRun,
         [switch] $PortableAttestationNotRun,
-        [switch] $MismatchedPackageBinding
+        [switch] $MismatchedPackageBinding,
+        [switch] $CorruptSourceFixtureReceipt,
+        [string] $PromoteFrozenSourceCheckId
     )
 
     $evidenceRoot = Join-Path $Root "evidence"
@@ -472,72 +485,33 @@ function New-SteinReviewSyntheticFixture {
     $nativePaths = @{}
     $screenshotAttachmentId = "screenshot-p2-build"
     $sourceCommit = "8" * 40
+    $sourceTree = "c" * 40
     $sourceGeneratorFiles = @(
         @($evidenceSpecification.specification.source_report_contract.required_generator_paths) |
             ForEach-Object {
+                $generatorPath = [string]$_
+                $isFixtureRegistry = $generatorPath -ceq
+                    "scripts/windows/phase2/Source-Fixture-Registry.json"
+                $registryItem = if ($isFixtureRegistry) {
+                    Get-Item -LiteralPath $sourceFixtureRegistryPath `
+                        -Force `
+                        -ErrorAction Stop
+                }
+                else { $null }
                 [ordered]@{
-                    path = [string]$_
-                    size = 1
-                    sha256 = "9" * 64
+                    path = $generatorPath
+                    size = if ($isFixtureRegistry) {
+                        [long]$registryItem.Length
+                    }
+                    else { 1L }
+                    sha256 = if ($isFixtureRegistry) {
+                        Get-SteinPhase2Sha256 -Path $registryItem.FullName
+                    }
+                    else { "9" * 64 }
                 }
             })
     $sourceGeneratorHash = Get-SteinPhase2EvidenceTextSha256 `
         -Value ($sourceGeneratorFiles | ConvertTo-Json -Depth 16 -Compress)
-    $sourceChecks = @(
-        foreach ($sourceCheckId in @(
-                $evidenceSpecification.specification.source_report_contract.required_pass_check_ids)) {
-            if ($OmitMandatorySourceCheck -and
-                [string]$sourceCheckId -ceq "no-leaks-scanner-static") {
-                continue
-            }
-            [ordered]@{
-                id = [string]$sourceCheckId
-                status = "pass"
-                exit_code = 0
-            }
-        }
-        foreach ($sourceCheckId in @(
-                $evidenceSpecification.specification.source_report_contract.allowed_not_run_check_ids)) {
-            if ($PinnedExecutionNotRun -and
-                [string]$sourceCheckId -ceq "pinned-clean-build-environment") {
-                [ordered]@{
-                    id = [string]$sourceCheckId
-                    status = "not_run"
-                    reason = "Synthetic mutable-worktree source execution was not promoted."
-                }
-            }
-            elseif ($CommandProvenanceNotRun -and
-                [string]$sourceCheckId -ceq "source-report-command-provenance") {
-                [ordered]@{
-                    id = [string]$sourceCheckId
-                    status = "not_run"
-                    reason = "Synthetic source command provenance was not promoted."
-                }
-            }
-            elseif ($PortableAttestationNotRun -and
-                [string]$sourceCheckId -ceq "portable-runner-attestation") {
-                [ordered]@{
-                    id = [string]$sourceCheckId
-                    status = "not_run"
-                    reason = "Synthetic portable runner identity was not authenticated."
-                }
-            }
-            elseif ([string]$sourceCheckId -cne "windows-native-ignored-fixtures") {
-                [ordered]@{
-                    id = [string]$sourceCheckId
-                    status = "pass"
-                    exit_code = 0
-                }
-            }
-            else {
-                [ordered]@{
-                    id = [string]$sourceCheckId
-                    status = "not_run"
-                    reason = "Synthetic optional native fixture was not executed."
-                }
-            }
-        }
-    )
     $sourceProvenance = [ordered]@{
         schema_version = 2
         classification = "bounded_content_free_source_provenance"
@@ -590,10 +564,140 @@ function New-SteinReviewSyntheticFixture {
             [ordered]@{ path = "Cargo.lock"; size = 16; sha256 = "e" * 64 }
         )
     }
+    $sourceFixtureRegistry = Read-SteinSourceFixtureLockedJson `
+        -Path $sourceFixtureRegistryPath `
+        -MaximumBytes 1048576
+    $sourceFixtureRegistryGenerator = @($sourceGeneratorFiles | Where-Object {
+            [string]$_.path -ceq
+                "scripts/windows/phase2/Source-Fixture-Registry.json"
+        })
+    if ($sourceFixtureRegistryGenerator.Count -ne 1) {
+        throw "The synthetic source report has no exact fixture-registry generator."
+    }
+    $sourceFixtureSuite = New-SteinSourceFixtureSyntheticSuiteArtifacts `
+        -Registry $sourceFixtureRegistry.value `
+        -RegistrySha256 ([string]$sourceFixtureRegistryGenerator[0].sha256) `
+        -OutputDirectory (Join-Path $Root "synthetic-source-fixture-artifacts") `
+        -CandidateGitCommit $sourceCommit `
+        -CandidateGitTree $sourceTree `
+        -RustupToolchain `
+            ([string]$sourceProvenance.toolchain.cargo.rustup_toolchain) `
+        -CargoLauncherSha256 `
+            ([string]$sourceProvenance.toolchain.cargo.executable_sha256) `
+        -CargoResolvedSha256 `
+            ([string]$sourceProvenance.toolchain.cargo.resolved_executable_sha256) `
+        -RustcLauncherSha256 `
+            ([string]$sourceProvenance.toolchain.rustc.executable_sha256) `
+        -RustcResolvedSha256 `
+            ([string]$sourceProvenance.toolchain.rustc.resolved_executable_sha256) `
+        -RustupVersion ([string]$sourceProvenance.toolchain.rustup.version) `
+        -RustupSha256 `
+            ([string]$sourceProvenance.toolchain.rustup.executable_sha256) `
+        -GitLauncherVersion ([string]$sourceProvenance.toolchain.git.version) `
+        -GitLauncherSha256 `
+            ([string]$sourceProvenance.toolchain.git.executable_sha256) `
+        -GitResolvedVersion `
+            ([string]$sourceProvenance.toolchain.git.resolved_version) `
+        -GitResolvedSha256 `
+            ([string]$sourceProvenance.toolchain.git.resolved_executable_sha256)
+    $sourceFixtureByCheck = @{}
+    foreach ($fixtureRecord in @($sourceFixtureSuite.Records)) {
+        $sourceFixtureByCheck[
+            [string]$fixtureRecord.Fixture.source_check_id] = $fixtureRecord
+    }
+    $emptySourceLogHash = Get-SteinSourceEvidenceTextSha256 -Value ""
+    $sourceChecks = @(
+        foreach ($sourceCheckId in @(
+                $evidenceSpecification.specification.source_report_contract.required_pass_check_ids)) {
+            if ($OmitMandatorySourceCheck -and
+                [string]$sourceCheckId -ceq "no-leaks-scanner-static") {
+                continue
+            }
+            if ($sourceFixtureByCheck.ContainsKey([string]$sourceCheckId)) {
+                $fixtureRecord = $sourceFixtureByCheck[[string]$sourceCheckId]
+                [ordered]@{
+                    id = [string]$sourceCheckId
+                    status = "pass"
+                    executable = "powershell.exe"
+                    arguments = @(
+                        "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", "scripts/windows/phase2/Run-Source-Fixture.ps1",
+                        "-OutputDirectory",
+                        "artifacts/evidence/phase-2/source-synthetic/source-fixtures")
+                    working_directory = "."
+                    started_at = $recordedAt
+                    completed_at = $recordedAt
+                    duration_ms = 0
+                    exit_code = 0
+                    failure_summary = $null
+                    stdout = [ordered]@{
+                        path = "source-fixture-suite.stdout.txt"
+                        size = 0
+                        sha256 = $emptySourceLogHash
+                    }
+                    stderr = [ordered]@{
+                        path = "source-fixture-suite.stderr.txt"
+                        size = 0
+                        sha256 = $emptySourceLogHash
+                    }
+                    source_fixture_receipt = $fixtureRecord.Receipt
+                    source_fixture_receipt_artifact = [ordered]@{
+                        path = "source-fixtures/$([string]$fixtureRecord.Name)"
+                        size = [long]$fixtureRecord.Size
+                        sha256 = [string]$fixtureRecord.Sha256
+                    }
+                    source_fixture_suite_index = [ordered]@{
+                        path = "source-fixtures/index.json"
+                        size = [long]$sourceFixtureSuite.IndexSize
+                        sha256 = [string]$sourceFixtureSuite.IndexSha256
+                    }
+                }
+            }
+            else {
+                [ordered]@{
+                    id = [string]$sourceCheckId
+                    status = "pass"
+                    exit_code = 0
+                }
+            }
+        }
+        foreach ($sourceCheckId in @(
+                $evidenceSpecification.specification.source_report_contract.allowed_not_run_check_ids)) {
+            $notRunReasons = [ordered]@{
+                "native-toolchain-provenance" = "Authenticated Rust/rustup/Git/VS/MSVC/Windows SDK/package-tool payload, runtime, sysroot, library, and linker provenance is not implemented."
+                "no-leaks-producer-workflow" = "Candidate-owned installed artifact producer is not implemented."
+                "pinned-clean-build-environment" = "Authenticated immutable candidate input and fresh dependency, build, and output isolation are not implemented for every source check."
+                "portable-runner-attestation" = "Authenticated GitHub artifact attestation tied to repository, workflow, commit, and artifact digest is not implemented."
+                "source-report-command-provenance" = "Independent closed command/argument/working-directory provenance for every source-report check is not implemented."
+                "windows-native-ignored-fixtures" = "Requires explicit native-fixture workflow support; interactive native fixtures remain unimplemented source evidence."
+            }
+            if ([string]$sourceCheckId -ceq $PromoteFrozenSourceCheckId) {
+                [ordered]@{
+                    id = [string]$sourceCheckId
+                    status = "pass"
+                    exit_code = 0
+                }
+            }
+            else {
+                [ordered]@{
+                    id = [string]$sourceCheckId
+                    status = "not_run"
+                    reason = [string]$notRunReasons[[string]$sourceCheckId]
+                }
+            }
+        }
+    )
+    if ($CorruptSourceFixtureReceipt) {
+        $corruptReceiptCheck = @($sourceChecks | Where-Object {
+                [string]$_.id -clike 'phase2-source-fixture-*'
+            })[0]
+        $corruptReceiptCheck.source_fixture_receipt.gate_runner_id =
+            "stein.phase2.invalid.v1"
+    }
     $sourceProvenanceHash = Get-SteinPhase2EvidenceTextSha256 `
         -Value ($sourceProvenance | ConvertTo-Json -Depth 16 -Compress)
     $sourceChecksHash = Get-SteinPhase2EvidenceTextSha256 `
-        -Value ($sourceChecks | ConvertTo-Json -Depth 16 -Compress)
+        -Value ($sourceChecks | ConvertTo-Json -Depth 40 -Compress)
     $sourceReportRecord = [ordered]@{
         schema_version = 2
         claim = "source_verification_only"
@@ -651,7 +755,7 @@ function New-SteinReviewSyntheticFixture {
     $sourceRootItem = Get-Item -LiteralPath $sourceRootPath -Force -ErrorAction Stop
     $sourceRootHash = Get-SteinPhase2Sha256 -Path $sourceRootPath
     $package.candidate_git_commit = $sourceCommit
-    $package.candidate_git_tree = "c" * 40
+    $package.candidate_git_tree = $sourceTree
     $package.source_verification_sha256 = $sourceReportHash
     $package.source_root_anchor_sha256 = $sourceRootHash
     $package.source_root_digest_sha256 = [string]$sourceRootRecord.root_digest_sha256
@@ -668,6 +772,7 @@ function New-SteinReviewSyntheticFixture {
                 -SubcheckId ([string]$subcheckId)
         }
         $origins = @($subcheckOrigins.Values | Sort-Object -Unique)
+        $sourceGateFrozen = 'source_verification' -cin $origins
         $artifactRecords = New-Object Collections.Generic.List[object]
         $artifactMappings = New-Object Collections.Generic.List[object]
         foreach ($sharedArtifact in @(
@@ -1103,6 +1208,7 @@ function New-SteinReviewSyntheticFixture {
                     @(
                         @($sourceMappingProperty.Value) +
                             @(
+                                "native-toolchain-provenance",
                                 "pinned-clean-build-environment",
                                 "source-report-command-provenance") |
                             Sort-Object -Unique)
@@ -1117,9 +1223,9 @@ function New-SteinReviewSyntheticFixture {
             gate_id = $gateId
             fixture_id = [string]$gateSpecification.fixture_id
             runner_id = [string]$gateSpecification.runner_id
-            result = "pass"
+            result = if ($sourceGateFrozen) { "not_run" } else { "pass" }
             recorded_at_utc = $recordedAt
-            exit_code = 0
+            exit_code = if ($sourceGateFrozen) { $null } else { 0 }
             runner = [ordered]@{
                 platform = "windows"
                 architecture = "AMD64"
@@ -1180,7 +1286,7 @@ function New-SteinReviewSyntheticFixture {
             attachment_id = $attachmentId
             gate_id = $gateId
             kind = "native_fixture_result"
-            declared_result = "pass"
+            declared_result = if ($sourceGateFrozen) { "not_run" } else { "pass" }
             recorded_at_utc = $recordedAt
             sha256 = $nativeHash
             size = [long]$nativeItem.Length
@@ -1195,7 +1301,7 @@ function New-SteinReviewSyntheticFixture {
                 contract_sha256 = [string]$fixtureRecord.contract_sha256
                 fixture_id = [string]$fixtureRecord.fixture_id
                 runner_id = [string]$fixtureRecord.runner_id
-                exit_code = 0
+                exit_code = if ($sourceGateFrozen) { $null } else { 0 }
                 closed_content_free_schema_verified = $true
                 proof_classes = @($fixtureRecord.proof_classes)
                 subchecks = @($fixtureRecord.subchecks)
@@ -1518,7 +1624,8 @@ function Invoke-SteinReviewTestCase {
         Where-Object { $_.Name -like "reviewed-*" })
     if ($ExpectOutput) {
         if ($outputs.Count -ne 1) {
-            throw "A valid reviewer case did not emit exactly one protected output."
+            $caseLeaf = Split-Path -Leaf (Split-Path -Parent $Fixture.output_root)
+            throw "Reviewer case $caseLeaf emitted $($outputs.Count) protected outputs; expected one."
         }
         Assert-SteinPhase2OwnerOnlyTree -Root $outputs[0].FullName
         $ledgerPath = Join-Path $outputs[0].FullName "ledger.json"
@@ -1583,6 +1690,9 @@ function Invoke-SteinReviewTestCase {
 }
 
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..\..")).Path
+if ($ReviewTestLibraryOnly) {
+    return
+}
 $testRoot = Join-Path $repoRoot (
     "artifacts\evidence\phase-2\review-tests-" + [Guid]::NewGuid().ToString("N"))
 $artifactsRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot "artifacts"))
@@ -1598,19 +1708,86 @@ $cases = New-Object Collections.Generic.List[string]
 try {
     $null = New-Item -ItemType Directory -Path $testRoot -Force -ErrorAction Stop
 
-    $positive = New-SteinReviewSyntheticFixture -Root (Join-Path $testRoot "positive")
-    $positiveLedger = Invoke-SteinReviewTestCase `
-        -Fixture $positive `
-        -ExpectedExitCode 0 `
+    foreach ($functionName in @(
+            "Get-SteinReviewLockedStreamSha256",
+            "Open-SteinReviewBootstrapFileBinding")) {
+        $functionAst = @($reviewerAst.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -ceq $functionName
+                }, $true))
+        if ($functionAst.Count -ne 1) {
+            throw "The reviewer runtime-source lock helper is not uniquely defined."
+        }
+        . ([scriptblock]::Create($functionAst[0].Extent.Text))
+    }
+    $lockProbeRoot = Join-Path $testRoot "runtime-lock-probe"
+    $null = New-Item -ItemType Directory -Path $lockProbeRoot -ErrorAction Stop
+    $lockProbePath = Join-Path $lockProbeRoot "source.ps1"
+    $replacementPath = Join-Path $lockProbeRoot "replacement.ps1"
+    [IO.File]::WriteAllText($lockProbePath, "locked-review-source")
+    [IO.File]::WriteAllText($replacementPath, "replacement-review-source")
+    $binding = Open-SteinReviewBootstrapFileBinding `
+        -Role "lock-probe" `
+        -Path $lockProbePath `
+        -RepositoryRoot $testRoot
+    try {
+        $writeRejected = $false
+        try {
+            [IO.File]::WriteAllText($lockProbePath, "mutated-review-source")
+        }
+        catch {
+            $writeRejected = $true
+        }
+        $replacementRejected = $false
+        try {
+            Move-Item `
+                -LiteralPath $replacementPath `
+                -Destination $lockProbePath `
+                -Force `
+                -ErrorAction Stop
+        }
+        catch {
+            $replacementRejected = $true
+        }
+        $sameHandleSha256 = Get-SteinReviewLockedStreamSha256 `
+            -Stream $binding.stream `
+            -FailureCode "reviewer_runtime_source_changed"
+        if (-not $writeRejected -or -not $replacementRejected -or
+            $sameHandleSha256 -cne [string]$binding.record.sha256) {
+            throw "The reviewer runtime-source lock allowed a swap or changed bytes."
+        }
+    }
+    finally {
+        $binding.stream.Dispose()
+    }
+    $cases.Add("reviewer_runtime_source_swap_rejected")
+
+    $frozenBaseline = New-SteinReviewSyntheticFixture `
+        -Root (Join-Path $testRoot "frozen-baseline")
+    $frozenLedger = Invoke-SteinReviewTestCase `
+        -Fixture $frozenBaseline `
+        -ExpectedExitCode 3 `
         -ExpectOutput
-    if (-not [bool]$positiveLedger.complete_acceptance -or
-        @($positiveLedger.rows | Where-Object { $_.status -cne "pass" }).Count -ne 0 -or
-        [int]$positiveLedger.source_integrity.collector_rows_rehashed -ne 32 -or
-        [int]$positiveLedger.source_integrity.collector_attachments_rehashed -ne 33) {
-        throw "The positive reviewer fixture did not produce complete acceptance."
+    $sourceOriginGateIds = @(
+        $evidenceSpecification.specification.gates | Where-Object {
+            $sourceSubchecksProperty =
+                $_.PSObject.Properties['source_subchecks']
+            $null -ne $sourceSubchecksProperty -and
+                @($sourceSubchecksProperty.Value).Count -gt 0
+        } | ForEach-Object { [string]$_.gate_id })
+    $sourceOriginRows = @($frozenLedger.rows | Where-Object {
+            [string]$_.gate_id -cin $sourceOriginGateIds
+        })
+    if ([bool]$frozenLedger.complete_acceptance -or
+        $sourceOriginRows.Count -lt 1 -or
+        @($sourceOriginRows | Where-Object { [string]$_.status -ceq "pass" }).Count -ne 0 -or
+        [int]$frozenLedger.source_integrity.collector_rows_rehashed -ne 32 -or
+        [int]$frozenLedger.source_integrity.collector_attachments_rehashed -ne 33) {
+        throw "The frozen source-evidence blockers did not conservatively prevent promotion."
     }
     $positiveOutput = @(
-        Get-ChildItem -LiteralPath $positive.output_root -Directory -Force)[0]
+        Get-ChildItem -LiteralPath $frozenBaseline.output_root -Directory -Force)[0]
     $outputText = @(
         Get-ChildItem -LiteralPath $positiveOutput.FullName -File -Recurse -Force |
             ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 }
@@ -1618,7 +1795,7 @@ try {
     if ($outputText -match '(?i)(?:[a-z]:[\\/]|S-1-[0-9]+(?:-[0-9]+){2,})') {
         throw "The content-minimized final bundle retained a local path or SID."
     }
-    $cases.Add("positive_complete_acceptance")
+    $cases.Add("frozen_source_evidence_baseline_cannot_complete")
 
     $missingSourceContractCheck = New-SteinReviewSyntheticFixture `
         -Root (Join-Path $testRoot "missing-source-contract-check") `
@@ -1628,29 +1805,29 @@ try {
         -ExpectedExitCode 1
     $cases.Add("missing_mandatory_source_contract_check_rejected")
 
-    $mutableSourceExecution = New-SteinReviewSyntheticFixture `
-        -Root (Join-Path $testRoot "mutable-source-execution") `
-        -PinnedExecutionNotRun
-    $null = Invoke-SteinReviewTestCase `
-        -Fixture $mutableSourceExecution `
-        -ExpectedExitCode 1
-    $cases.Add("mutable_source_execution_cannot_promote")
+    foreach ($frozenCheckId in @(
+            "native-toolchain-provenance",
+            "no-leaks-producer-workflow",
+            "pinned-clean-build-environment",
+            "portable-runner-attestation",
+            "source-report-command-provenance",
+            "windows-native-ignored-fixtures")) {
+        $forgedFrozenPass = New-SteinReviewSyntheticFixture `
+            -Root (Join-Path $testRoot ("forged-" + $frozenCheckId)) `
+            -PromoteFrozenSourceCheckId $frozenCheckId
+        $null = Invoke-SteinReviewTestCase `
+            -Fixture $forgedFrozenPass `
+            -ExpectedExitCode 1
+        $cases.Add("frozen_$($frozenCheckId.Replace('-', '_'))_pass_rejected")
+    }
 
-    $unboundSourceCommands = New-SteinReviewSyntheticFixture `
-        -Root (Join-Path $testRoot "unbound-source-commands") `
-        -CommandProvenanceNotRun
+    $corruptSourceFixtureReceipt = New-SteinReviewSyntheticFixture `
+        -Root (Join-Path $testRoot "corrupt-source-fixture-receipt") `
+        -CorruptSourceFixtureReceipt
     $null = Invoke-SteinReviewTestCase `
-        -Fixture $unboundSourceCommands `
+        -Fixture $corruptSourceFixtureReceipt `
         -ExpectedExitCode 1
-    $cases.Add("unbound_source_commands_cannot_promote")
-
-    $unattestedPortableRunner = New-SteinReviewSyntheticFixture `
-        -Root (Join-Path $testRoot "unattested-portable-runner") `
-        -PortableAttestationNotRun
-    $null = Invoke-SteinReviewTestCase `
-        -Fixture $unattestedPortableRunner `
-        -ExpectedExitCode 1
-    $cases.Add("unattested_portable_runner_cannot_promote")
+    $cases.Add("corrupt_source_fixture_receipt_rejected")
 
     $mismatchedPackageBinding = New-SteinReviewSyntheticFixture `
         -Root (Join-Path $testRoot "mismatched-package-binding") `
@@ -1778,7 +1955,9 @@ try {
     $null = Invoke-SteinReviewTestCase -Fixture $reparse -ExpectedExitCode 1
     $cases.Add("attachment_reparse_rejected")
 
-    $independence = New-SteinReviewSyntheticFixture -Root (Join-Path $testRoot "independence")
+    $independence = New-SteinReviewSyntheticFixture `
+        -Root (Join-Path $testRoot "independence") `
+        -SourceStatuses @{ "P2-BUILD" = "pass" }
     $manifest = Get-SteinReviewTestManifest -Path $independence.manifest_path
     $manifest.reviews[0].independent_review = $false
     Set-SteinReviewTestManifest -Path $independence.manifest_path -Manifest $manifest
@@ -1863,8 +2042,9 @@ try {
         powershell_edition = [string]$PSVersionTable.PSEdition
         powershell_version = [string]$PSVersionTable.PSVersion
         exact_gate_count = $actualGates.Count
-        positive_complete_acceptance = $true
-        negative_case_count = $cases.Count - 1
+        frozen_baseline_incomplete = $true
+        reviewer_runtime_source_swap_rejected = $true
+        negative_case_count = $cases.Count
         cases = @($cases | ForEach-Object { $_ })
         installed_state_mutations = 0
     } | ConvertTo-Json -Compress -Depth 4

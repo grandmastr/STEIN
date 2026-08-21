@@ -67,6 +67,60 @@ function Get-SteinPhase2EvidenceTextSha256 {
     }
 }
 
+function Read-SteinPhase2SourceFixtureRegistry {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $ExpectedSha256
+    )
+
+    Assert-SteinPhase2EvidenceHash `
+        -Value $ExpectedSha256 `
+        -FailureCode 'source_fixture_registry_hash_invalid'
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        $item.Length -le 0 -or $item.Length -gt 1MB) {
+        throw 'source_fixture_registry_file_invalid'
+    }
+    $bytes = $null
+    $stream = [IO.FileStream]::new(
+        $item.FullName,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read)
+    try {
+        $bytes = New-Object byte[] ([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) { throw 'source_fixture_registry_file_invalid' }
+            $offset += $read
+        }
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $actualSha256 = [BitConverter]::ToString(
+                $sha256.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()
+        }
+        finally { $sha256.Dispose() }
+        if ($actualSha256 -cne $ExpectedSha256) {
+            throw 'source_fixture_registry_hash_mismatch'
+        }
+        try {
+            $json = [Text.UTF8Encoding]::new($false, $true).GetString($bytes) |
+                ConvertFrom-Json -ErrorAction Stop
+        }
+        catch { throw 'source_fixture_registry_json_invalid' }
+    }
+    finally {
+        $stream.Dispose()
+        if ($null -ne $bytes) { [Array]::Clear($bytes, 0, $bytes.Length) }
+    }
+    return [pscustomobject]@{
+        value = $json
+        sha256 = $actualSha256
+    }
+}
+
 function Read-SteinPhase2EvidenceSpecification {
     param(
         [Parameter(Mandatory = $true)][string] $Path,
@@ -155,9 +209,15 @@ function Read-SteinPhase2EvidenceSpecification {
         -FailureCode 'evidence_spec_binding_set_invalid'
     Assert-SteinPhase2EvidenceShape -Value $specification.source_report_contract `
         -ExpectedProperties @(
-            'required_pass_check_ids', 'allowed_not_run_check_ids',
-            'required_generator_paths') `
+            'source_fixture_registry_sha256', 'required_pass_check_ids',
+            'allowed_not_run_check_ids', 'required_generator_paths') `
         -FailureCode 'evidence_spec_source_report_contract_invalid'
+    $expectedSourceFixtureRegistrySha256 =
+        'd2414e552dfbc00b3ecf5837cfc431c64f670508ae4e8696b9fce4f85a75c5c5'
+    if ([string]$specification.source_report_contract.source_fixture_registry_sha256 `
+            -cne $expectedSourceFixtureRegistrySha256) {
+        throw 'evidence_spec_source_fixture_registry_invalid'
+    }
     $expectedSourcePassCheckIds = @(
         'boundary-contract',
         'desktop-build',
@@ -174,6 +234,19 @@ function Read-SteinPhase2EvidenceSpecification {
         'installed-reviewer-windows-powershell-contract',
         'msix-static-contract',
         'no-leaks-scanner-static',
+        'phase2-source-fixture-goals',
+        'phase2-source-fixture-identity',
+        'phase2-source-fixture-intervention',
+        'phase2-source-fixture-model-contract',
+        'phase2-source-fixture-notification',
+        'phase2-source-fixture-outbox-recovery',
+        'phase2-source-fixture-phase1-regression',
+        'phase2-source-fixture-pixels',
+        'phase2-source-fixture-policy-failsafe',
+        'phase2-source-fixture-revocation-race',
+        'phase2-source-fixture-retention',
+        'phase2-source-fixture-secrets',
+        'phase2-source-fixture-upgrade',
         'release-edge-host',
         'release-production-core',
         'release-tauri-no-bundle',
@@ -188,19 +261,6 @@ function Read-SteinPhase2EvidenceSpecification {
     $expectedAllowedNotRunCheckIds = @(
         'native-toolchain-provenance',
         'no-leaks-producer-workflow',
-        'phase2-source-fixture-goals',
-        'phase2-source-fixture-identity',
-        'phase2-source-fixture-intervention',
-        'phase2-source-fixture-model-contract',
-        'phase2-source-fixture-notification',
-        'phase2-source-fixture-outbox-recovery',
-        'phase2-source-fixture-phase1-regression',
-        'phase2-source-fixture-pixels',
-        'phase2-source-fixture-policy-failsafe',
-        'phase2-source-fixture-retention',
-        'phase2-source-fixture-revocation-race',
-        'phase2-source-fixture-secrets',
-        'phase2-source-fixture-upgrade',
         'pinned-clean-build-environment',
         'portable-runner-attestation',
         'source-report-command-provenance',
@@ -210,6 +270,9 @@ function Read-SteinPhase2EvidenceSpecification {
         'scripts/windows/phase2/Verify-Source.ps1',
         'scripts/windows/phase2/Verify-Source.cmd',
         'scripts/windows/phase2/Source-Evidence.ps1',
+        'scripts/windows/phase2/Source-Fixture-Registry.json',
+        'scripts/windows/phase2/Run-Source-Fixture.ps1',
+        'scripts/windows/phase2/Test-SourceFixture.ps1',
         'scripts/windows/phase2/Test-VerifySource.ps1',
         'scripts/windows/phase2/Review-Installed.ps1',
         'scripts/windows/phase2/Review-Installed.cmd',
@@ -759,6 +822,7 @@ function Assert-SteinPhase2GateEvidenceResult {
             @(
                 @($sourceMappingProperty.Value) +
                     @(
+                        'native-toolchain-provenance',
                         'pinned-clean-build-environment',
                         'source-report-command-provenance') |
                     Sort-Object -Unique)
@@ -1203,12 +1267,702 @@ function Assert-SteinPhase2NoLeaksReceiptPair {
     return $true
 }
 
+function Get-SteinPhase2SourceFixtureInvocationId {
+    param([Parameter(Mandatory = $true)] $Invocation)
+
+    $material = @(
+        'stein-source-fixture-invocation-v1',
+        "kind=$([string]$Invocation.kind)",
+        "module=$([string]$Invocation.module)",
+        "test=$([string]$Invocation.test)") -join "`n"
+    $digest = Get-SteinPhase2EvidenceTextSha256 -Value $material
+    return "source-invocation-$($digest.Substring(0, 24))"
+}
+
+function Get-SteinPhase2SourceFixtureCommandDefinition {
+    param([Parameter(Mandatory = $true)] $Invocation)
+
+    $kind = [string]$Invocation.kind
+    $module = [string]$Invocation.module
+    $test = [string]$Invocation.test
+    switch ($kind) {
+        'core' { $qualified = "$module`::tests::$test"; $package = 'stein-core'; $target = @('--lib') }
+        'store' { $qualified = $test; $package = 'stein-store-sqlite'; $target = @('--test', 'repository') }
+        'windows' { $qualified = "$module`::tests::$test"; $package = 'stein-platform-windows'; $target = @('--lib') }
+        'model' { $qualified = "tests::$test"; $package = 'stein-model-openai'; $target = @('--lib') }
+        'desktop' {
+            $qualified = if ($module -ceq 'toast_activation') {
+                "toast_activation::tests::$test"
+            }
+            else { "$module`::$test" }
+            $package = 'stein-desktop'; $target = @('--lib')
+        }
+        'cli' { $qualified = "tests::$test"; $package = 'stein-cli'; $target = @('--bin', 'stein-cli') }
+        'protocol' { $qualified = $test; $package = 'stein-protocol'; $target = @('--test', 'protocol_contract') }
+        'ipc' { $qualified = "$module`::tests::$test"; $package = 'stein-ipc'; $target = @('--lib') }
+        'boundary' {
+            return [pscustomobject]@{
+                qualified_name = 'boundary_contract'
+                arguments = @(
+                    '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                    '-File', 'scripts/windows/check-boundaries.ps1', '-Json')
+                harness = $null
+            }
+        }
+        default { throw 'source_fixture_receipt_invalid' }
+    }
+    $targetKind = if ($target[0] -ceq '--lib') { 'lib' }
+        elseif ($target[0] -ceq '--test') { 'test' }
+        else { 'bin' }
+    $targetName = switch ($package) {
+        'stein-core' { 'stein_core' }
+        'stein-store-sqlite' { 'repository' }
+        'stein-platform-windows' { 'stein_platform_windows' }
+        'stein-model-openai' { 'stein_model_openai' }
+        'stein-desktop' { 'stein_desktop_lib' }
+        'stein-cli' { 'stein-cli' }
+        'stein-protocol' { 'protocol_contract' }
+        'stein-ipc' { 'stein_ipc' }
+    }
+    $manifestPath = switch ($package) {
+        'stein-core' { 'crates/stein-core/Cargo.toml' }
+        'stein-store-sqlite' { 'crates/stein-store-sqlite/Cargo.toml' }
+        'stein-platform-windows' { 'crates/stein-platform-windows/Cargo.toml' }
+        'stein-model-openai' { 'crates/stein-model-openai/Cargo.toml' }
+        'stein-desktop' { 'apps/desktop/src-tauri/Cargo.toml' }
+        'stein-cli' { 'apps/core-cli/Cargo.toml' }
+        'stein-protocol' { 'crates/stein-protocol/Cargo.toml' }
+        'stein-ipc' { 'crates/stein-ipc/Cargo.toml' }
+    }
+    $prefix = @(
+        'test', '--locked', '--manifest-path', 'Cargo.toml', '-p', $package) +
+        $target
+    return [pscustomobject]@{
+        qualified_name = $qualified
+        arguments = @($prefix + @(
+                '--', $qualified, '--exact', '--test-threads=1'))
+        harness = [pscustomobject]@{
+            harness_id = ("cargo-harness-$package-$targetKind-$targetName" -replace '_', '-')
+            package = $package
+            target_kind = $targetKind
+            target_name = $targetName
+            manifest_path = $manifestPath
+            compile_arguments = @($prefix + @(
+                    '--no-run', '--message-format=json-render-diagnostics'))
+        }
+    }
+}
+
+function Assert-SteinPhase2SourceFixtureReceiptCheck {
+    param(
+        [Parameter(Mandatory = $true)] $Check,
+        [Parameter(Mandatory = $true)] $Gate,
+        [Parameter(Mandatory = $true)] $SourceReport,
+        [Parameter(Mandatory = $true)] $EvidenceResult,
+        [Parameter(Mandatory = $true)][string] $RegistrySha256,
+        [Parameter(Mandatory = $true)] $Fixture
+    )
+
+    $failureCode = 'source_fixture_receipt_invalid'
+    Assert-SteinPhase2EvidenceShape -Value $Check `
+        -ExpectedProperties @(
+            'id', 'status', 'executable', 'arguments', 'working_directory',
+            'started_at', 'completed_at', 'duration_ms', 'exit_code',
+            'failure_summary', 'stdout', 'stderr', 'source_fixture_receipt',
+            'source_fixture_receipt_artifact', 'source_fixture_suite_index') `
+        -FailureCode $failureCode
+    $checkId = [string]$Check.id
+    if ([string]$Check.status -cne 'pass' -or
+        [string]$Check.executable -cne 'powershell.exe' -or
+        [string]$Check.working_directory -cne '.' -or
+        [long]$Check.exit_code -ne 0 -or $null -ne $Check.failure_summary) {
+        throw $failureCode
+    }
+    $arguments = @($Check.arguments | ForEach-Object { [string]$_ })
+    if ($arguments.Count -ne 8 -or
+        [string]$arguments[0] -cne '-NoLogo' -or
+        [string]$arguments[1] -cne '-NoProfile' -or
+        [string]$arguments[2] -cne '-ExecutionPolicy' -or
+        [string]$arguments[3] -cne 'Bypass' -or
+        [string]$arguments[4] -cne '-File' -or
+        [string]$arguments[5] -cne
+            'scripts/windows/phase2/Run-Source-Fixture.ps1' -or
+        [string]$arguments[6] -cne '-OutputDirectory' -or
+        [string]$arguments[7] -cnotmatch
+            '^artifacts/evidence/phase-2/source-[A-Za-z0-9._-]{1,96}/source-fixtures$') {
+        throw $failureCode
+    }
+
+    $receipt = $Check.source_fixture_receipt
+    Assert-SteinPhase2EvidenceShape -Value $receipt `
+        -ExpectedProperties @(
+            'schema_version', 'claim', 'source_check_id', 'source_fixture_id',
+            'source_runner_id', 'gate_id', 'gate_fixture_id', 'gate_runner_id',
+            'result', 'bindings', 'environment', 'semantic_sources', 'harnesses',
+            'executions', 'subchecks', 'summary') `
+        -FailureCode $failureCode
+    $sourceSlug = $checkId.Substring('phase2-source-fixture-'.Length)
+    if ([long]$receipt.schema_version -ne 1 -or
+        [string]$receipt.claim -cne 'closed_source_fixture_only' -or
+        [string]$receipt.source_check_id -cne $checkId -or
+        [string]$receipt.source_fixture_id -cne "$checkId-v1" -or
+        [string]$receipt.source_runner_id -cne
+            "stein.phase2.source-fixture.$sourceSlug.v1" -or
+        [string]$receipt.gate_id -cne [string]$Gate.gate_id -or
+        [string]$receipt.gate_fixture_id -cne [string]$Gate.fixture_id -or
+        [string]$receipt.gate_runner_id -cne [string]$Gate.runner_id -or
+        [string]$receipt.result -cne 'pass') {
+        throw $failureCode
+    }
+    Assert-SteinPhase2EvidenceShape -Value $Fixture `
+        -ExpectedProperties @(
+            'source_check_id', 'source_fixture_id', 'source_runner_id',
+            'gate_id', 'gate_fixture_id', 'gate_runner_id',
+            'semantic_source_paths', 'subchecks') `
+        -FailureCode $failureCode
+    if ([string]$Fixture.source_check_id -cne $checkId -or
+        [string]$Fixture.source_fixture_id -cne [string]$receipt.source_fixture_id -or
+        [string]$Fixture.source_runner_id -cne [string]$receipt.source_runner_id -or
+        [string]$Fixture.gate_id -cne [string]$receipt.gate_id -or
+        [string]$Fixture.gate_fixture_id -cne [string]$receipt.gate_fixture_id -or
+        [string]$Fixture.gate_runner_id -cne [string]$receipt.gate_runner_id) {
+        throw $failureCode
+    }
+    Assert-SteinPhase2EvidenceShape -Value $receipt.bindings `
+        -ExpectedProperties @(
+            'candidate_git_commit', 'candidate_git_tree',
+            'candidate_tree_file_count', 'candidate_tree_manifest_sha256',
+            'registry_sha256', 'fixture_definition_sha256',
+            'semantic_source_manifest_sha256', 'rustup_toolchain',
+            'rustup_version', 'rustup_sha256',
+            'cargo_launcher_sha256', 'cargo_resolved_sha256',
+            'rustc_launcher_sha256', 'rustc_resolved_sha256',
+            'git_launcher_version', 'git_launcher_sha256',
+            'git_resolved_version', 'git_resolved_sha256',
+            'compiler_environment_sha256', 'git_environment_sha256') `
+        -FailureCode $failureCode
+    foreach ($property in @(
+            'candidate_tree_manifest_sha256', 'registry_sha256',
+            'fixture_definition_sha256', 'semantic_source_manifest_sha256',
+            'cargo_launcher_sha256', 'cargo_resolved_sha256',
+            'rustc_launcher_sha256', 'rustc_resolved_sha256',
+            'rustup_sha256',
+            'git_launcher_sha256', 'git_resolved_sha256',
+            'compiler_environment_sha256', 'git_environment_sha256')) {
+        Assert-SteinPhase2EvidenceHash `
+            -Value $receipt.bindings.$property `
+            -FailureCode $failureCode
+    }
+    if ([string]$receipt.bindings.candidate_git_commit -cne
+            [string]$EvidenceResult.bindings.commit.object_id -or
+        [string]$receipt.bindings.candidate_git_tree -cne
+            [string]$EvidenceResult.bindings.commit.tree_id -or
+        [string]$receipt.bindings.registry_sha256 -cne $RegistrySha256 -or
+        [string]$receipt.bindings.cargo_launcher_sha256 -cne
+            [string]$SourceReport.provenance.toolchain.cargo.executable_sha256 -or
+        [string]$receipt.bindings.cargo_resolved_sha256 -cne
+            [string]$SourceReport.provenance.toolchain.cargo.resolved_executable_sha256 -or
+        [string]$receipt.bindings.rustc_launcher_sha256 -cne
+            [string]$SourceReport.provenance.toolchain.rustc.executable_sha256 -or
+        [string]$receipt.bindings.rustc_resolved_sha256 -cne
+            [string]$SourceReport.provenance.toolchain.rustc.resolved_executable_sha256 -or
+        [string]$receipt.bindings.rustup_toolchain -cne
+            [string]$SourceReport.provenance.toolchain.cargo.rustup_toolchain -or
+        [string]$receipt.bindings.rustup_version -cne
+            [string]$SourceReport.provenance.toolchain.rustup.version -or
+        [string]$receipt.bindings.rustup_sha256 -cne
+            [string]$SourceReport.provenance.toolchain.rustup.executable_sha256 -or
+        [string]$receipt.bindings.git_launcher_version -cne
+            [string]$SourceReport.provenance.toolchain.git.version -or
+        [string]$receipt.bindings.git_launcher_sha256 -cne
+            [string]$SourceReport.provenance.toolchain.git.executable_sha256 -or
+        [string]$receipt.bindings.git_resolved_version -cne
+            [string]$SourceReport.provenance.toolchain.git.resolved_version -or
+        [string]$receipt.bindings.git_resolved_sha256 -cne
+            [string]$SourceReport.provenance.toolchain.git.resolved_executable_sha256 -or
+        [long]$receipt.bindings.candidate_tree_file_count -lt 1 -or
+        [long]$receipt.bindings.candidate_tree_file_count -gt 100000) {
+        throw $failureCode
+    }
+    $fixtureDefinitionDigest = Get-SteinPhase2EvidenceTextSha256 `
+        -Value ($Fixture | ConvertTo-Json -Depth 32 -Compress)
+    if ([string]$receipt.bindings.fixture_definition_sha256 -cne
+        $fixtureDefinitionDigest) {
+        throw $failureCode
+    }
+    Assert-SteinPhase2EvidenceShape -Value $receipt.environment `
+        -ExpectedProperties @(
+            'source', 'target', 'tracked_source_lock', 'working_directory',
+            'cargo_home_precondition', 'cargo_home_initial_entry_count',
+            'cargo_config_precondition', 'cargo_config_postcondition',
+            'effective_compiler_environment', 'effective_git_environment') `
+        -FailureCode $failureCode
+    if ([string]$receipt.environment.source -cne 'private_exact_git_snapshot' -or
+        [string]$receipt.environment.target -cne
+            'fresh_private_shared_suite_target' -or
+        [string]$receipt.environment.tracked_source_lock -cne
+            'all_candidate_files_held_read_only' -or
+        [string]$receipt.environment.working_directory -cne '.' -or
+        [string]$receipt.environment.cargo_home_precondition -cne
+            'fresh_private_owner_only_empty' -or
+        [string]$receipt.environment.cargo_config_precondition -cne
+            'execution_and_snapshot_ancestor_configs_absent' -or
+        [string]$receipt.environment.cargo_config_postcondition -cne
+            'execution_and_snapshot_ancestor_configs_absent' -or
+        [long]$receipt.environment.cargo_home_initial_entry_count -ne 0) {
+        throw $failureCode
+    }
+    $expectedCompilerEnvironment = [ordered]@{
+        CARGO_HOME = 'fresh_private_owner_only_empty_at_suite_start'
+        CARGO_INCREMENTAL = '0'
+        CARGO_TARGET_DIR = 'fresh_private_shared_suite_target'
+        CARGO_BUILD_TARGET_DIR = 'cleared'
+        CARGO_TERM_COLOR = 'never'
+        CARGO_BUILD_RUSTC = 'resolved_rustc_payload'
+        CARGO_BUILD_RUSTC_WRAPPER = 'cleared'
+        CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER = 'cleared'
+        RUSTC = 'resolved_rustc_payload'
+        RUSTC_WRAPPER = 'cleared'
+        RUSTC_WORKSPACE_WRAPPER = 'cleared'
+        RUSTFLAGS = 'cleared'
+        CARGO_ENCODED_RUSTFLAGS = 'cleared'
+        RUSTUP_TOOLCHAIN = [string]$receipt.bindings.rustup_toolchain
+        UNREGISTERED_TOOL_OVERRIDE_PREFIXES = 'cleared'
+        PATH_SHA256 = [string]$receipt.environment.effective_compiler_environment.PATH_SHA256
+    }
+    Assert-SteinPhase2EvidenceShape `
+        -Value $receipt.environment.effective_compiler_environment `
+        -ExpectedProperties @($expectedCompilerEnvironment.Keys) `
+        -FailureCode $failureCode
+    foreach ($environmentName in $expectedCompilerEnvironment.Keys) {
+        if ([string]$receipt.environment.effective_compiler_environment.$environmentName -cne
+            [string]$expectedCompilerEnvironment[$environmentName]) {
+            throw $failureCode
+        }
+    }
+    if ((Get-SteinPhase2EvidenceTextSha256 -Value (
+                $receipt.environment.effective_compiler_environment |
+                    ConvertTo-Json -Depth 8 -Compress)) -cne
+        [string]$receipt.bindings.compiler_environment_sha256) {
+        throw $failureCode
+    }
+    Assert-SteinPhase2EvidenceHash `
+        -Value $receipt.environment.effective_compiler_environment.PATH_SHA256 `
+        -FailureCode $failureCode
+    $expectedGitEnvironment = [ordered]@{
+        GIT_CONFIG_NOSYSTEM = '1'
+        GIT_CONFIG_GLOBAL = 'NUL'
+        GIT_CONFIG_COUNT = '0'
+        GIT_NO_REPLACE_OBJECTS = '1'
+        GIT_TERMINAL_PROMPT = '0'
+        GIT_OPTIONAL_LOCKS = '0'
+        OTHER_GIT_ENVIRONMENT = 'cleared'
+        PATH_SHA256 = [string]$receipt.environment.effective_compiler_environment.PATH_SHA256
+    }
+    Assert-SteinPhase2EvidenceShape `
+        -Value $receipt.environment.effective_git_environment `
+        -ExpectedProperties @($expectedGitEnvironment.Keys) `
+        -FailureCode $failureCode
+    foreach ($environmentName in $expectedGitEnvironment.Keys) {
+        if ([string]$receipt.environment.effective_git_environment.$environmentName -cne
+            [string]$expectedGitEnvironment[$environmentName]) {
+            throw $failureCode
+        }
+    }
+    if ((Get-SteinPhase2EvidenceTextSha256 -Value (
+                $receipt.environment.effective_git_environment |
+                    ConvertTo-Json -Depth 8 -Compress)) -cne
+        [string]$receipt.bindings.git_environment_sha256) {
+        throw $failureCode
+    }
+
+    $semanticSources = @($receipt.semantic_sources)
+    $expectedSemanticPaths = @(
+        $Fixture.semantic_source_paths | ForEach-Object { [string]$_ })
+    if ($semanticSources.Count -ne $expectedSemanticPaths.Count) {
+        throw $failureCode
+    }
+    $semanticPaths = New-Object Collections.Generic.List[string]
+    for ($sourceIndex = 0; $sourceIndex -lt $semanticSources.Count; $sourceIndex++) {
+        $source = $semanticSources[$sourceIndex]
+        Assert-SteinPhase2EvidenceShape -Value $source `
+            -ExpectedProperties @('path', 'size', 'sha256', 'git_blob_object_id') `
+            -FailureCode $failureCode
+        if ([string]$source.path -cne $expectedSemanticPaths[$sourceIndex] -or
+            [string]$source.path -cnotmatch
+                '^(?!.*(?:^|/)\.\.?/)[A-Za-z0-9._/-]{1,512}$' -or
+            [IO.Path]::IsPathRooted([string]$source.path) -or
+            ($source.size -isnot [int] -and $source.size -isnot [long]) -or
+            [long]$source.size -lt 1 -or
+            [string]$source.git_blob_object_id -cnotmatch
+                '^(?:[0-9a-f]{40}|[0-9a-f]{64})$') {
+            throw $failureCode
+        }
+        Assert-SteinPhase2EvidenceHash -Value $source.sha256 -FailureCode $failureCode
+        $semanticPaths.Add([string]$source.path)
+    }
+    if ($semanticPaths.Count -lt 2 -or
+        @($semanticPaths | Select-Object -Unique).Count -ne $semanticPaths.Count -or
+        (Get-SteinPhase2EvidenceTextSha256 -Value (
+                $semanticSources | ConvertTo-Json -Depth 16 -Compress)) -cne
+            [string]$receipt.bindings.semantic_source_manifest_sha256) {
+        throw $failureCode
+    }
+
+    $expectedHarnesses = New-Object Collections.Generic.List[object]
+    $expectedHarnessIds = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    foreach ($fixtureSubcheck in @($Fixture.subchecks)) {
+        foreach ($fixtureInvocation in @($fixtureSubcheck.invocations)) {
+            $fixtureCommand = Get-SteinPhase2SourceFixtureCommandDefinition `
+                -Invocation $fixtureInvocation
+            if ($null -ne $fixtureCommand.harness -and
+                $expectedHarnessIds.Add([string]$fixtureCommand.harness.harness_id)) {
+                $expectedHarnesses.Add($fixtureCommand.harness)
+            }
+        }
+    }
+    $harnesses = @($receipt.harnesses)
+    if ($harnesses.Count -ne $expectedHarnesses.Count) {
+        throw $failureCode
+    }
+    $harnessById = @{}
+    for ($harnessIndex = 0; $harnessIndex -lt $harnesses.Count; $harnessIndex++) {
+        $harness = $harnesses[$harnessIndex]
+        $expectedHarness = $expectedHarnesses[$harnessIndex]
+        Assert-SteinPhase2EvidenceShape -Value $harness `
+            -ExpectedProperties @(
+                'harness_id', 'package', 'target_kind', 'target_name',
+                'manifest_path', 'binary', 'compile') `
+            -FailureCode $failureCode
+        $harnessId = [string]$harness.harness_id
+        if ($harnessId -cnotmatch '^cargo-harness-[a-z0-9-]{8,127}$' -or
+            $harnessById.ContainsKey($harnessId) -or
+            [string]$harness.package -cnotmatch '^[a-z][a-z0-9-]{2,63}$' -or
+            [string]$harness.target_kind -cnotin @('lib', 'test', 'bin') -or
+            [string]$harness.target_name -cnotmatch '^[A-Za-z0-9_-]{1,96}$' -or
+            [string]$harness.manifest_path -cnotmatch
+                '^[A-Za-z0-9._/-]{1,256}/Cargo\.toml$' -or
+            [IO.Path]::IsPathRooted([string]$harness.manifest_path)) {
+            throw $failureCode
+        }
+        if ($harnessId -cne [string]$expectedHarness.harness_id -or
+            [string]$harness.package -cne [string]$expectedHarness.package -or
+            [string]$harness.target_kind -cne [string]$expectedHarness.target_kind -or
+            [string]$harness.target_name -cne [string]$expectedHarness.target_name -or
+            [string]$harness.manifest_path -cne [string]$expectedHarness.manifest_path) {
+            throw $failureCode
+        }
+        Assert-SteinPhase2EvidenceShape -Value $harness.binary `
+            -ExpectedProperties @('size', 'sha256') `
+            -FailureCode $failureCode
+        Assert-SteinPhase2EvidenceHash -Value $harness.binary.sha256 `
+            -FailureCode $failureCode
+        if ([long]$harness.binary.size -lt 1 -or
+            [long]$harness.binary.size -gt 2147483648) {
+            throw $failureCode
+        }
+        Assert-SteinPhase2EvidenceShape -Value $harness.compile `
+            -ExpectedProperties @(
+                'executable', 'arguments', 'working_directory', 'exit_code',
+                'stdout', 'stderr', 'compiler_artifact_matches') `
+            -FailureCode $failureCode
+        $compileArguments = @($harness.compile.arguments | ForEach-Object { [string]$_ })
+        if ([string]$harness.compile.executable -cne 'cargo.exe' -or
+            [string]$harness.compile.working_directory -cne '.' -or
+            [long]$harness.compile.exit_code -ne 0 -or
+            [long]$harness.compile.compiler_artifact_matches -ne 1 -or
+            $compileArguments.Count -ne @($expectedHarness.compile_arguments).Count -or
+            @(Compare-Object `
+                    -ReferenceObject @($expectedHarness.compile_arguments) `
+                    -DifferenceObject $compileArguments `
+                    -CaseSensitive `
+                    -SyncWindow 0).Count -ne 0) {
+            throw $failureCode
+        }
+        foreach ($output in @($harness.compile.stdout, $harness.compile.stderr)) {
+            Assert-SteinPhase2EvidenceShape -Value $output `
+                -ExpectedProperties @('size', 'sha256') `
+                -FailureCode $failureCode
+            Assert-SteinPhase2EvidenceHash -Value $output.sha256 -FailureCode $failureCode
+            if ([long]$output.size -lt 0 -or [long]$output.size -gt 16777216) {
+                throw $failureCode
+            }
+        }
+        $harnessById[$harnessId] = $harness
+    }
+    if ($harnesses.Count -lt 1 -or $harnesses.Count -gt 8) {
+        throw $failureCode
+    }
+
+    $expectedExecutionOrder = New-Object Collections.Generic.List[string]
+    $expectedInvocationById = @{}
+    $expectedSubcheckExecutionIds = New-Object Collections.Generic.List[object]
+    foreach ($fixtureSubcheck in @($Fixture.subchecks)) {
+        $subcheckExecutionIds = New-Object Collections.Generic.List[string]
+        foreach ($fixtureInvocation in @($fixtureSubcheck.invocations)) {
+            $executionId = Get-SteinPhase2SourceFixtureInvocationId `
+                -Invocation $fixtureInvocation
+            $subcheckExecutionIds.Add($executionId)
+            if (-not $expectedInvocationById.ContainsKey($executionId)) {
+                $expectedInvocationById[$executionId] = $fixtureInvocation
+                $expectedExecutionOrder.Add($executionId)
+            }
+        }
+        $expectedSubcheckExecutionIds.Add(
+            @($subcheckExecutionIds | ForEach-Object { $_ }))
+    }
+    $executions = @($receipt.executions)
+    if ($executions.Count -ne $expectedExecutionOrder.Count) {
+        throw $failureCode
+    }
+    $executionById = @{}
+    $cargoExecutionCount = 0
+    $boundaryExecutionCount = 0
+    for ($executionIndex = 0; $executionIndex -lt $executions.Count; $executionIndex++) {
+        $execution = $executions[$executionIndex]
+        $expectedExecutionId = [string]$expectedExecutionOrder[$executionIndex]
+        $expectedInvocation = $expectedInvocationById[$expectedExecutionId]
+        $expectedCommand = Get-SteinPhase2SourceFixtureCommandDefinition `
+            -Invocation $expectedInvocation
+        $isBoundary = [string]$expectedInvocation.kind -ceq 'boundary'
+        $properties = @(
+            'execution_id', 'sequence', 'kind', 'qualified_test_name',
+            'executable', 'arguments', 'working_directory', 'execution')
+        if (-not $isBoundary) {
+            $properties += @('harness_id', 'registered_cargo_arguments', 'preflight')
+        }
+        else {
+            $properties += @('nested_tool')
+        }
+        Assert-SteinPhase2EvidenceShape -Value $execution `
+            -ExpectedProperties $properties `
+            -FailureCode $failureCode
+        $executionId = [string]$execution.execution_id
+        if ($executionId -cne $expectedExecutionId -or
+            $executionId -cnotmatch '^source-invocation-[0-9a-f]{24}$' -or
+            $executionById.ContainsKey($executionId) -or
+            [long]$execution.sequence -ne ($executionIndex + 1) -or
+            [string]$execution.working_directory -cne '.' -or
+            [string]$execution.qualified_test_name -cne
+                [string]$expectedCommand.qualified_name) {
+            throw $failureCode
+        }
+        if ($isBoundary) {
+            Assert-SteinPhase2EvidenceShape -Value $execution.execution `
+                -ExpectedProperties @(
+                    'exit_code', 'stdout', 'stderr', 'passed_checks',
+                    'failed_checks') `
+                -FailureCode $failureCode
+            $boundaryArguments = @($execution.arguments | ForEach-Object { [string]$_ })
+            $expectedBoundaryArguments = @($expectedCommand.arguments)
+            if ([string]$execution.executable -cne 'powershell.exe' -or
+                [string]$receipt.gate_id -cne 'P2-MODEL-CONTRACT' -or
+                [string]$execution.qualified_test_name -cne 'boundary_contract' -or
+                @(Compare-Object `
+                        -ReferenceObject $expectedBoundaryArguments `
+                        -DifferenceObject $boundaryArguments `
+                        -CaseSensitive `
+                        -SyncWindow 0).Count -ne 0 -or
+                [long]$execution.execution.exit_code -ne 0 -or
+                [long]$execution.execution.passed_checks -ne 4 -or
+                [long]$execution.execution.failed_checks -ne 0) {
+                throw $failureCode
+            }
+            Assert-SteinPhase2EvidenceShape -Value $execution.nested_tool `
+                -ExpectedProperties @(
+                    'executable', 'sha256', 'arguments', 'working_directory') `
+                -FailureCode $failureCode
+            Assert-SteinPhase2EvidenceHash `
+                -Value $execution.nested_tool.sha256 `
+                -FailureCode $failureCode
+            $expectedNestedArguments = @(
+                'metadata', '--locked', '--no-deps', '--format-version', '1',
+                '--manifest-path', 'Cargo.toml')
+            if ([string]$execution.nested_tool.executable -cne
+                    'resolved_cargo_payload' -or
+                [string]$execution.nested_tool.sha256 -cne
+                    [string]$receipt.bindings.cargo_resolved_sha256 -or
+                [string]$execution.nested_tool.working_directory -cne
+                    'validated_config_free_system_directory' -or
+                @(Compare-Object `
+                        -ReferenceObject $expectedNestedArguments `
+                        -DifferenceObject @($execution.nested_tool.arguments) `
+                        -CaseSensitive `
+                        -SyncWindow 0).Count -ne 0 -or
+                [long]$execution.execution.stderr.size -ne 0) {
+                throw $failureCode
+            }
+            $boundaryExecutionCount++
+        }
+        else {
+            $harnessId = [string]$execution.harness_id
+            $directArguments = @($execution.arguments | ForEach-Object { [string]$_ })
+            $registeredArguments = @(
+                $execution.registered_cargo_arguments | ForEach-Object { [string]$_ })
+            $preflightArguments = @(
+                $execution.preflight.arguments | ForEach-Object { [string]$_ })
+            Assert-SteinPhase2EvidenceShape -Value $execution.preflight `
+                -ExpectedProperties @(
+                    'exit_code', 'arguments', 'stdout', 'stderr',
+                    'exact_test_matches') `
+                -FailureCode $failureCode
+            Assert-SteinPhase2EvidenceShape -Value $execution.execution `
+                -ExpectedProperties @(
+                    'exit_code', 'stdout', 'stderr', 'passed_tests', 'failed_tests') `
+                -FailureCode $failureCode
+            if (-not $harnessById.ContainsKey($harnessId)) {
+                throw $failureCode
+            }
+            $harness = $harnessById[$harnessId]
+            $registeredTargetArguments = @(switch ([string]$harness.target_kind) {
+                    'lib' { '--lib' }
+                    'test' { '--test'; [string]$harness.target_name }
+                    'bin' { '--bin'; [string]$harness.target_name }
+                    default { }
+                })
+            $expectedRegisteredArguments = @($expectedCommand.arguments)
+            if ([string]$execution.executable -cne 'locked_test_binary' -or
+                [string]$execution.harness_id -cne
+                    [string]$expectedCommand.harness.harness_id -or
+                $directArguments.Count -ne 3 -or
+                $directArguments[0] -cne [string]$execution.qualified_test_name -or
+                $directArguments[1] -cne '--exact' -or
+                $directArguments[2] -cne '--test-threads=1' -or
+                $preflightArguments.Count -ne 3 -or
+                $preflightArguments[0] -cne [string]$execution.qualified_test_name -or
+                $preflightArguments[1] -cne '--exact' -or
+                $preflightArguments[2] -cne '--list' -or
+                @(Compare-Object `
+                        -ReferenceObject $expectedRegisteredArguments `
+                        -DifferenceObject $registeredArguments `
+                        -CaseSensitive `
+                        -SyncWindow 0).Count -ne 0 -or
+                [long]$execution.preflight.exit_code -ne 0 -or
+                [long]$execution.preflight.exact_test_matches -ne 1 -or
+                [long]$execution.execution.exit_code -ne 0 -or
+                [long]$execution.execution.passed_tests -ne 1 -or
+                [long]$execution.execution.failed_tests -ne 0 -or
+                [long]$execution.preflight.stderr.size -ne 0 -or
+                [long]$execution.execution.stderr.size -ne 0) {
+                throw $failureCode
+            }
+            $cargoExecutionCount++
+        }
+        foreach ($output in @(
+                $execution.execution.stdout, $execution.execution.stderr) +
+            $(if ($isBoundary) { @() } else {
+                    @($execution.preflight.stdout, $execution.preflight.stderr)
+                })) {
+            Assert-SteinPhase2EvidenceShape -Value $output `
+                -ExpectedProperties @('size', 'sha256') `
+                -FailureCode $failureCode
+            Assert-SteinPhase2EvidenceHash -Value $output.sha256 -FailureCode $failureCode
+            if ([long]$output.size -lt 0 -or [long]$output.size -gt 16777216) {
+                throw $failureCode
+            }
+        }
+        $executionById[$executionId] = $execution
+    }
+    if ($executions.Count -lt 1 -or $executions.Count -gt 128) {
+        throw $failureCode
+    }
+
+    $expectedSourceSubchecks = New-Object Collections.Generic.List[string]
+    foreach ($sourceSubcheckId in @($Gate.source_subchecks)) {
+        $mapping = $Gate.source_subcheck_check_ids.PSObject.Properties[
+            [string]$sourceSubcheckId]
+        if ($null -ne $mapping -and $checkId -cin @($mapping.Value)) {
+            $expectedSourceSubchecks.Add([string]$sourceSubcheckId)
+        }
+    }
+    $subchecks = @($receipt.subchecks)
+    $fixtureSubchecks = @($Fixture.subchecks)
+    if ($subchecks.Count -ne $expectedSourceSubchecks.Count -or
+        $fixtureSubchecks.Count -ne $expectedSourceSubchecks.Count) {
+        throw $failureCode
+    }
+    $referencedExecutions = @{}
+    $mappingCount = 0
+    for ($subcheckIndex = 0; $subcheckIndex -lt $subchecks.Count; $subcheckIndex++) {
+        $subcheck = $subchecks[$subcheckIndex]
+        Assert-SteinPhase2EvidenceShape -Value $subcheck `
+            -ExpectedProperties @('id', 'result', 'execution_ids') `
+            -FailureCode $failureCode
+        $executionIds = @($subcheck.execution_ids | ForEach-Object { [string]$_ })
+        if ([string]$subcheck.id -cne
+                [string]$expectedSourceSubchecks[$subcheckIndex] -or
+            [string]$subcheck.id -cne
+                [string]$fixtureSubchecks[$subcheckIndex].id -or
+            [string]$subcheck.result -cne 'pass' -or
+            $executionIds.Count -lt 1 -or
+            @($executionIds | Select-Object -Unique).Count -ne $executionIds.Count -or
+            @(Compare-Object `
+                    -ReferenceObject @($expectedSubcheckExecutionIds[$subcheckIndex]) `
+                    -DifferenceObject $executionIds `
+                    -CaseSensitive `
+                    -SyncWindow 0).Count -ne 0) {
+            throw $failureCode
+        }
+        foreach ($executionId in $executionIds) {
+            if (-not $executionById.ContainsKey($executionId)) {
+                throw $failureCode
+            }
+            $referencedExecutions[$executionId] = $true
+            $mappingCount++
+        }
+    }
+    if ($referencedExecutions.Count -ne $executionById.Count) {
+        throw $failureCode
+    }
+    Assert-SteinPhase2EvidenceShape -Value $receipt.summary `
+        -ExpectedProperties @(
+            'subcheck_count', 'harness_count', 'invocation_mapping_count',
+            'unique_execution_count', 'cargo_test_execution_count',
+            'boundary_execution_count') `
+        -FailureCode $failureCode
+    if ([long]$receipt.summary.subcheck_count -ne $subchecks.Count -or
+        [long]$receipt.summary.harness_count -ne $harnesses.Count -or
+        [long]$receipt.summary.invocation_mapping_count -ne $mappingCount -or
+        [long]$receipt.summary.unique_execution_count -ne $executions.Count -or
+        [long]$receipt.summary.cargo_test_execution_count -ne $cargoExecutionCount -or
+        [long]$receipt.summary.boundary_execution_count -ne $boundaryExecutionCount) {
+        throw $failureCode
+    }
+
+    foreach ($descriptorCase in @(
+            [pscustomobject]@{
+                value = $Check.source_fixture_receipt_artifact
+                path = "source-fixtures/$checkId.receipt.json"
+                maximum = 4194304
+            },
+            [pscustomobject]@{
+                value = $Check.source_fixture_suite_index
+                path = 'source-fixtures/index.json'
+                maximum = 1048576
+            })) {
+        Assert-SteinPhase2EvidenceShape -Value $descriptorCase.value `
+            -ExpectedProperties @('path', 'size', 'sha256') `
+            -FailureCode $failureCode
+        Assert-SteinPhase2EvidenceHash -Value $descriptorCase.value.sha256 `
+            -FailureCode $failureCode
+        if ([string]$descriptorCase.value.path -cne $descriptorCase.path -or
+            [long]$descriptorCase.value.size -lt 1 -or
+            [long]$descriptorCase.value.size -gt $descriptorCase.maximum) {
+            throw $failureCode
+        }
+    }
+    return $true
+}
+
 function Assert-SteinPhase2SourceEvidenceBinding {
     param(
         [Parameter(Mandatory = $true)] $EvidenceResult,
         [Parameter(Mandatory = $true)] $SourceReport,
         [Parameter(Mandatory = $true)] $SourceRootAnchor,
-        [Parameter(Mandatory = $true)] $EvidenceSpecification
+        [Parameter(Mandatory = $true)] $EvidenceSpecification,
+        [Parameter(Mandatory = $true)] $SourceFixtureRegistry,
+        [Parameter(Mandatory = $true)][string] $SourceFixtureRegistrySha256
     )
 
     Assert-SteinPhase2EvidenceShape -Value $SourceRootAnchor `
@@ -1270,6 +2024,7 @@ function Assert-SteinPhase2SourceEvidenceBinding {
     }
     $sourceGeneratorFiles = @($SourceReport.integrity.generator.files)
     $sourceGeneratorPaths = New-Object Collections.Generic.List[string]
+    $sourceGeneratorByPath = @{}
     foreach ($generatorFile in $sourceGeneratorFiles) {
         Assert-SteinPhase2EvidenceShape -Value $generatorFile `
             -ExpectedProperties @('path', 'size', 'sha256') `
@@ -1282,8 +2037,12 @@ function Assert-SteinPhase2SourceEvidenceBinding {
             [long]$generatorFile.size -le 0) {
             throw 'source_evidence_generator_invalid'
         }
+        if ($sourceGeneratorByPath.ContainsKey([string]$generatorFile.path)) {
+            throw 'source_evidence_generator_invalid'
+        }
         Assert-SteinPhase2EvidenceHash -Value $generatorFile.sha256 `
             -FailureCode 'source_evidence_generator_invalid'
+        $sourceGeneratorByPath[[string]$generatorFile.path] = $generatorFile
         $sourceGeneratorPaths.Add([string]$generatorFile.path)
     }
     Assert-SteinPhase2EvidenceExactSet `
@@ -1389,7 +2148,7 @@ function Assert-SteinPhase2SourceEvidenceBinding {
     $recomputedProvenanceDigest = Get-SteinPhase2EvidenceTextSha256 `
         -Value ($SourceReport.provenance | ConvertTo-Json -Depth 16 -Compress)
     $recomputedChecksDigest = Get-SteinPhase2EvidenceTextSha256 `
-        -Value (@($SourceReport.checks) | ConvertTo-Json -Depth 16 -Compress)
+        -Value (@($SourceReport.checks) | ConvertTo-Json -Depth 40 -Compress)
     if ([string]$SourceReport.integrity.provenance_sha256 -cne
             $recomputedProvenanceDigest -or
         [string]$SourceReport.integrity.checks_sha256 -cne
@@ -1456,27 +2215,79 @@ function Assert-SteinPhase2SourceEvidenceBinding {
     }
     foreach ($allowedNotRunId in $contractAllowedNotRunIds) {
         $allowedCheck = $checksById[[string]$allowedNotRunId]
-        $allowedStatus = [string]$allowedCheck.status
-        if ($allowedStatus -cne 'pass' -and $allowedStatus -cne 'not_run') {
+        $expectedNotRunReasons = [ordered]@{
+            'native-toolchain-provenance' = 'Authenticated Rust/rustup/Git/VS/MSVC/Windows SDK/package-tool payload, runtime, sysroot, library, and linker provenance is not implemented.'
+            'no-leaks-producer-workflow' = 'Candidate-owned installed artifact producer is not implemented.'
+            'pinned-clean-build-environment' = 'Authenticated immutable candidate input and fresh dependency, build, and output isolation are not implemented for every source check.'
+            'portable-runner-attestation' = 'Authenticated GitHub artifact attestation tied to repository, workflow, commit, and artifact digest is not implemented.'
+            'source-report-command-provenance' = 'Independent closed command/argument/working-directory provenance for every source-report check is not implemented.'
+            'windows-native-ignored-fixtures' = 'Requires explicit native-fixture workflow support; interactive native fixtures remain unimplemented source evidence.'
+        }
+        Assert-SteinPhase2EvidenceShape -Value $allowedCheck `
+            -ExpectedProperties @('id', 'status', 'reason') `
+            -FailureCode 'source_evidence_check_status_invalid'
+        if ([string]$allowedCheck.status -cne 'not_run' -or
+            [string]$allowedCheck.reason -cne
+                [string]$expectedNotRunReasons[[string]$allowedNotRunId]) {
             throw 'source_evidence_check_status_invalid'
         }
-        $allowedExitProperty = $allowedCheck.PSObject.Properties['exit_code']
-        if ($allowedStatus -ceq 'pass' -and $null -ne $allowedExitProperty -and
-            (($allowedExitProperty.Value -isnot [int] -and
-                    $allowedExitProperty.Value -isnot [long]) -or
-                [long]$allowedExitProperty.Value -ne 0)) {
-            throw 'source_evidence_check_status_invalid'
+    }
+    $registryGeneratorPath =
+        'scripts/windows/phase2/Source-Fixture-Registry.json'
+    if (-not $sourceGeneratorByPath.ContainsKey($registryGeneratorPath)) {
+        throw 'source_evidence_generator_invalid'
+    }
+    if ([string]$sourceGeneratorByPath[$registryGeneratorPath].sha256 -cne
+            [string]$EvidenceSpecification.source_report_contract.source_fixture_registry_sha256 -or
+        $SourceFixtureRegistrySha256 -cne
+            [string]$EvidenceSpecification.source_report_contract.source_fixture_registry_sha256) {
+        throw 'source_evidence_fixture_registry_invalid'
+    }
+    Assert-SteinPhase2EvidenceShape -Value $SourceFixtureRegistry `
+        -ExpectedProperties @(
+            'schema_version', 'registry_id', 'receipt_schema_version',
+            'fixtures') `
+        -FailureCode 'source_evidence_fixture_registry_invalid'
+    $sourceFixtureByCheck = @{}
+    foreach ($fixture in @($SourceFixtureRegistry.fixtures)) {
+        $fixtureCheckProperty = $fixture.PSObject.Properties['source_check_id']
+        if ($null -eq $fixtureCheckProperty -or
+            $sourceFixtureByCheck.ContainsKey([string]$fixtureCheckProperty.Value)) {
+            throw 'source_evidence_fixture_registry_invalid'
         }
-        if ($allowedStatus -ceq 'not_run') {
-            Assert-SteinPhase2EvidenceShape -Value $allowedCheck `
-                -ExpectedProperties @('id', 'status', 'reason') `
-                -FailureCode 'source_evidence_check_status_invalid'
-            if ($allowedCheck.reason -isnot [string] -or
-                [string]::IsNullOrWhiteSpace([string]$allowedCheck.reason) -or
-                ([string]$allowedCheck.reason).Length -gt 256) {
-                throw 'source_evidence_check_status_invalid'
-            }
+        $sourceFixtureByCheck[[string]$fixtureCheckProperty.Value] = $fixture
+    }
+    if ([long]$SourceFixtureRegistry.schema_version -ne 1 -or
+        [long]$SourceFixtureRegistry.receipt_schema_version -ne 1 -or
+        [string]$SourceFixtureRegistry.registry_id -cne
+            'stein.phase2.source-fixture.registry.v1' -or
+        $sourceFixtureByCheck.Count -ne 13) {
+        throw 'source_evidence_fixture_registry_invalid'
+    }
+    foreach ($fixtureCheck in @($SourceReport.checks | Where-Object {
+                [string]$_.id -clike 'phase2-source-fixture-*' -and
+                [string]$_.status -ceq 'pass'
+            })) {
+        $fixtureGates = @($EvidenceSpecification.gates | Where-Object {
+                $sourceCheckProperty =
+                    $_.PSObject.Properties['source_report_check_ids']
+                $null -ne $sourceCheckProperty -and
+                    [string]$fixtureCheck.id -cin @($sourceCheckProperty.Value)
+            })
+        if ($fixtureGates.Count -ne 1) {
+            throw 'source_fixture_receipt_invalid'
         }
+        if (-not $sourceFixtureByCheck.ContainsKey([string]$fixtureCheck.id)) {
+            throw 'source_fixture_receipt_invalid'
+        }
+        $null = Assert-SteinPhase2SourceFixtureReceiptCheck `
+            -Check $fixtureCheck `
+            -Gate $fixtureGates[0] `
+            -SourceReport $SourceReport `
+            -EvidenceResult $EvidenceResult `
+            -RegistrySha256 `
+                ([string]$sourceGeneratorByPath[$registryGeneratorPath].sha256) `
+            -Fixture $sourceFixtureByCheck[[string]$fixtureCheck.id]
     }
     Assert-SteinPhase2EvidenceShape -Value $SourceReport.summary `
         -ExpectedProperties @('pass', 'fail', 'not_run') `
@@ -1504,17 +2315,37 @@ function Assert-SteinPhase2SourceEvidenceBinding {
             } | ForEach-Object { @($_.source_check_ids) }) |
             ForEach-Object { $_ } |
             Sort-Object -Unique)
+    $frozenDependencySeen = $false
     foreach ($requiredCheckId in $requiredCheckIds) {
-        if (-not $checksById.ContainsKey([string]$requiredCheckId) -or
-            [string]$checksById[[string]$requiredCheckId].status -cne 'pass') {
+        if (-not $checksById.ContainsKey([string]$requiredCheckId)) {
             throw 'source_evidence_required_check_not_passed'
         }
-        $exitProperty = $checksById[[string]$requiredCheckId].PSObject.Properties['exit_code']
-        if ($null -ne $exitProperty -and
-            (($exitProperty.Value -isnot [int] -and $exitProperty.Value -isnot [long]) -or
-                [long]$exitProperty.Value -ne 0)) {
+        $requiredCheck = $checksById[[string]$requiredCheckId]
+        if ([string]$requiredCheckId -cin $contractRequiredPassIds) {
+            if ([string]$requiredCheck.status -cne 'pass') {
+                throw 'source_evidence_required_check_not_passed'
+            }
+            $exitProperty = $requiredCheck.PSObject.Properties['exit_code']
+            if ($null -ne $exitProperty -and
+                (($exitProperty.Value -isnot [int] -and
+                        $exitProperty.Value -isnot [long]) -or
+                    [long]$exitProperty.Value -ne 0)) {
+                throw 'source_evidence_required_check_not_passed'
+            }
+        }
+        elseif ([string]$requiredCheckId -cin $contractAllowedNotRunIds) {
+            if ([string]$requiredCheck.status -cne 'not_run') {
+                throw 'source_evidence_required_check_not_passed'
+            }
+            $frozenDependencySeen = $true
+        }
+        else {
             throw 'source_evidence_required_check_not_passed'
         }
+    }
+    if ($frozenDependencySeen -and
+        [string]$EvidenceResult.result -ceq 'pass') {
+        throw 'source_evidence_required_check_not_passed'
     }
     return $true
 }

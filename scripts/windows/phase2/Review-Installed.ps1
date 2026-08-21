@@ -35,7 +35,37 @@ trap {
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..\..")).Path
 $commonPath = Join-Path $PSScriptRoot "Common.ps1"
 
-function Get-SteinReviewBootstrapFileRecord {
+function Get-SteinReviewLockedStreamSha256 {
+    param(
+        [Parameter(Mandatory = $true)][IO.FileStream] $Stream,
+        [Parameter(Mandatory = $true)][string] $FailureCode
+    )
+
+    if (-not $Stream.CanRead -or -not $Stream.CanSeek) {
+        throw $FailureCode
+    }
+    try {
+        $Stream.Position = 0
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            return [BitConverter]::ToString($sha256.ComputeHash($Stream)).
+                Replace("-", "").ToLowerInvariant()
+        }
+        finally {
+            $sha256.Dispose()
+        }
+    }
+    catch {
+        throw $FailureCode
+    }
+    finally {
+        if ($Stream.CanSeek) {
+            $Stream.Position = 0
+        }
+    }
+}
+
+function Open-SteinReviewBootstrapFileBinding {
     param(
         [Parameter(Mandatory = $true)][string] $Role,
         [Parameter(Mandatory = $true)][string] $Path,
@@ -50,6 +80,27 @@ function Get-SteinReviewBootstrapFileRecord {
     if (-not $resolved.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
         throw "reviewer_runtime_source_outside_repository"
     }
+    $probe = Split-Path -Parent $resolved
+    while ($probe.Length -ge $repository.Length) {
+        $ancestor = Get-Item -LiteralPath $probe -Force -ErrorAction Stop
+        if (-not $ancestor.PSIsContainer -or
+            (($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            throw "reviewer_runtime_source_invalid"
+        }
+        if ([string]::Equals(
+                $probe,
+                $repository,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $parent = Split-Path -Parent $probe
+        if ([string]::IsNullOrWhiteSpace($parent) -or
+            [string]::Equals($parent, $probe, [StringComparison]::OrdinalIgnoreCase) -or
+            -not $parent.StartsWith($repository, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "reviewer_runtime_source_invalid"
+        }
+        $probe = $parent
+    }
     $item = Get-Item -LiteralPath $resolved -Force -ErrorAction Stop
     if ($item.PSIsContainer -or
         (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
@@ -62,23 +113,32 @@ function Get-SteinReviewBootstrapFileRecord {
         [IO.FileAccess]::Read,
         [IO.FileShare]::Read)
     try {
-        $sha256 = [Security.Cryptography.SHA256]::Create()
-        try {
-            $digest = [BitConverter]::ToString($sha256.ComputeHash($stream)).
-                Replace("-", "").ToLowerInvariant()
+        if ($stream.Length -ne [long]$item.Length) {
+            throw "reviewer_runtime_source_invalid"
         }
-        finally {
-            $sha256.Dispose()
+        $digest = Get-SteinReviewLockedStreamSha256 `
+            -Stream $stream `
+            -FailureCode "reviewer_runtime_source_invalid"
+        $current = Get-Item -LiteralPath $item.FullName -Force -ErrorAction Stop
+        if ($current.PSIsContainer -or
+            (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            [long]$current.Length -ne [long]$item.Length) {
+            throw "reviewer_runtime_source_invalid"
+        }
+        return [pscustomobject]@{
+            record = [pscustomobject]@{
+                role = $Role
+                path = $item.FullName.Substring($repository.Length + 1).Replace("\", "/")
+                size = [long]$item.Length
+                sha256 = $digest
+            }
+            full_path = $item.FullName
+            stream = $stream
         }
     }
-    finally {
+    catch {
         $stream.Dispose()
-    }
-    return [pscustomobject]@{
-        role = $Role
-        path = $item.FullName.Substring($repository.Length + 1).Replace("\", "/")
-        size = [long]$item.Length
-        sha256 = $digest
+        throw
     }
 }
 
@@ -95,20 +155,38 @@ $script:SteinReviewRuntimeSourceDefinitions = @(
         path = (Join-Path $PSScriptRoot "Evidence-Spec.json")
     },
     [pscustomobject]@{
+        role = "source-fixture-registry"
+        path = (Join-Path $PSScriptRoot "Source-Fixture-Registry.json")
+    },
+    [pscustomobject]@{
         role = "package-tools"
         path = (Join-Path $repoRoot "packaging\windows-msix\PackageTools.ps1")
     }
 ) | Sort-Object role
-$script:SteinReviewInitialRuntimeSources = @(
+$script:SteinReviewRuntimeSourceBindings = @(
     $script:SteinReviewRuntimeSourceDefinitions | ForEach-Object {
-        Get-SteinReviewBootstrapFileRecord `
+        Open-SteinReviewBootstrapFileBinding `
             -Role $_.role `
             -Path $_.path `
             -RepositoryRoot $repoRoot
     }
 )
+$script:SteinReviewInitialRuntimeSources = @(
+    $script:SteinReviewRuntimeSourceBindings | ForEach-Object { $_.record })
 
-. $commonPath
+$commonBinding = @($script:SteinReviewRuntimeSourceBindings | Where-Object {
+        [string]$_.record.role -ceq "phase2-common"
+    })
+if ($commonBinding.Count -ne 1) {
+    throw "reviewer_runtime_source_invalid"
+}
+. $commonBinding[0].full_path
+if ((Get-SteinReviewLockedStreamSha256 `
+            -Stream $commonBinding[0].stream `
+            -FailureCode "reviewer_runtime_source_changed") -cne
+        [string]$commonBinding[0].record.sha256) {
+    throw "reviewer_runtime_source_changed"
+}
 
 $script:SteinPhase2ReviewGateIds = @(
     "P2-BUILD",
@@ -144,9 +222,21 @@ $script:SteinPhase2ReviewGateIds = @(
     "P2-NO-LEAKS",
     "P2-PORTABLE-FIXTURE"
 )
-$evidenceContractPath = Join-Path $PSScriptRoot "Evidence-Contract.ps1"
+$evidenceContractBinding = @($script:SteinReviewRuntimeSourceBindings | Where-Object {
+        [string]$_.record.role -ceq "evidence-contract"
+    })
+if ($evidenceContractBinding.Count -ne 1) {
+    throw "reviewer_runtime_source_invalid"
+}
+$evidenceContractPath = [string]$evidenceContractBinding[0].full_path
 $evidenceSpecificationPath = Join-Path $PSScriptRoot "Evidence-Spec.json"
 . $evidenceContractPath
+if ((Get-SteinReviewLockedStreamSha256 `
+            -Stream $evidenceContractBinding[0].stream `
+            -FailureCode "reviewer_runtime_source_changed") -cne
+        [string]$evidenceContractBinding[0].record.sha256) {
+    throw "reviewer_runtime_source_changed"
+}
 $initialEvidenceSpecification = @($script:SteinReviewInitialRuntimeSources | Where-Object {
         [string]$_.role -ceq "evidence-spec"
     })
@@ -159,6 +249,17 @@ $script:SteinPhase2ReviewEvidenceSpecification = Read-SteinPhase2EvidenceSpecifi
     -Path $evidenceSpecificationPath `
     -ExpectedGateIds $script:SteinPhase2ReviewGateIds `
     -ExpectedSha256 $script:SteinPhase2ReviewEvidenceSpecificationSha256
+$initialSourceFixtureRegistry = @(
+    $script:SteinReviewInitialRuntimeSources | Where-Object {
+        [string]$_.role -ceq 'source-fixture-registry'
+    })
+if ($initialSourceFixtureRegistry.Count -ne 1) {
+    throw 'source_fixture_registry_runtime_source_missing'
+}
+$script:SteinPhase2ReviewSourceFixtureRegistry =
+    Read-SteinPhase2SourceFixtureRegistry `
+        -Path (Join-Path $PSScriptRoot 'Source-Fixture-Registry.json') `
+        -ExpectedSha256 ([string]$initialSourceFixtureRegistry[0].sha256)
 $script:SteinReviewArtifactCache = @{}
 $script:SteinReviewAttachmentFiles = @{}
 $script:SteinReviewCollectorRuntimeSourceFiles = @{}
@@ -734,26 +835,31 @@ function Assert-SteinReviewCollectorRuntimeSourcesStable {
 }
 
 function Assert-SteinReviewRuntimeSourcesStable {
-    $current = @(
-        $script:SteinReviewRuntimeSourceDefinitions | ForEach-Object {
-            Get-SteinReviewBootstrapFileRecord `
-                -Role $_.role `
-                -Path $_.path `
-                -RepositoryRoot $repoRoot
-        }
-    )
-    if ($current.Count -ne $script:SteinReviewInitialRuntimeSources.Count) {
+    $bindings = @($script:SteinReviewRuntimeSourceBindings)
+    if ($bindings.Count -ne $script:SteinReviewInitialRuntimeSources.Count) {
         throw "reviewer_runtime_source_changed"
     }
-    for ($index = 0; $index -lt $current.Count; $index++) {
+    for ($index = 0; $index -lt $bindings.Count; $index++) {
+        $binding = $bindings[$index]
+        $expected = $script:SteinReviewInitialRuntimeSources[$index]
         foreach ($property in @("role", "path", "size", "sha256")) {
-            if ([string]$current[$index].$property -cne
-                [string]$script:SteinReviewInitialRuntimeSources[$index].$property) {
+            if ([string]$binding.record.$property -cne [string]$expected.$property) {
                 throw "reviewer_runtime_source_changed"
             }
         }
+        $item = Get-Item -LiteralPath $binding.full_path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or
+            (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            [long]$item.Length -ne [long]$expected.size -or
+            [long]$binding.stream.Length -ne [long]$expected.size -or
+            (Get-SteinReviewLockedStreamSha256 `
+                -Stream $binding.stream `
+                -FailureCode "reviewer_runtime_source_changed") -cne
+                [string]$expected.sha256) {
+            throw "reviewer_runtime_source_changed"
+        }
     }
-    return $current
+    return @($script:SteinReviewInitialRuntimeSources | ForEach-Object { $_ })
 }
 
 function Assert-SteinReviewGenerator {
@@ -800,6 +906,10 @@ function Assert-SteinReviewGenerator {
         [pscustomobject]@{
             role = "evidence-spec"
             path = "scripts/windows/phase2/Evidence-Spec.json"
+        },
+        [pscustomobject]@{
+            role = "source-fixture-registry"
+            path = "scripts/windows/phase2/Source-Fixture-Registry.json"
         },
         [pscustomobject]@{
             role = "phase2-status"
@@ -1343,7 +1453,10 @@ function Read-SteinReviewNativeFixture {
         -EvidenceResult $fixture `
         -SourceReport $sourceReport `
         -SourceRootAnchor $sourceRoot `
-        -EvidenceSpecification $script:SteinPhase2ReviewEvidenceSpecification.specification
+        -EvidenceSpecification $script:SteinPhase2ReviewEvidenceSpecification.specification `
+        -SourceFixtureRegistry $script:SteinPhase2ReviewSourceFixtureRegistry.value `
+        -SourceFixtureRegistrySha256 `
+            ([string]$script:SteinPhase2ReviewSourceFixtureRegistry.sha256)
     if ([string]$Metadata.gate_id -ceq "P2-PORTABLE-FIXTURE") {
         $linuxPath = $UnderlyingPaths[[string]$fixture.bindings.linux_artifact.artifact_id]
         if ([string]::IsNullOrWhiteSpace($linuxPath)) {
@@ -2128,7 +2241,7 @@ foreach ($review in $reviews) {
     }
 
     if ([string]$review.disposition -ceq "pass") {
-        if ([string]$sourceRow.status -cin @("fail", "blocked")) {
+        if ([string]$sourceRow.status -cin @("fail", "blocked", "not_run")) {
             # The row is retained conservatively below; it cannot be promoted.
         }
         elseif ($null -eq $fixtureBinding -or
@@ -2180,9 +2293,13 @@ foreach ($gateId in $script:SteinPhase2ReviewGateIds) {
         }
         else { "independent_review_declared_blocked" }
     }
-    elseif ([string]$review.disposition -ceq "pass") {
+    elseif ([string]$sourceRow.status -ceq "pass" -and
+        [string]$review.disposition -ceq "pass") {
         $status = "pass"
         $reasonCode = "independently_reviewed_native_fixture_pass"
+    }
+    elseif ([string]$sourceRow.status -ceq "not_run") {
+        $reasonCode = "source_collector_declared_not_run"
     }
     $fixtureHash = $null
     if ($null -ne $fixtureBinding) {
@@ -2412,6 +2529,7 @@ for ($index = 0; $index -lt $reviewOutputArtifacts.Count; $index++) {
         throw "review_output_changed_during_finalization"
     }
 }
+$null = Assert-SteinReviewRuntimeSourcesStable
 
 $displayPath = $script:SteinReviewOutputPath.Substring($repoRoot.Length + 1).Replace("\", "/")
 Write-Host "Reviewed evidence directory (repository-relative): $displayPath"

@@ -151,9 +151,9 @@ not the required `no-leaks-producer-workflow` check and cannot promote
 `not_run` evidence with the bounded reason that the candidate-owned installed
 artifact producer is not implemented.
 
-The same checked-in contract fixes the full 44-row source-report check set (25
-required `pass`; 19 explicitly allowed `not_run`/`pass`) and the exact fourteen
-generator paths. Source provenance schema 2 records both the
+The same checked-in contract fixes the full 44-row source-report check set (38
+required `pass`; six exact frozen `not_run`) and the exact seventeen generator
+paths. Source provenance schema 2 records both the
 launcher shims and the rustup-selected Cargo/rustc payload hashes/toolchain ID,
 the pnpm JavaScript entrypoint hash, and both the Git-for-Windows launcher and
 resolved `mingw64\bin\git.exe` payload; a proxy or command shim alone is not
@@ -161,16 +161,23 @@ accepted as tool identity.
 
 Each named source subcheck maps to an exact check ID set. A generic
 `rust-tests` pass does not prove that a gate-specific fixture exists or ran.
-The thirteen `phase2-source-fixture-*` checks are therefore explicit `not_run`
-placeholders with the bounded reason `Closed gate-specific source fixture
-receipt is not implemented.` until targeted commands and closed receipts are
-added. Every source-origin subcheck also requires
-`pinned-clean-build-environment=pass` and
-`source-report-command-provenance=pass`; their current bounded reasons record
-that source verification still executes the mutable worktree/may reuse ignored
-Rust/frontend outputs and that independent closed command/argument/working-
-directory provenance is not implemented. This blocks all source-backed
-promotion while leaving native-only gates independently reviewable.
+The frozen source-fixture registry (`SHA-256
+d2414e552dfbc00b3ecf5837cfc431c64f670508ae4e8696b9fce4f85a75c5c5`)
+defines 13 fixtures and 71 ordered subchecks. The runner exports the exact Git
+tree, creates fresh private Cargo home/target directories, compiles eight closed
+harnesses, requires exact test discovery, and invokes only hash-locked test
+binaries. Its 140 mappings produce 117 per-fixture execution records (107
+globally unique identities); each receipt binds the candidate tree, semantic
+source bytes/Git blobs, environment, harness binary, exact command, result, and
+suite index.
+
+Every source-origin subcheck also requires
+`native-toolchain-provenance=pass`, `pinned-clean-build-environment=pass`, and
+`source-report-command-provenance=pass`. All three remain exact `not_run`
+because authenticated Rust/Git/native dependency closure, immutable isolated
+execution for every non-fixture source check, and independently attested
+commands are not implemented. This blocks all source-backed promotion while
+leaving native-only gates independently reviewable.
 
 The signed schema-3 build exports and locks the selected Git tree, uses private
 Cargo targets/home and fresh frozen-lockfile renderer output, and signer-binds

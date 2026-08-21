@@ -69,7 +69,107 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
-. (Join-Path $PSScriptRoot "PackageTools.ps1")
+
+function Get-SteinVerifyBootstrapStreamSha256 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [IO.FileStream] $Stream
+    )
+
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $Stream.Position = 0
+        return [BitConverter]::ToString($sha256.ComputeHash($Stream)).Replace(
+            '-',
+            '').ToLowerInvariant()
+    }
+    finally {
+        $Stream.Position = 0
+        $sha256.Dispose()
+    }
+}
+
+function Open-SteinVerifyBootstrapScriptBinding {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Path
+    )
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        $item.Length -lt 1 -or
+        $item.Length -gt 4194304) {
+        throw "An MSIX-verifier bootstrap script is not a regular bounded file."
+    }
+    $probe = Split-Path -Parent $item.FullName
+    $volume = [IO.Path]::GetPathRoot($probe)
+    while ($probe.Length -ge $volume.Length) {
+        $directory = Get-Item -LiteralPath $probe -Force -ErrorAction Stop
+        if (-not $directory.PSIsContainer -or
+            (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            throw "An MSIX-verifier bootstrap script has an unsafe ancestor."
+        }
+        if ([string]::Equals(
+                $probe,
+                $volume,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $probe = Split-Path -Parent $probe
+    }
+
+    $stream = [IO.FileStream]::new(
+        $item.FullName,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read)
+    try {
+        $length = [long]$stream.Length
+        if ($length -ne [long]$item.Length) {
+            throw "An MSIX-verifier bootstrap script changed before it was locked."
+        }
+        return [pscustomobject]@{
+            FullPath = $item.FullName
+            Length = $length
+            Sha256 = Get-SteinVerifyBootstrapStreamSha256 -Stream $stream
+            Stream = $stream
+        }
+    }
+    catch {
+        $stream.Dispose()
+        throw
+    }
+}
+
+function Assert-SteinVerifyBootstrapScriptBindingStable {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Binding
+    )
+
+    if ([long]$Binding.Stream.Length -ne [long]$Binding.Length -or
+        (Get-SteinVerifyBootstrapStreamSha256 -Stream $Binding.Stream) -cne
+            [string]$Binding.Sha256) {
+        throw "An MSIX-verifier bootstrap script changed while it was in use."
+    }
+}
+
+$verifyBootstrapBindings = New-Object Collections.Generic.List[object]
+$verifyBootstrapFailure = $null
+try {
+    $verifyScriptBootstrapBinding = Open-SteinVerifyBootstrapScriptBinding `
+        -Path $PSCommandPath
+    $verifyBootstrapBindings.Add($verifyScriptBootstrapBinding)
+    $packageToolsBootstrapBinding = Open-SteinVerifyBootstrapScriptBinding `
+        -Path (Join-Path $PSScriptRoot "PackageTools.ps1")
+    $verifyBootstrapBindings.Add($packageToolsBootstrapBinding)
+
+    . $packageToolsBootstrapBinding.FullPath
+    foreach ($binding in $verifyBootstrapBindings) {
+        $null = Assert-SteinVerifyBootstrapScriptBindingStable -Binding $binding
+    }
 
 $resolvedPackage = Resolve-SteinPackageRegularFileWithAncestors -Path $PackagePath
 if ([IO.Path]::GetExtension($resolvedPackage) -ine ".msix") {
@@ -189,4 +289,26 @@ finally {
             -Path $unpackRoot `
             -Purpose "verify"
     }
+}
+}
+catch {
+    $verifyBootstrapFailure = $_
+}
+finally {
+    foreach ($binding in $verifyBootstrapBindings) {
+        try {
+            $null = Assert-SteinVerifyBootstrapScriptBindingStable -Binding $binding
+        }
+        catch {
+            if ($null -eq $verifyBootstrapFailure) {
+                $verifyBootstrapFailure = $_
+            }
+        }
+        finally {
+            $binding.Stream.Dispose()
+        }
+    }
+}
+if ($null -ne $verifyBootstrapFailure) {
+    throw $verifyBootstrapFailure
 }

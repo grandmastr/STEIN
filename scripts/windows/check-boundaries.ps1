@@ -1,15 +1,58 @@
 [CmdletBinding()]
 param(
-    [switch]$Json
+    [switch]$Json,
+    [string]$CargoExecutable,
+    [string]$CargoExecutableSha256
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 3.0
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
-
-if (-not (Get-Command "cargo.exe" -ErrorAction SilentlyContinue)) {
-    throw "Required boundary-check tool is unavailable: cargo.exe"
+$CargoLock = $null
+if ([string]::IsNullOrWhiteSpace($CargoExecutable) -xor
+    [string]::IsNullOrWhiteSpace($CargoExecutableSha256)) {
+    throw "Cargo executable identity must be supplied as an exact pair."
+}
+if ([string]::IsNullOrWhiteSpace($CargoExecutable)) {
+    $CargoPath = [string]@(Get-Command "cargo.exe" -CommandType Application `
+            -ErrorAction Stop)[0].Source
+}
+else {
+    if ($CargoExecutableSha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw "Cargo executable SHA-256 is invalid."
+    }
+    $CargoPath = [IO.Path]::GetFullPath($CargoExecutable)
+    $CargoItem = Get-Item -LiteralPath $CargoPath -Force -ErrorAction Stop
+    if ($CargoItem.PSIsContainer -or
+        (($CargoItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "Cargo executable is not a regular file."
+    }
+    $cursor = $CargoItem.Directory
+    while ($null -ne $cursor) {
+        if (($cursor.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Cargo executable has a reparse-point ancestor."
+        }
+        $cursor = $cursor.Parent
+    }
+    $CargoLock = [IO.FileStream]::new(
+        $CargoPath,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read)
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $actualCargoSha256 = [BitConverter]::ToString(
+            $sha256.ComputeHash($CargoLock)).Replace("-", "").ToLowerInvariant()
+        $CargoLock.Position = 0
+    }
+    finally {
+        $sha256.Dispose()
+    }
+    if ($actualCargoSha256 -cne $CargoExecutableSha256) {
+        $CargoLock.Dispose()
+        $CargoLock = $null
+        throw "Cargo executable differs from its expected SHA-256."
+    }
 }
 
 $Checks = New-Object Collections.Generic.List[object]
@@ -66,13 +109,17 @@ function Find-ForbiddenSourceReferences(
     )
 }
 
-Push-Location $RepoRoot
 try {
-    $MetadataText = (& cargo.exe metadata --no-deps --format-version 1) -join [Environment]::NewLine
+    $MetadataText = (& $CargoPath metadata --locked --no-deps --format-version 1 `
+            --manifest-path (Join-Path $RepoRoot "Cargo.toml")) -join `
+        [Environment]::NewLine
     if ($LASTEXITCODE -ne 0) {
         throw "cargo metadata failed"
     }
     $Metadata = $MetadataText | ConvertFrom-Json
+
+    Push-Location $RepoRoot
+    try {
 
     $Core = Get-CargoPackage -Metadata $Metadata -Name "stein-core"
     $Protocol = Get-CargoPackage -Metadata $Metadata -Name "stein-protocol"
@@ -163,9 +210,16 @@ try {
             Write-Host "[$Marker] $($Check.name): $($Check.summary)"
         }
     }
-    if (-not $Passed) {
-        exit 1
+        if (-not $Passed) {
+            exit 1
+        }
     }
-} finally {
-    Pop-Location
+    finally {
+        Pop-Location
+    }
+}
+finally {
+    if ($null -ne $CargoLock) {
+        $CargoLock.Dispose()
+    }
 }

@@ -940,7 +940,7 @@ function Get-SteinSourceEvidenceObjectDigest {
     param([Parameter(Mandatory = $true)] $Value)
 
     return Get-SteinSourceEvidenceTextSha256 `
-        -Value ($Value | ConvertTo-Json -Depth 16 -Compress)
+        -Value ($Value | ConvertTo-Json -Depth 40 -Compress)
 }
 
 function Get-SteinSourceEvidenceGenerator {

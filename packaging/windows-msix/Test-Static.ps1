@@ -215,6 +215,8 @@ finally {
 }
 
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
+. (Join-Path $repoRoot "scripts\windows\phase2\Test-SourceFixture.ps1") `
+    -FixtureTestLibraryOnly
 $manifestPath = Join-Path $PSScriptRoot "AppxManifest.xml.in"
 $contract = Test-SteinManifestContract -ManifestPath $manifestPath
 if ($contract.Publisher -cne "{{PUBLISHER}}" -or $contract.Version -cne "{{VERSION}}") {
@@ -388,6 +390,154 @@ if ($buildIdentityProperties.Count -ne $identityProperties.Count -or
 }
 
 $verifyScript = Get-Content -LiteralPath (Join-Path $PSScriptRoot "Verify-Msix.ps1") -Raw
+$bootstrapScriptContracts = @(
+    [pscustomobject]@{
+        Path = Join-Path $PSScriptRoot "Build-Msix.ps1"
+        Source = $buildScript
+        Prefix = "Build"
+    },
+    [pscustomobject]@{
+        Path = Join-Path $PSScriptRoot "Verify-Msix.ps1"
+        Source = $verifyScript
+        Prefix = "Verify"
+    }
+)
+foreach ($bootstrapContract in $bootstrapScriptContracts) {
+    $openToken = "Open-Stein$($bootstrapContract.Prefix)BootstrapScriptBinding"
+    $assertToken = "Assert-Stein$($bootstrapContract.Prefix)BootstrapScriptBindingStable"
+    $dotSourceToken = '. $packageToolsBootstrapBinding.FullPath'
+    $openIndex = $bootstrapContract.Source.IndexOf(
+        "`$packageToolsBootstrapBinding = $openToken",
+        [StringComparison]::Ordinal)
+    $dotSourceIndex = $bootstrapContract.Source.IndexOf(
+        $dotSourceToken,
+        [StringComparison]::Ordinal)
+    $finalAssertionIndex = $bootstrapContract.Source.LastIndexOf(
+        $assertToken,
+        [StringComparison]::Ordinal)
+    if ($openIndex -lt 0 -or
+        $dotSourceIndex -le $openIndex -or
+        $finalAssertionIndex -le $dotSourceIndex) {
+        throw "A packaging entrypoint loads PackageTools outside its retained bootstrap lock."
+    }
+
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile(
+        $bootstrapContract.Path,
+        [ref]$tokens,
+        [ref]$parseErrors)
+    if ($parseErrors.Count -ne 0) {
+        throw "A packaging bootstrap contract did not parse."
+    }
+    foreach ($functionName in @(
+            "Get-Stein$($bootstrapContract.Prefix)BootstrapStreamSha256",
+            $openToken,
+            $assertToken)) {
+        $definition = @($ast.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -ceq $functionName
+                }, $true))
+        if ($definition.Count -ne 1) {
+            throw "A packaging bootstrap contract does not define its exact lock helper."
+        }
+        Invoke-Expression $definition[0].Extent.Text
+    }
+}
+
+$bootstrapFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) (
+    "stein-msix-bootstrap-" + [Guid]::NewGuid().ToString("N"))
+try {
+    $null = New-Item `
+        -ItemType Directory `
+        -Path $bootstrapFixtureRoot `
+        -ErrorAction Stop
+    foreach ($prefix in @("Build", "Verify")) {
+        $fixturePath = Join-Path $bootstrapFixtureRoot (
+            "$($prefix.ToLowerInvariant()).ps1")
+        [IO.File]::WriteAllText(
+            $fixturePath,
+            "Set-StrictMode -Version Latest`n",
+            [Text.UTF8Encoding]::new($false))
+        $openCommand = Get-Command `
+            -Name "Open-Stein${prefix}BootstrapScriptBinding" `
+            -CommandType Function `
+            -ErrorAction Stop
+        $assertCommand = Get-Command `
+            -Name "Assert-Stein${prefix}BootstrapScriptBindingStable" `
+            -CommandType Function `
+            -ErrorAction Stop
+        $hashCommand = Get-Command `
+            -Name "Get-Stein${prefix}BootstrapStreamSha256" `
+            -CommandType Function `
+            -ErrorAction Stop
+
+        $binding = & $openCommand -Path $fixturePath
+        try {
+            $writeWasDenied = $false
+            try {
+                [IO.File]::WriteAllText(
+                    $fixturePath,
+                    "throw 'swapped'`n",
+                    [Text.UTF8Encoding]::new($false))
+            }
+            catch {
+                $writeWasDenied = $true
+            }
+            if (-not $writeWasDenied) {
+                throw "A packaging bootstrap binding allowed its loaded script to be replaced."
+            }
+            $null = & $assertCommand -Binding $binding
+        }
+        finally {
+            $binding.Stream.Dispose()
+        }
+
+        $mutableStream = [IO.FileStream]::new(
+            $fixturePath,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::ReadWrite)
+        try {
+            $mutableBinding = [pscustomobject]@{
+                FullPath = $fixturePath
+                Length = [long]$mutableStream.Length
+                Sha256 = & $hashCommand -Stream $mutableStream
+                Stream = $mutableStream
+            }
+            $writer = [IO.FileStream]::new(
+                $fixturePath,
+                [IO.FileMode]::Open,
+                [IO.FileAccess]::Write,
+                [IO.FileShare]::ReadWrite)
+            try {
+                $writer.Position = 0
+                $writer.WriteByte(0x58)
+                $writer.Flush()
+            }
+            finally {
+                $writer.Dispose()
+            }
+            $mutationWasRejected = $false
+            try {
+                $null = & $assertCommand -Binding $mutableBinding
+            }
+            catch {
+                $mutationWasRejected = $true
+            }
+            if (-not $mutationWasRejected) {
+                throw "A packaging bootstrap finalization accepted changed loaded bytes."
+            }
+        }
+        finally {
+            $mutableStream.Dispose()
+        }
+    }
+}
+finally {
+    Remove-SteinStaticTemporaryLeaf -Path $bootstrapFixtureRoot
+}
 if ($verifyScript.IndexOf("Get-ExactSigningCertificate", [StringComparison]::Ordinal) -ge 0 -or
     $verifyScript.IndexOf("Assert-SteinExactAuthenticodeSignature", [StringComparison]::Ordinal) -lt 0 -or
     $verifyScript.IndexOf("ExpectedCoreSha256", [StringComparison]::Ordinal) -lt 0 -or
@@ -402,7 +552,10 @@ if ($verifyScript.IndexOf("Get-ExactSigningCertificate", [StringComparison]::Ord
     $verifyScript.IndexOf("ExpectedSourceRootDigestSha256", [StringComparison]::Ordinal) -lt 0 -or
     $verifyScript.IndexOf("packageReadLock", [StringComparison]::Ordinal) -lt 0 -or
     $verifyScript.IndexOf("[IO.FileShare]::Read", [StringComparison]::Ordinal) -lt 0 -or
-    $verifyScript.IndexOf("Test-SteinCoreBindingContract", [StringComparison]::Ordinal) -lt 0) {
+    $verifyScript.IndexOf("Test-SteinCoreBindingContract", [StringComparison]::Ordinal) -lt 0 -or
+    $verifyScript.IndexOf(
+        "Open-SteinVerifyBootstrapScriptBinding",
+        [StringComparison]::Ordinal) -lt 0) {
     throw "MSIX verification must pin the signature without requiring the signing private key."
 }
 if ($buildScript -cnotmatch '(?m)^\s*identity_schema_version\s*=\s*3\s*$' -or
@@ -420,7 +573,11 @@ if ($buildScript -cnotmatch '(?m)^\s*identity_schema_version\s*=\s*3\s*$' -or
             [Text.RegularExpressions.RegexOptions]::CultureInvariant)).Count -lt 3 -or
     $buildScript.IndexOf('$toolchain.Cargo build', [StringComparison]::Ordinal) -lt 0 -or
     $buildScript.IndexOf('$toolchain.PnpmEntrypoint', [StringComparison]::Ordinal) -lt 0 -or
-    $buildScript.IndexOf('--package stein-cli', [StringComparison]::Ordinal) -lt 0) {
+    $buildScript.IndexOf('--package stein-cli', [StringComparison]::Ordinal) -lt 0 -or
+    $buildScript.IndexOf(
+        "Open-SteinBuildBootstrapScriptBinding",
+        [StringComparison]::Ordinal) -lt 0 -or
+    $buildScript -cnotmatch '(?ms)buildScriptBootstrapBinding\.Sha256.*candidateBuildScriptHash.*packageToolsBootstrapBinding\.Sha256.*candidatePackageToolsHash') {
     throw "The signed build does not use schema-3 identity and the private pinned-tree build boundary."
 }
 $packageToolsSource = Get-Content -LiteralPath (
@@ -451,6 +608,8 @@ if ($publicationLockIndex -lt 0 -or
 
 $provenanceFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) (
     "stein-msix-provenance-static-" + [Guid]::NewGuid().ToString("N"))
+$groundingSnapshotRoot = $null
+$groundingSnapshotLocks = $null
 try {
     $null = New-Item -ItemType Directory -Path $provenanceFixtureRoot -ErrorAction Stop
     $sourceReportSpecPath = Join-Path $repoRoot "scripts\windows\phase2\Evidence-Spec.json"
@@ -497,12 +656,55 @@ try {
             "scripts/windows/phase2/Evidence-Spec.json") {
             $sourceReportSpecText
         }
+        elseif ([string]$generatorRelativePath -ceq
+            "scripts/windows/phase2/Source-Fixture-Registry.json") {
+            Get-Content -LiteralPath (Join-Path $repoRoot `
+                "scripts\windows\phase2\Source-Fixture-Registry.json") -Raw
+        }
+        elseif ([string]$generatorRelativePath -cin @(
+                "scripts/windows/phase2/Evidence-Contract.ps1",
+                "packaging/windows-msix/PackageTools.ps1")) {
+            Get-Content -LiteralPath (Join-Path $repoRoot (
+                    ([string]$generatorRelativePath).Replace(
+                        '/',
+                        [IO.Path]::DirectorySeparatorChar))) -Raw
+        }
         else {
             "synthetic generator: $generatorRelativePath`n"
         }
         [IO.File]::WriteAllText(
             $generatorPath,
             $generatorText,
+            [Text.UTF8Encoding]::new($false))
+    }
+    $syntheticRegistry = Get-Content `
+        -LiteralPath (Join-Path $provenanceFixtureRoot `
+            "scripts\windows\phase2\Source-Fixture-Registry.json") `
+        -Raw `
+        -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+    $semanticSourcePaths = @(
+        $syntheticRegistry.fixtures | ForEach-Object {
+            @($_.semantic_source_paths)
+        } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+    foreach ($semanticRelativePath in $semanticSourcePaths) {
+        $semanticPath = Join-Path $provenanceFixtureRoot (
+            $semanticRelativePath.Replace(
+                '/',
+                [IO.Path]::DirectorySeparatorChar))
+        if (Test-Path -LiteralPath $semanticPath) {
+            continue
+        }
+        $semanticParent = Split-Path -Parent $semanticPath
+        if (-not (Test-Path -LiteralPath $semanticParent)) {
+            $null = New-Item `
+                -ItemType Directory `
+                -Path $semanticParent `
+                -Force `
+                -ErrorAction Stop
+        }
+        [IO.File]::WriteAllText(
+            $semanticPath,
+            "synthetic semantic source: $semanticRelativePath`n",
             [Text.UTF8Encoding]::new($false))
     }
     $gitCommand = Get-Command git.exe -CommandType Application -ErrorAction Stop |
@@ -524,6 +726,27 @@ try {
         -RepositoryRoot $provenanceFixtureRoot `
         -GitExecutable $gitCommand.Source `
         -ExpectedGitExecutableSha256 $gitExecutableDigest
+    $groundingSnapshotRoot = New-SteinPackagePrivateTemporaryDirectory `
+        -Purpose "build"
+    $groundingSnapshot = New-SteinExactGitCandidateSnapshot `
+        -RepositoryRoot $provenanceFixtureRoot `
+        -GitExecutable $gitCommand.Source `
+        -ExpectedGitExecutableSha256 $gitExecutableDigest `
+        -ExpectedCommit $gitFixtureState.Commit `
+        -ExpectedTree $gitFixtureState.Tree `
+        -BuildRoot $groundingSnapshotRoot
+    $groundingSnapshotLocks = Open-SteinExactCandidateSnapshotLocks `
+        -Snapshot $groundingSnapshot
+    $groundingTreeBinding = Get-SteinPackageSourceFixtureTreeBinding `
+        -Snapshot $groundingSnapshot
+    $runnerGroundingTreeBinding = Get-SteinSourceFixtureTreeBinding `
+        -Snapshot $groundingSnapshot
+    if ([long]$runnerGroundingTreeBinding.file_count -ne
+            [long]$groundingTreeBinding.FileCount -or
+        [string]$runnerGroundingTreeBinding.manifest_sha256 -cne
+            [string]$groundingTreeBinding.ManifestSha256) {
+        throw "Source-fixture runner and signer candidate-tree bindings diverged."
+    }
 
     $evidenceDirectory = Join-Path $provenanceFixtureRoot "artifacts\evidence\phase-2\source-static"
     $null = New-Item -ItemType Directory -Path $evidenceDirectory -Force -ErrorAction Stop
@@ -664,6 +887,44 @@ try {
     $report.integrity.generator.files = $generatorFiles
     $provenanceDigest = Get-SteinPackageTextSha256 `
         -Value ($report.provenance | ConvertTo-Json -Depth 16 -Compress)
+    $syntheticRegistryPath = Join-Path $provenanceFixtureRoot `
+        "scripts\windows\phase2\Source-Fixture-Registry.json"
+    $syntheticRegistryRead = Read-SteinSourceFixtureLockedJson `
+        -Path $syntheticRegistryPath `
+        -MaximumBytes 1048576
+    $syntheticFixtureDirectory = Join-Path $evidenceDirectory "source-fixtures"
+    $syntheticFixtureSuite = New-SteinSourceFixtureSyntheticSuiteArtifacts `
+        -Registry $syntheticRegistryRead.value `
+        -RegistrySha256 ([string]$syntheticRegistryRead.sha256) `
+        -OutputDirectory $syntheticFixtureDirectory `
+        -CandidateGitCommit ([string]$gitFixtureState.Commit) `
+        -CandidateGitTree ([string]$gitFixtureState.Tree) `
+        -RustupToolchain $rustToolchainId `
+        -CargoLauncherSha256 $gitExecutableDigest `
+        -CargoResolvedSha256 $gitExecutableDigest `
+        -RustcLauncherSha256 $gitExecutableDigest `
+        -RustcResolvedSha256 $gitExecutableDigest `
+        -RustupVersion "rustup synthetic" `
+        -RustupSha256 $gitExecutableDigest `
+        -GitLauncherVersion "git version synthetic" `
+        -GitLauncherSha256 $gitExecutableDigest `
+        -GitResolvedVersion "git version synthetic" `
+        -GitResolvedSha256 $gitExecutableDigest `
+        -CandidateSnapshot $groundingSnapshot
+    foreach ($syntheticFixtureRecord in @($syntheticFixtureSuite.Records)) {
+        if ([long]$syntheticFixtureRecord.Receipt.bindings.candidate_tree_file_count -ne
+                [long]$groundingTreeBinding.FileCount -or
+            [string]$syntheticFixtureRecord.Receipt.bindings.
+                candidate_tree_manifest_sha256 -cne
+                [string]$groundingTreeBinding.ManifestSha256) {
+            throw "A synthetic source-fixture receipt has a divergent candidate-tree binding."
+        }
+    }
+    $syntheticFixtureByCheck = @{}
+    foreach ($fixtureRecord in @($syntheticFixtureSuite.Records)) {
+        $syntheticFixtureByCheck[
+            [string]$fixtureRecord.Fixture.source_check_id] = $fixtureRecord
+    }
     $checks = New-Object Collections.Generic.List[object]
     foreach ($checkId in @(
             $sourceReportSpec.source_report_contract.required_pass_check_ids)) {
@@ -674,6 +935,38 @@ try {
                     initial_provenance_sha256 = $provenanceDigest
                     completed_provenance_sha256 = $provenanceDigest
                     failure_summary = $null
+                })
+        }
+        elseif ($syntheticFixtureByCheck.ContainsKey([string]$checkId)) {
+            $fixtureRecord = $syntheticFixtureByCheck[[string]$checkId]
+            $checks.Add([ordered]@{
+                    id = [string]$checkId
+                    status = "pass"
+                    executable = "powershell.exe"
+                    arguments = @(
+                        "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", "scripts/windows/phase2/Run-Source-Fixture.ps1",
+                        "-OutputDirectory",
+                        "artifacts/evidence/phase-2/source-static/source-fixtures")
+                    working_directory = "."
+                    started_at = "2026-08-21T00:00:00.0000000Z"
+                    completed_at = "2026-08-21T00:00:01.0000000Z"
+                    duration_ms = 1000L
+                    exit_code = 0
+                    failure_summary = $null
+                    stdout = & $newLogRecord $logPaths.stdout
+                    stderr = & $newLogRecord $logPaths.stderr
+                    source_fixture_receipt = $fixtureRecord.Receipt
+                    source_fixture_receipt_artifact = [ordered]@{
+                        path = "source-fixtures/$([string]$fixtureRecord.Name)"
+                        size = [long]$fixtureRecord.Size
+                        sha256 = [string]$fixtureRecord.Sha256
+                    }
+                    source_fixture_suite_index = [ordered]@{
+                        path = "source-fixtures/index.json"
+                        size = [long]$syntheticFixtureSuite.IndexSize
+                        sha256 = [string]$syntheticFixtureSuite.IndexSha256
+                    }
                 })
         }
         else {
@@ -693,26 +986,37 @@ try {
                 })
         }
     }
+    $frozenSourceCheckReasons = [ordered]@{
+        "native-toolchain-provenance" = "Authenticated Rust/rustup/Git/VS/MSVC/Windows SDK/package-tool payload, runtime, sysroot, library, and linker provenance is not implemented."
+        "no-leaks-producer-workflow" = "Candidate-owned installed artifact producer is not implemented."
+        "pinned-clean-build-environment" = "Authenticated immutable candidate input and fresh dependency, build, and output isolation are not implemented for every source check."
+        "portable-runner-attestation" = "Authenticated GitHub artifact attestation tied to repository, workflow, commit, and artifact digest is not implemented."
+        "source-report-command-provenance" = "Independent closed command/argument/working-directory provenance for every source-report check is not implemented."
+        "windows-native-ignored-fixtures" = "Requires explicit native-fixture workflow support; interactive native fixtures remain unimplemented source evidence."
+    }
     foreach ($checkId in @(
             $sourceReportSpec.source_report_contract.allowed_not_run_check_ids)) {
+        if (-not $frozenSourceCheckReasons.Contains([string]$checkId)) {
+            throw "The static source-report fixture encountered an unknown frozen check."
+        }
         $checks.Add([ordered]@{
                 id = [string]$checkId
                 status = "not_run"
-                reason = "Synthetic fixture does not execute this optional workflow."
+                reason = [string]$frozenSourceCheckReasons[[string]$checkId]
             })
     }
     $report.checks = $checks.ToArray()
     $report.summary.pass = @($report.checks | Where-Object status -ceq "pass").Count
     $report.summary.not_run = @(
         $report.checks | Where-Object status -ceq "not_run").Count
-    $checksDigest = Get-SteinPackageTextSha256 `
-        -Value (@($report.checks | ForEach-Object { $_ }) |
-            ConvertTo-Json -Depth 16 -Compress)
+    $checksDigest = Get-SteinPackageCanonicalSourceChecksDigest `
+        -Checks @($report.checks) `
+        -FixtureCheckIds @($syntheticFixtureByCheck.Keys)
     $report.integrity.provenance_sha256 = $provenanceDigest
     $report.integrity.checks_sha256 = $checksDigest
     [IO.File]::WriteAllText(
         $reportPath,
-        ($report | ConvertTo-Json -Depth 16),
+        ($report | ConvertTo-Json -Depth 40),
         [Text.UTF8Encoding]::new($false))
     $reportItem = Get-Item -LiteralPath $reportPath -Force -ErrorAction Stop
     $reportDigest = Get-SteinPackageFileSha256 -Path $reportPath
@@ -745,25 +1049,45 @@ try {
     $anchorDigest = Get-SteinPackageFileSha256 -Path $anchorPath
     $verifiedSourceBinding = Get-SteinVerifiedSourceBuildBinding `
         -RepositoryRoot $provenanceFixtureRoot `
+        -CandidateRoot ([string]$groundingSnapshot.Root) `
+        -CandidateSnapshot $groundingSnapshot `
         -SourceVerificationReportPath $reportPath `
         -SourceRootAnchorPath $anchorPath `
         -ExpectedSourceVerificationSha256 $reportDigest `
         -ExpectedSourceRootAnchorSha256 $anchorDigest `
         -ExpectedCandidateGitCommit $gitFixtureState.Commit `
         -ExpectedCandidateGitTree $gitFixtureState.Tree
-    if ($verifiedSourceBinding.CandidateGitCommit -cne $gitFixtureState.Commit -or
+    if ([string]$verifiedSourceBinding.CandidateBindingScope -cne
+            "authoritative_locked_snapshot" -or
+        $verifiedSourceBinding.CandidateGitCommit -cne $gitFixtureState.Commit -or
         $verifiedSourceBinding.CandidateGitTree -cne $gitFixtureState.Tree -or
+        [long]$verifiedSourceBinding.CandidateTreeFileCount -ne
+            [long]$groundingTreeBinding.FileCount -or
+        [string]$verifiedSourceBinding.CandidateTreeManifestSha256 -cne
+            [string]$groundingTreeBinding.ManifestSha256 -or
         $verifiedSourceBinding.SourceRootDigestSha256 -cne $rootDigest) {
         throw "The signed-build source provenance fixture did not reproduce its exact binding."
     }
+    $fixtureContract = Get-SteinPackageSourceFixtureRegistryContract `
+        -CandidateRoot $provenanceFixtureRoot `
+        -EvidenceSpecification $sourceReportSpec
 
     $missingCheckRejected = $false
     try {
         $null = Assert-SteinPackageSourceReportCheckContract `
             -Checks @($report.checks | Select-Object -Skip 1) `
             -Contract $sourceReportSpec.source_report_contract `
+            -FixtureContract $fixtureContract `
+            -SourceReport $report `
+            -EvidenceSpecification $sourceReportSpec `
+            -CandidateRoot ([string]$groundingSnapshot.Root) `
+            -CandidateSnapshot $groundingSnapshot `
+            -CandidateTreeBinding $groundingTreeBinding `
+            -RequireCandidateGrounding $true `
             -RepositoryRoot $provenanceFixtureRoot `
-            -ReportDirectory $evidenceDirectory
+            -ReportDirectory $evidenceDirectory `
+            -ExpectedCandidateGitCommit $gitFixtureState.Commit `
+            -ExpectedCandidateGitTree $gitFixtureState.Tree
     }
     catch { $missingCheckRejected = $true }
     $duplicateCheckRejected = $false
@@ -771,8 +1095,17 @@ try {
         $null = Assert-SteinPackageSourceReportCheckContract `
             -Checks @($report.checks + @($report.checks[0])) `
             -Contract $sourceReportSpec.source_report_contract `
+            -FixtureContract $fixtureContract `
+            -SourceReport $report `
+            -EvidenceSpecification $sourceReportSpec `
+            -CandidateRoot ([string]$groundingSnapshot.Root) `
+            -CandidateSnapshot $groundingSnapshot `
+            -CandidateTreeBinding $groundingTreeBinding `
+            -RequireCandidateGrounding $true `
             -RepositoryRoot $provenanceFixtureRoot `
-            -ReportDirectory $evidenceDirectory
+            -ReportDirectory $evidenceDirectory `
+            -ExpectedCandidateGitCommit $gitFixtureState.Commit `
+            -ExpectedCandidateGitTree $gitFixtureState.Tree
     }
     catch { $duplicateCheckRejected = $true }
     $requiredNotRunChecks = @($report.checks | ForEach-Object {
@@ -791,19 +1124,212 @@ try {
         $null = Assert-SteinPackageSourceReportCheckContract `
             -Checks $requiredNotRunChecks `
             -Contract $sourceReportSpec.source_report_contract `
+            -FixtureContract $fixtureContract `
+            -SourceReport $report `
+            -EvidenceSpecification $sourceReportSpec `
+            -CandidateRoot ([string]$groundingSnapshot.Root) `
+            -CandidateSnapshot $groundingSnapshot `
+            -CandidateTreeBinding $groundingTreeBinding `
+            -RequireCandidateGrounding $true `
             -RepositoryRoot $provenanceFixtureRoot `
-            -ReportDirectory $evidenceDirectory
+            -ReportDirectory $evidenceDirectory `
+            -ExpectedCandidateGitCommit $gitFixtureState.Commit `
+            -ExpectedCandidateGitTree $gitFixtureState.Tree
     }
     catch { $requiredNotRunRejected = $true }
     if (-not $missingCheckRejected -or -not $duplicateCheckRejected -or
         -not $requiredNotRunRejected) {
         throw "The signed-build source check catalog accepted an incomplete or downgraded run."
     }
+    foreach ($frozenCheckId in @(
+            $sourceReportSpec.source_report_contract.allowed_not_run_check_ids)) {
+        $forgedChecks = @($report.checks | ForEach-Object {
+                if ([string]$_.id -ceq [string]$frozenCheckId) {
+                    [ordered]@{
+                        id = [string]$frozenCheckId
+                        status = 'pass'
+                        exit_code = 0
+                    }
+                }
+                else { $_ }
+            })
+        $frozenPassRejected = $false
+        try {
+            $null = Assert-SteinPackageSourceReportCheckContract `
+                -Checks $forgedChecks `
+                -Contract $sourceReportSpec.source_report_contract `
+                -FixtureContract $fixtureContract `
+                -SourceReport $report `
+                -EvidenceSpecification $sourceReportSpec `
+                -CandidateRoot ([string]$groundingSnapshot.Root) `
+                -CandidateSnapshot $groundingSnapshot `
+                -CandidateTreeBinding $groundingTreeBinding `
+                -RequireCandidateGrounding $true `
+                -RepositoryRoot $provenanceFixtureRoot `
+                -ReportDirectory $evidenceDirectory `
+                -ExpectedCandidateGitCommit $gitFixtureState.Commit `
+                -ExpectedCandidateGitTree $gitFixtureState.Tree
+        }
+        catch { $frozenPassRejected = $true }
+        if (-not $frozenPassRejected) {
+            throw "The signer accepted a generic PASS for a frozen source check."
+        }
+    }
+
+    $nestedReceiptChecks = $report.checks |
+        ConvertTo-Json -Depth 40 -Compress |
+        ConvertFrom-Json -ErrorAction Stop
+    $nestedReceiptChecks = @($nestedReceiptChecks)
+    $nestedReceiptCheck = @($nestedReceiptChecks | Where-Object {
+            [string]$_.id -clike 'phase2-source-fixture-*'
+        })[0]
+    $nestedReceiptCheck.source_fixture_receipt.bindings.registry_sha256 = "f" * 64
+    $nestedReceiptDigest = Get-SteinPackageCanonicalSourceChecksDigest `
+        -Checks $nestedReceiptChecks `
+        -FixtureCheckIds @($fixtureContract.CheckIds)
+    if ($nestedReceiptDigest -ceq $checksDigest) {
+        throw "A nested source-fixture mutation did not change the source checks digest."
+    }
+    $nestedReceiptMutationRejected = $false
+    try {
+        $null = Assert-SteinPackageSourceReportCheckContract `
+            -Checks $nestedReceiptChecks `
+            -Contract $sourceReportSpec.source_report_contract `
+            -FixtureContract $fixtureContract `
+            -SourceReport $report `
+            -EvidenceSpecification $sourceReportSpec `
+            -CandidateRoot ([string]$groundingSnapshot.Root) `
+            -CandidateSnapshot $groundingSnapshot `
+            -CandidateTreeBinding $groundingTreeBinding `
+            -RequireCandidateGrounding $true `
+            -RepositoryRoot $provenanceFixtureRoot `
+            -ReportDirectory $evidenceDirectory `
+            -ExpectedCandidateGitCommit $gitFixtureState.Commit `
+            -ExpectedCandidateGitTree $gitFixtureState.Tree
+    }
+    catch { $nestedReceiptMutationRejected = $true }
+    if (-not $nestedReceiptMutationRejected) {
+        throw "The signed-build source contract accepted a nested receipt mutation."
+    }
+
+    $assertGroundedReceiptMutationRejected = {
+        param(
+            [Parameter(Mandatory = $true)] $MutatedChecks,
+            $Snapshot = $groundingSnapshot,
+            $TreeBinding = $groundingTreeBinding
+        )
+        $rejected = $false
+        try {
+            $null = Assert-SteinPackageSourceReportCheckContract `
+                -Checks $MutatedChecks `
+                -Contract $sourceReportSpec.source_report_contract `
+                -FixtureContract $fixtureContract `
+                -SourceReport $report `
+                -EvidenceSpecification $sourceReportSpec `
+                -CandidateRoot ([string]$groundingSnapshot.Root) `
+                -CandidateSnapshot $Snapshot `
+                -CandidateTreeBinding $TreeBinding `
+                -RequireCandidateGrounding $true `
+                -RepositoryRoot $provenanceFixtureRoot `
+                -ReportDirectory $evidenceDirectory `
+                -ExpectedCandidateGitCommit $gitFixtureState.Commit `
+                -ExpectedCandidateGitTree $gitFixtureState.Tree
+        }
+        catch { $rejected = $true }
+        if (-not $rejected) {
+            throw "The signed-build source contract accepted a grounded receipt mutation."
+        }
+    }
+    foreach ($nestedMutation in @(
+            [pscustomobject]@{
+                Description = 'qualified test substitution'
+                Apply = {
+                    param($check)
+                    $check.source_fixture_receipt.executions[0].qualified_test_name =
+                        'repository::tests::unrelated_trivial_pass'
+                }
+            },
+            [pscustomobject]@{
+                Description = 'zero exact-test matches'
+                Apply = {
+                    param($check)
+                    $check.source_fixture_receipt.executions[0].preflight.exact_test_matches = 0
+                }
+            },
+            [pscustomobject]@{
+                Description = 'an empty execution set'
+                Apply = {
+                    param($check)
+                    $check.source_fixture_receipt.executions = @()
+                }
+            })) {
+        $mutatedChecks = $report.checks |
+            ConvertTo-Json -Depth 40 -Compress |
+            ConvertFrom-Json -ErrorAction Stop
+        $mutatedChecks = @($mutatedChecks)
+        $mutatedFixtureCheck = @($mutatedChecks | Where-Object {
+                [string]$_.id -clike 'phase2-source-fixture-*'
+            })[0]
+        & $nestedMutation.Apply $mutatedFixtureCheck
+        & $assertGroundedReceiptMutationRejected -MutatedChecks $mutatedChecks
+    }
+
+    foreach ($groundingMutation in @('semantic_sha256', 'semantic_blob',
+            'tree_count', 'tree_manifest')) {
+        $mutatedChecks = $report.checks |
+            ConvertTo-Json -Depth 40 -Compress |
+            ConvertFrom-Json -ErrorAction Stop
+        $mutatedChecks = @($mutatedChecks)
+        $mutatedFixtureCheck = @($mutatedChecks | Where-Object {
+                [string]$_.id -clike 'phase2-source-fixture-*'
+            })[0]
+        switch ($groundingMutation) {
+            'semantic_sha256' {
+                $mutatedFixtureCheck.source_fixture_receipt.semantic_sources[0].sha256 =
+                    'e' * 64
+                $mutatedFixtureCheck.source_fixture_receipt.bindings.semantic_source_manifest_sha256 =
+                    Get-SteinPackageTextSha256 -Value (
+                        $mutatedFixtureCheck.source_fixture_receipt.semantic_sources |
+                            ConvertTo-Json -Depth 16 -Compress)
+            }
+            'semantic_blob' {
+                $mutatedFixtureCheck.source_fixture_receipt.semantic_sources[0].git_blob_object_id =
+                    'd' * $gitFixtureState.Commit.Length
+                $mutatedFixtureCheck.source_fixture_receipt.bindings.semantic_source_manifest_sha256 =
+                    Get-SteinPackageTextSha256 -Value (
+                        $mutatedFixtureCheck.source_fixture_receipt.semantic_sources |
+                            ConvertTo-Json -Depth 16 -Compress)
+            }
+            'tree_count' {
+                $mutatedFixtureCheck.source_fixture_receipt.bindings.candidate_tree_file_count =
+                    [long]$groundingTreeBinding.FileCount + 1
+            }
+            'tree_manifest' {
+                $mutatedFixtureCheck.source_fixture_receipt.bindings.candidate_tree_manifest_sha256 =
+                    'c' * 64
+            }
+        }
+        & $assertGroundedReceiptMutationRejected -MutatedChecks $mutatedChecks
+    }
+    $missingSemanticSnapshot = ($groundingSnapshot |
+            ConvertTo-Json -Depth 16 -Compress) |
+        ConvertFrom-Json -ErrorAction Stop
+    $firstSemanticPath = [string]@(
+        $syntheticRegistry.fixtures[0].semantic_source_paths)[0]
+    $missingSemanticSnapshot.Files = @($missingSemanticSnapshot.Files | Where-Object {
+            [string]$_.RelativePath -cne $firstSemanticPath
+        })
+    & $assertGroundedReceiptMutationRejected `
+        -MutatedChecks @($report.checks) `
+        -Snapshot $missingSemanticSnapshot `
+        -TreeBinding $groundingTreeBinding
 
     $wrongEvidenceDigestRejected = $false
     try {
         $null = Get-SteinVerifiedSourceBuildBinding `
             -RepositoryRoot $provenanceFixtureRoot `
+            -CandidateRoot ([string]$groundingSnapshot.Root) `
+            -CandidateSnapshot $groundingSnapshot `
             -SourceVerificationReportPath $reportPath `
             -SourceRootAnchorPath $anchorPath `
             -ExpectedSourceVerificationSha256 ("f6" * 32) `
@@ -867,6 +1393,17 @@ try {
     }
 }
 finally {
+    if ($null -ne $groundingSnapshotLocks) {
+        foreach ($stream in @($groundingSnapshotLocks.Streams)) {
+            $stream.Dispose()
+        }
+    }
+    if ($null -ne $groundingSnapshotRoot -and
+        (Test-Path -LiteralPath $groundingSnapshotRoot)) {
+        Remove-SteinPackagePrivateTemporaryDirectory `
+            -Path $groundingSnapshotRoot `
+            -Purpose "build"
+    }
     if (Test-Path -LiteralPath $provenanceFixtureRoot) {
         Remove-SteinStaticTemporaryLeaf -Path $provenanceFixtureRoot
     }
@@ -1070,12 +1607,14 @@ $phase2PowerShell = @(
     "Uninstall.ps1",
     "Source-Evidence.ps1",
     "Evidence-Contract.ps1",
+    "Run-Source-Fixture.ps1",
     "Scan-NoLeaks.ps1",
     "Verify-Source.ps1",
     "Verify-Installed.ps1",
     "Review-Installed.ps1",
     "Test-VerifySource.ps1",
     "Test-VerifyInstalled.ps1",
+    "Test-SourceFixture.ps1",
     "Test-ScanNoLeaks.ps1",
     "Test-ReviewInstalled.ps1"
 )
@@ -1090,6 +1629,7 @@ $phase2Launchers = @(
 )
 $phase2EvidenceFiles = @(
     "Evidence-Spec.json",
+    "Source-Fixture-Registry.json",
     "Scan-NoLeaks.cmd"
 )
 foreach ($leaf in $phase2PowerShell + $phase2Launchers + $phase2EvidenceFiles + @("README.md")) {
@@ -1230,6 +1770,7 @@ if ($null -eq $installedEvidenceStatic -or
     -not [bool]$installedEvidenceStatic.evidence_spec_swap_rejected -or
     -not [bool]$installedEvidenceStatic.closed_runner_order_enforced -or
     -not [bool]$installedEvidenceStatic.no_leaks_pair_mismatch_rejected -or
+    -not [bool]$installedEvidenceStatic.runtime_source_swap_rejected -or
     -not [bool]$installedEvidenceStatic.exact_gate_evidence_contract) {
     throw "The Phase 2 installed-evidence harness failed its static contract."
 }
@@ -1255,8 +1796,9 @@ $reviewerStatic = $reviewerStaticJson | ConvertFrom-Json -ErrorAction Stop
 if ($null -eq $reviewerStatic -or
     -not [bool]$reviewerStatic.verified -or
     [int]$reviewerStatic.exact_gate_count -ne 32 -or
-    -not [bool]$reviewerStatic.positive_complete_acceptance -or
-    [int]$reviewerStatic.negative_case_count -ne 28 -or
+    -not [bool]$reviewerStatic.frozen_baseline_incomplete -or
+    -not [bool]$reviewerStatic.reviewer_runtime_source_swap_rejected -or
+    [int]$reviewerStatic.negative_case_count -lt 28 -or
     [int]$reviewerStatic.installed_state_mutations -ne 0) {
     throw "The Phase 2 installed-evidence reviewer failed its static contract."
 }
@@ -1266,7 +1808,7 @@ if ($null -eq $sourceEvidenceStatic -or
     -not [bool]$sourceEvidenceStatic.verified -or
     [int]$sourceEvidenceStatic.report_schema_version -ne 2 -or
     [int]$sourceEvidenceStatic.provenance_schema_version -ne 2 -or
-    [int]$sourceEvidenceStatic.generator_file_count -ne 14 -or
+    [int]$sourceEvidenceStatic.generator_file_count -ne 17 -or
     [int]$sourceEvidenceStatic.source_report_check_count -ne 44 -or
     -not [bool]$sourceEvidenceStatic.source_report_contract_bound -or
     -not [bool]$sourceEvidenceStatic.gate_specific_source_mapping_bound -or
@@ -1281,7 +1823,9 @@ if ($null -eq $sourceEvidenceStatic -or
     [int]$sourceEvidenceStatic.migration_identifier_count -lt 11 -or
     [string]$sourceEvidenceStatic.protocol_version -notmatch '^[0-9]+\.[0-9]+$' -or
     [string]::IsNullOrWhiteSpace([string]$sourceEvidenceStatic.policy_profile) -or
-    -not [bool]$sourceEvidenceStatic.deterministic_root_anchor) {
+    -not [bool]$sourceEvidenceStatic.deterministic_root_anchor -or
+    -not [bool]$sourceEvidenceStatic.bootstrap_source_swap_rejected -or
+    -not [bool]$sourceEvidenceStatic.bootstrap_role_set_closed) {
     throw "The Phase 2 source-evidence harness failed its static contract."
 }
 

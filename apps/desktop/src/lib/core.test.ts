@@ -48,7 +48,7 @@ describe("renderer-to-Tauri boundary", () => {
     tauri.listen.mockResolvedValue(vi.fn());
   });
 
-  it("exposes one metadata-only native route setup command and no standalone secret write", async () => {
+  it("phase2 secrets: exposes a closed value-free renderer command surface", async () => {
     const setup: ApproveModelRouteInput = {
       providerId: "openai",
       routeId: "exact-model",
@@ -70,9 +70,50 @@ describe("renderer-to-Tauri boundary", () => {
     expect(tauri.invoke).toHaveBeenCalledWith("desktop_setup_model_route", {
       input: setup,
     });
-    expect(core).not.toHaveProperty("storeModelSecret");
-    expect(core).not.toHaveProperty("approveModelRoute");
-    expect(JSON.stringify(setup)).not.toMatch(/credential|secret|password|api.?key/i);
+    expect(Object.keys(core)).toEqual([
+      "bootstrap",
+      "refresh",
+      "reconnect",
+      "createGoal",
+      "updateGoal",
+      "completeGoal",
+      "abandonGoal",
+      "deleteGoal",
+      "setupModelRoute",
+      "grantPermission",
+      "revokePermission",
+      "startFocusSession",
+      "registerSelectedResource",
+      "removeSelectedResource",
+      "updateUserPreferences",
+      "getSteinIdentity",
+      "getUserPreferences",
+      "getEffectivePolicy",
+      "getSelectedResources",
+      "setInterventionsMuted",
+      "endFocusSession",
+      "recordInterventionFeedback",
+      "explainIntervention",
+      "getInterventionHistory",
+      "getLatestModelRequestReceipt",
+      "subscribe",
+      "subscribeToastActivation",
+    ]);
+    expect(Object.keys(setup).sort()).toEqual([
+      "accountProfile",
+      "allowedDataCategories",
+      "disclosureVersion",
+      "handlingProfileVersion",
+      "idempotencyKey",
+      "maximumRequestTokens",
+      "placement",
+      "providerId",
+      "purpose",
+      "retentionKind",
+      "retentionMaximumSeconds",
+      "routeId",
+      "trainingUse",
+    ]);
   });
 
   it("exposes the complete protocol 1.2 command and query surface", async () => {

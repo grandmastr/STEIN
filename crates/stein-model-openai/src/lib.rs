@@ -140,11 +140,15 @@ impl OpenAiResponsesGateway {
             }
             bytes.extend_from_slice(&chunk);
         }
-        let decoded = serde_json::from_slice(&bytes);
-        bytes.fill(0);
-        let response: ResponsesEnvelope = decoded.map_err(|_| invalid_response())?;
+        let response = decode_response_and_zero(&mut bytes)?;
         normalize_response(response, request)
     }
+}
+
+fn decode_response_and_zero(bytes: &mut [u8]) -> Result<ResponsesEnvelope, ModelGatewayError> {
+    let decoded = serde_json::from_slice(bytes);
+    bytes.fill(0);
+    decoded.map_err(|_| invalid_response())
 }
 
 fn authorization_header(secret: &SecretValue) -> Result<HeaderValue, ModelGatewayError> {
@@ -620,11 +624,15 @@ fn map_status(status: reqwest::StatusCode) -> ModelGatewayError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use stein_core::{
         ActorId, ClientId, FocusSessionId, ModelHandlingProfile, ModelRouteApproval,
-        ModelRouteApprovalId, SecretStoreError, SecretValue, SensitiveText, WorkingContextItem,
+        ModelRouteApprovalId, ModelRouteReference, SecretStoreError, SecretValue, SensitiveText,
+        WorkingContextItem,
     };
     use time::OffsetDateTime;
 
@@ -639,6 +647,21 @@ mod tests {
 
         fn read(&self, _key: &SecretKey) -> Result<Option<SecretValue>, SecretStoreError> {
             Ok(Some(SecretValue::new(b"synthetic-api-key".to_vec())))
+        }
+    }
+
+    struct MissingSecrets {
+        read_calls: Arc<AtomicUsize>,
+    }
+
+    impl SecretStore for MissingSecrets {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn read(&self, _key: &SecretKey) -> Result<Option<SecretValue>, SecretStoreError> {
+            self.read_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
         }
     }
 
@@ -857,6 +880,115 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn phase2_secrets_missing_store_value_fails_before_network_without_fallback() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let gateway = OpenAiResponsesGateway::for_loopback_test(
+            Arc::new(MissingSecrets {
+                read_calls: Arc::clone(&read_calls),
+            }),
+            &format!("http://{address}/v1/responses"),
+        )
+        .unwrap();
+
+        let error = gateway
+            .reason(&request(), CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind, ModelGatewayErrorKind::Unavailable);
+        assert_eq!(error.summary, "The model route credential is unavailable.");
+        assert!(!error.retryable);
+        assert_eq!(read_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+
+        for (mut request, named_fallback) in [(request(), true), (request(), false)] {
+            if named_fallback {
+                request.route.fallback = Some(ModelRouteReference {
+                    provider_id: "synthetic-fallback-provider".to_owned(),
+                    route_id: "synthetic-fallback-route".to_owned(),
+                    placement: ModelPlacement::Remote,
+                });
+            } else {
+                request.route.fallback_allowed = true;
+            }
+            let read_calls = Arc::new(AtomicUsize::new(0));
+            let gateway = OpenAiResponsesGateway::for_loopback_test(
+                Arc::new(MissingSecrets {
+                    read_calls: Arc::clone(&read_calls),
+                }),
+                &format!("http://{address}/v1/responses"),
+            )
+            .unwrap();
+            let error = gateway
+                .reason(&request, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, ModelGatewayErrorKind::HandlingMismatch);
+            assert_eq!(read_calls.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        }
+
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::phase2_secrets_environment_secret_fallback_is_ignored_child",
+                "--test-threads=1",
+            ])
+            .env("STEIN_PHASE2_ENV_FALLBACK_CHILD", "1")
+            .env("OPENAI_API_KEY", "synthetic-env-fallback-must-not-be-read")
+            .env(
+                "STEIN_OPENAI_API_KEY",
+                "synthetic-env-fallback-must-not-be-read",
+            )
+            .output()
+            .unwrap();
+        assert!(child.status.success());
+        assert!(!String::from_utf8_lossy(&child.stdout).contains("synthetic-env-fallback"));
+        assert!(!String::from_utf8_lossy(&child.stderr).contains("synthetic-env-fallback"));
+    }
+
+    #[tokio::test]
+    async fn phase2_secrets_environment_secret_fallback_is_ignored_child() {
+        if std::env::var_os("STEIN_PHASE2_ENV_FALLBACK_CHILD").is_none() {
+            return;
+        }
+        assert!(std::env::var_os("OPENAI_API_KEY").is_some());
+        assert!(std::env::var_os("STEIN_OPENAI_API_KEY").is_some());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let gateway = OpenAiResponsesGateway::for_loopback_test(
+            Arc::new(MissingSecrets {
+                read_calls: Arc::clone(&read_calls),
+            }),
+            &format!("http://{address}/v1/responses"),
+        )
+        .unwrap();
+
+        let error = gateway
+            .reason(&request(), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ModelGatewayErrorKind::Unavailable);
+        assert_eq!(error.summary, "The model route credential is unavailable.");
+        assert_eq!(read_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
     #[test]
     fn tool_shaped_and_unknown_evidence_output_is_rejected() {
         let request = request();
@@ -1068,8 +1200,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn successful_response_buffer_is_zeroized_and_provider_fields_are_discarded() {
+        const PROVIDER_ONLY_SENTINEL: &str = "PROVIDER_ONLY_RAW_RESPONSE_SENTINEL";
+        let structured_output = serde_json::to_string(&json!({
+            "decision": "candidate",
+            "candidate_text": "Review the synthetic ledger while the evidence is fresh.",
+            "reason_code": "recent_relevant_progress",
+            "evidence_references": ["evidence-0"],
+            "uncertainty": "low"
+        }))
+        .unwrap();
+        let mut bytes = serde_json::to_vec(&json!({
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": structured_output}]
+            }],
+            "usage": {"output_tokens": 40},
+            "provider_private_debug": PROVIDER_ONLY_SENTINEL
+        }))
+        .unwrap();
+
+        let response = decode_response_and_zero(&mut bytes).unwrap();
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        let normalized = normalize_response(response, &request()).unwrap();
+        assert!(!format!("{normalized:?}").contains(PROVIDER_ONLY_SENTINEL));
+    }
+
     #[tokio::test]
     async fn loopback_contract_proves_headers_body_and_strict_response() {
+        const PROVIDER_ONLY_SENTINEL: &str = "PROVIDER_ONLY_RAW_RESPONSE_SENTINEL";
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let captured = Arc::new(Mutex::new(String::new()));
@@ -1112,7 +1274,8 @@ mod tests {
                     "status": "completed",
                     "content": [{"type": "output_text", "text": output}]
                 }],
-                "usage": {"output_tokens": 40}
+                "usage": {"output_tokens": 40},
+                "provider_private_debug": PROVIDER_ONLY_SENTINEL
             }))
             .unwrap();
             let response = format!(
@@ -1132,6 +1295,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(output, ModelReasoningOutput::Candidate { .. }));
+        assert!(!format!("{output:?}").contains(PROVIDER_ONLY_SENTINEL));
         server.await.unwrap();
         let captured = captured.lock().unwrap();
         assert!(captured.contains("authorization: Bearer synthetic-api-key"));
