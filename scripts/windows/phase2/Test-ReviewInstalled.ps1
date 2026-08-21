@@ -7,7 +7,10 @@ Set-StrictMode -Version 3.0
 $reviewerPath = Join-Path $PSScriptRoot "Review-Installed.ps1"
 $launcherPath = Join-Path $PSScriptRoot "Review-Installed.cmd"
 $commonPath = Join-Path $PSScriptRoot "Common.ps1"
-foreach ($requiredPath in @($reviewerPath, $launcherPath, $commonPath)) {
+$contractPath = Join-Path $PSScriptRoot "Evidence-Contract.ps1"
+$specificationPath = Join-Path $PSScriptRoot "Evidence-Spec.json"
+foreach ($requiredPath in @(
+        $reviewerPath, $launcherPath, $commonPath, $contractPath, $specificationPath)) {
     if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
         throw "The installed evidence reviewer fixture is incomplete."
     }
@@ -44,6 +47,8 @@ foreach ($mandatoryName in @(
 }
 
 $reviewerSource = Get-Content -LiteralPath $reviewerPath -Raw
+$contractSource = Get-Content -LiteralPath $contractPath -Raw
+$reviewerValidationSource = $reviewerSource + "`n" + $contractSource
 $gateMatch = [regex]::Match(
     $reviewerSource,
     '(?ms)\$script:SteinPhase2ReviewGateIds\s*=\s*@\((?<body>.*?)^\s*\)')
@@ -114,6 +119,23 @@ foreach ($requiredLiteral in @(
         "review_pass_requirements_not_satisfied",
         "json_artifact_hash_or_size_mismatch",
         "native_fixture_result",
+        "Evidence-Contract.ps1",
+        "Evidence-Spec.json",
+        "Assert-SteinPhase2GateEvidenceResult",
+        "Assert-SteinPhase2SourceEvidenceBinding",
+        "Assert-SteinPhase2LinuxPortableArtifact",
+        "Assert-SteinPhase2PrivateDiagnosticArtifact",
+        "Assert-SteinPhase2ToastComDenialArtifact",
+        "Assert-SteinPhase2NoLeaksProducerArtifact",
+        "Assert-SteinPhase2NoLeaksReceiptPair",
+        "Read-SteinReviewJsonFile",
+        "[IO.FileShare]::Read",
+        "review_underlying_artifact_hash_or_size_mismatch",
+        "source_check_ids",
+        "cli_executable_size",
+        "desktop_executable_sha256",
+        "desktop_dist_manifest_sha256",
+        "runner_artifacts",
         "source_collector_declared_fail",
         "source_collector_declared_blocked",
         "screenshot_can_prove_gate = `$false",
@@ -125,7 +147,7 @@ foreach ($requiredLiteral in @(
         "complete_acceptance",
         "reviewer-generator.json",
         "root-anchor.json")) {
-    if ($reviewerSource.IndexOf($requiredLiteral, [StringComparison]::Ordinal) -lt 0) {
+    if ($reviewerValidationSource.IndexOf($requiredLiteral, [StringComparison]::Ordinal) -lt 0) {
         throw "Review-Installed.ps1 is missing a fail-closed reviewer invariant."
     }
 }
@@ -154,6 +176,13 @@ if ($launcher -match '(?im)^\s*powershell\.exe(?:\s|$)' -or
 }
 
 . $commonPath
+. (Join-Path $PSScriptRoot "Evidence-Contract.ps1")
+$evidenceSpecificationPath = Join-Path $PSScriptRoot "Evidence-Spec.json"
+$evidenceSpecificationSha256 = Get-SteinPhase2Sha256 -Path $evidenceSpecificationPath
+$evidenceSpecification = Read-SteinPhase2EvidenceSpecification `
+    -Path $evidenceSpecificationPath `
+    -ExpectedGateIds $expectedGates `
+    -ExpectedSha256 $evidenceSpecificationSha256
 Assert-SteinPhase2WindowsHost
 
 function Write-SteinReviewTestJson {
@@ -228,6 +257,14 @@ function Get-SteinReviewTestCollectorRuntimeSources {
             path = "scripts/windows/phase2/Common.ps1"
         },
         [pscustomobject]@{
+            role = "evidence-contract"
+            path = "scripts/windows/phase2/Evidence-Contract.ps1"
+        },
+        [pscustomobject]@{
+            role = "evidence-spec"
+            path = "scripts/windows/phase2/Evidence-Spec.json"
+        },
+        [pscustomobject]@{
             role = "phase2-status"
             path = "scripts/windows/phase2/Status.ps1"
         }
@@ -251,7 +288,12 @@ function New-SteinReviewSyntheticFixture {
         [string] $HostProductName = "Windows Synthetic Test",
         [switch] $FabricatedGeneratorSource,
         [switch] $MismatchedRowCommand,
-        [switch] $DuplicateRowOutputArtifact
+        [switch] $DuplicateRowOutputArtifact,
+        [switch] $OmitMandatorySourceCheck,
+        [switch] $PinnedExecutionNotRun,
+        [switch] $CommandProvenanceNotRun,
+        [switch] $PortableAttestationNotRun,
+        [switch] $MismatchedPackageBinding
     )
 
     $evidenceRoot = Join-Path $Root "evidence"
@@ -325,7 +367,7 @@ function New-SteinReviewSyntheticFixture {
         signing_certificate_thumbprint = ("A" * 40)
         version = "2.0.0.0"
         package_path = "<local-path-sha256:$('3' * 64)>"
-        release_identity_schema_version = 1
+        release_identity_schema_version = 3
         install_record_schema_version = 2
         package_family_name = "STEIN.Synthetic_fixture"
         desktop_aumid = "STEIN.Synthetic_fixture!Desktop"
@@ -334,14 +376,24 @@ function New-SteinReviewSyntheticFixture {
         msix_sha256 = ("4" * 64)
         core_sha256 = ("5" * 64)
         browser_host_sha256 = ("6" * 64)
+        candidate_git_commit = $null
+        candidate_git_tree = $null
+        source_verification_sha256 = $null
+        source_root_anchor_sha256 = $null
+        source_root_digest_sha256 = $null
         installed_payload_file_count = 8
-        cli_sha256 = ("7" * 64)
+        cli_executable_size = 4096
+        cli_executable_sha256 = ("7" * 64)
+        desktop_executable_size = 8192
+        desktop_executable_sha256 = ("b" * 64)
+        desktop_dist_file_count = 3
+        desktop_dist_manifest_sha256 = ("c" * 64)
     }
     $versions = [ordered]@{
         package_version = "2.0.0.0"
         runtime_build_id = "synthetic-build"
         protocol_version = 1
-        release_identity_schema_version = 1
+        release_identity_schema_version = 3
         install_record_schema_version = 2
         durable_persistence_capability_schema_version = 1
         numeric_database_schema_reported = $true
@@ -419,17 +471,705 @@ function New-SteinReviewSyntheticFixture {
     $rowPaths = @{}
     $nativePaths = @{}
     $screenshotAttachmentId = "screenshot-p2-build"
+    $sourceCommit = "8" * 40
+    $sourceGeneratorFiles = @(
+        @($evidenceSpecification.specification.source_report_contract.required_generator_paths) |
+            ForEach-Object {
+                [ordered]@{
+                    path = [string]$_
+                    size = 1
+                    sha256 = "9" * 64
+                }
+            })
+    $sourceGeneratorHash = Get-SteinPhase2EvidenceTextSha256 `
+        -Value ($sourceGeneratorFiles | ConvertTo-Json -Depth 16 -Compress)
+    $sourceChecks = @(
+        foreach ($sourceCheckId in @(
+                $evidenceSpecification.specification.source_report_contract.required_pass_check_ids)) {
+            if ($OmitMandatorySourceCheck -and
+                [string]$sourceCheckId -ceq "no-leaks-scanner-static") {
+                continue
+            }
+            [ordered]@{
+                id = [string]$sourceCheckId
+                status = "pass"
+                exit_code = 0
+            }
+        }
+        foreach ($sourceCheckId in @(
+                $evidenceSpecification.specification.source_report_contract.allowed_not_run_check_ids)) {
+            if ($PinnedExecutionNotRun -and
+                [string]$sourceCheckId -ceq "pinned-clean-build-environment") {
+                [ordered]@{
+                    id = [string]$sourceCheckId
+                    status = "not_run"
+                    reason = "Synthetic mutable-worktree source execution was not promoted."
+                }
+            }
+            elseif ($CommandProvenanceNotRun -and
+                [string]$sourceCheckId -ceq "source-report-command-provenance") {
+                [ordered]@{
+                    id = [string]$sourceCheckId
+                    status = "not_run"
+                    reason = "Synthetic source command provenance was not promoted."
+                }
+            }
+            elseif ($PortableAttestationNotRun -and
+                [string]$sourceCheckId -ceq "portable-runner-attestation") {
+                [ordered]@{
+                    id = [string]$sourceCheckId
+                    status = "not_run"
+                    reason = "Synthetic portable runner identity was not authenticated."
+                }
+            }
+            elseif ([string]$sourceCheckId -cne "windows-native-ignored-fixtures") {
+                [ordered]@{
+                    id = [string]$sourceCheckId
+                    status = "pass"
+                    exit_code = 0
+                }
+            }
+            else {
+                [ordered]@{
+                    id = [string]$sourceCheckId
+                    status = "not_run"
+                    reason = "Synthetic optional native fixture was not executed."
+                }
+            }
+        }
+    )
+    $sourceProvenance = [ordered]@{
+        schema_version = 2
+        classification = "bounded_content_free_source_provenance"
+        repository = [ordered]@{
+            head_commit = $sourceCommit
+            clean = $true
+        }
+        toolchain = [ordered]@{
+            cargo = [ordered]@{
+                version = "cargo 1.0.0 (synthetic)"
+                executable_sha256 = "1" * 64
+                rustup_toolchain = "synthetic-x86_64-pc-windows-msvc"
+                resolved_version = "cargo 1.0.0 (synthetic)"
+                resolved_executable_sha256 = "2" * 64
+            }
+            rustc = [ordered]@{
+                version = "rustc 1.0.0 (synthetic)"
+                executable_sha256 = "1" * 64
+                rustup_toolchain = "synthetic-x86_64-pc-windows-msvc"
+                resolved_version = "rustc 1.0.0 (synthetic)"
+                resolved_executable_sha256 = "3" * 64
+            }
+            pnpm = [ordered]@{
+                version = "1.0.0"
+                executable_sha256 = "4" * 64
+                resolved_entrypoint_sha256 = "5" * 64
+            }
+            rustup = [ordered]@{
+                version = "rustup 1.0.0 (synthetic)"
+                executable_sha256 = "6" * 64
+            }
+            node = [ordered]@{
+                version = "v1.0.0"
+                executable_sha256 = "7" * 64
+            }
+            git = [ordered]@{
+                version = "git version 1.0.0.synthetic"
+                executable_sha256 = "8" * 64
+                resolved_version = "git version 1.0.0.synthetic"
+                resolved_executable_sha256 = "9" * 64
+            }
+            pwsh = [ordered]@{
+                version = "PowerShell 7.0.0"
+                executable_sha256 = "a" * 64
+                authenticode_status = "valid"
+                signer_subject = "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
+            }
+        }
+        dependency_locks = @(
+            [ordered]@{ path = "Cargo.lock"; size = 16; sha256 = "e" * 64 }
+        )
+    }
+    $sourceProvenanceHash = Get-SteinPhase2EvidenceTextSha256 `
+        -Value ($sourceProvenance | ConvertTo-Json -Depth 16 -Compress)
+    $sourceChecksHash = Get-SteinPhase2EvidenceTextSha256 `
+        -Value ($sourceChecks | ConvertTo-Json -Depth 16 -Compress)
+    $sourceReportRecord = [ordered]@{
+        schema_version = 2
+        claim = "source_verification_only"
+        installed_or_signed_evidence = $false
+        passed = $true
+        complete_acceptance = $false
+        provenance = $sourceProvenance
+        integrity = [ordered]@{
+            semantics = "content_integrity_only_not_authentication"
+            generator = [ordered]@{
+                schema_version = 1
+                files = $sourceGeneratorFiles
+                digest_sha256 = $sourceGeneratorHash
+            }
+            provenance_sha256 = $sourceProvenanceHash
+            checks_sha256 = $sourceChecksHash
+            root_anchor_path = "root-anchor.json"
+        }
+        checks = $sourceChecks
+        summary = [ordered]@{
+            pass = @($sourceChecks | Where-Object { $_.status -ceq "pass" }).Count
+            fail = 0
+            not_run = @($sourceChecks | Where-Object {
+                    $_.status -ceq "not_run"
+                }).Count
+        }
+    }
+    $sourceReportPath = Join-Path $attachmentRoot "source-verification.json"
+    $null = Write-SteinReviewTestJson -Path $sourceReportPath -Value $sourceReportRecord
+    $sourceReportItem = Get-Item -LiteralPath $sourceReportPath -Force -ErrorAction Stop
+    $sourceReportHash = Get-SteinPhase2Sha256 -Path $sourceReportPath
+    $sourceRootMaterial = @(
+        "stein-phase2-source-evidence-root-v1",
+        "source_verification_sha256=$sourceReportHash",
+        "generator_sha256=$sourceGeneratorHash",
+        "provenance_sha256=$sourceProvenanceHash",
+        "checks_sha256=$sourceChecksHash"
+    ) -join "`n"
+    $sourceRootRecord = [ordered]@{
+        schema_version = 1
+        claim = "source_verification_only"
+        integrity_semantics = "content_integrity_only_not_authentication"
+        source_verification = [ordered]@{
+            path = "source-verification.json"
+            size = [long]$sourceReportItem.Length
+            sha256 = $sourceReportHash
+        }
+        generator_sha256 = $sourceGeneratorHash
+        provenance_sha256 = $sourceProvenanceHash
+        checks_sha256 = $sourceChecksHash
+        root_digest_sha256 = Get-SteinReviewTestStringSha256 -Value $sourceRootMaterial
+    }
+    $sourceRootPath = Join-Path $attachmentRoot "source-root-anchor.json"
+    $null = Write-SteinReviewTestJson -Path $sourceRootPath -Value $sourceRootRecord
+    $sourceRootItem = Get-Item -LiteralPath $sourceRootPath -Force -ErrorAction Stop
+    $sourceRootHash = Get-SteinPhase2Sha256 -Path $sourceRootPath
+    $package.candidate_git_commit = $sourceCommit
+    $package.candidate_git_tree = "c" * 40
+    $package.source_verification_sha256 = $sourceReportHash
+    $package.source_root_anchor_sha256 = $sourceRootHash
+    $package.source_root_digest_sha256 = [string]$sourceRootRecord.root_digest_sha256
+
     foreach ($gateId in $expectedGates) {
         $leaf = $gateId.ToLowerInvariant() -replace "[^a-z0-9._-]", "-"
         $attachmentId = "fixture-$leaf"
+        $gateSpecification = $evidenceSpecification.gates_by_id[$gateId]
+        $subcheckRecords = New-Object Collections.Generic.List[object]
+        $subcheckOrigins = @{}
+        foreach ($subcheckId in @($gateSpecification.required_subchecks)) {
+            $subcheckOrigins[[string]$subcheckId] = Get-SteinPhase2GateSubcheckOrigin `
+                -Gate $gateSpecification `
+                -SubcheckId ([string]$subcheckId)
+        }
+        $origins = @($subcheckOrigins.Values | Sort-Object -Unique)
+        $artifactRecords = New-Object Collections.Generic.List[object]
+        $artifactMappings = New-Object Collections.Generic.List[object]
+        foreach ($sharedArtifact in @(
+                [pscustomobject]@{
+                    id = "source-verification-report"
+                    path = $sourceReportPath
+                    hash = $sourceReportHash
+                    size = [long]$sourceReportItem.Length
+                },
+                [pscustomobject]@{
+                    id = "source-root-anchor"
+                    path = $sourceRootPath
+                    hash = $sourceRootHash
+                    size = [long]$sourceRootItem.Length
+                })) {
+            $artifactRecords.Add([ordered]@{
+                artifact_id = [string]$sharedArtifact.id
+                proof_class = "source_provenance"
+                origin = "source_verification"
+                sha256 = [string]$sharedArtifact.hash
+                size = [long]$sharedArtifact.size
+            })
+            $artifactMappings.Add([ordered]@{
+                artifact_id = [string]$sharedArtifact.id
+                path = "attachments/$([IO.Path]::GetFileName([string]$sharedArtifact.path))"
+                sha256 = [string]$sharedArtifact.hash
+                size = [long]$sharedArtifact.size
+            })
+        }
+
+        $linuxBinding = $null
+        $linuxArtifactId = $null
+        $linuxLogArtifactIds = @{}
+        if ($gateId -ceq "P2-PORTABLE-FIXTURE") {
+            $linuxArtifactId = "portable-linux-result"
+            $linuxSubchecks = @(
+                foreach ($linuxSubcheckId in @($gateSpecification.linux_artifact.required_subchecks)) {
+                    $linuxLogArtifactId =
+                        [string]$gateSpecification.linux_artifact.artifact_id_prefix +
+                        [string]$linuxSubcheckId
+                    $linuxLogPath = Join-Path `
+                        $attachmentRoot `
+                        "$leaf-$linuxLogArtifactId.log"
+                    [IO.File]::WriteAllText(
+                        $linuxLogPath,
+                        "synthetic portable log for $linuxSubcheckId`n",
+                        [Text.UTF8Encoding]::new($false))
+                    $linuxLogItem = Get-Item `
+                        -LiteralPath $linuxLogPath `
+                        -Force `
+                        -ErrorAction Stop
+                    $linuxLogHash = Get-SteinPhase2Sha256 -Path $linuxLogPath
+                    $linuxLogArtifactIds[[string]$linuxSubcheckId] = $linuxLogArtifactId
+                    $artifactRecords.Add([ordered]@{
+                        artifact_id = $linuxLogArtifactId
+                        proof_class = "portable_linux"
+                        origin = "linux_ci"
+                        sha256 = $linuxLogHash
+                        size = [long]$linuxLogItem.Length
+                    })
+                    $artifactMappings.Add([ordered]@{
+                        artifact_id = $linuxLogArtifactId
+                        path = "attachments/$([IO.Path]::GetFileName($linuxLogPath))"
+                        sha256 = $linuxLogHash
+                        size = [long]$linuxLogItem.Length
+                    })
+                    [ordered]@{
+                        id = [string]$linuxSubcheckId
+                        command = "cargo synthetic $linuxSubcheckId"
+                        exit_code = 0
+                        result = "pass"
+                        artifact = [ordered]@{
+                            path = "logs/$linuxSubcheckId.log"
+                            size_bytes = [long]$linuxLogItem.Length
+                            sha256 = $linuxLogHash
+                        }
+                    }
+                })
+            $linuxArtifactRecord = [ordered]@{
+                schema_version = 1
+                gate_id = "P2-PORTABLE-FIXTURE"
+                fixture_id = "phase2-portable-semantic-v1"
+                runner_id = "github-actions-ubuntu-portable-v1"
+                result = "pass"
+                generated_at = $recordedAt
+                repository = [ordered]@{
+                    commit = $sourceCommit
+                    tree = "c" * 40
+                    clean_before = $true
+                    clean_after = $true
+                }
+                toolchain = [ordered]@{
+                    rustc_verbose = "rustc synthetic linux"
+                    cargo_version = "cargo synthetic"
+                    rust_toolchain_sha256 = "d" * 64
+                    cargo_lock_sha256 = "e" * 64
+                }
+                generator = [ordered]@{
+                    workflow_path = ".github/workflows/portable-semantic.yml"
+                    workflow_sha256 = "f" * 64
+                }
+                subchecks = $linuxSubchecks
+            }
+            $linuxPath = Join-Path $attachmentRoot "$leaf-linux.json"
+            $null = Write-SteinReviewTestJson -Path $linuxPath -Value $linuxArtifactRecord
+            $linuxItem = Get-Item -LiteralPath $linuxPath -Force -ErrorAction Stop
+            $linuxHash = Get-SteinPhase2Sha256 -Path $linuxPath
+            $artifactRecords.Add([ordered]@{
+                artifact_id = $linuxArtifactId
+                proof_class = "portable_linux"
+                origin = "linux_ci"
+                sha256 = $linuxHash
+                size = [long]$linuxItem.Length
+            })
+            $artifactMappings.Add([ordered]@{
+                artifact_id = $linuxArtifactId
+                path = "attachments/$([IO.Path]::GetFileName($linuxPath))"
+                sha256 = $linuxHash
+                size = [long]$linuxItem.Length
+            })
+            $linuxBinding = [ordered]@{
+                artifact_id = $linuxArtifactId
+                sha256 = $linuxHash
+                fixture_id = "phase2-portable-semantic-v1"
+                runner_id = "github-actions-ubuntu-portable-v1"
+            }
+        }
+
+        $proofArtifactIdsByOrigin = @{}
+        foreach ($origin in $origins) {
+            $proofArtifactIdsByOrigin[[string]$origin] =
+                New-Object Collections.Generic.List[string]
+        }
+        $runnerArtifactBindings = New-Object Collections.Generic.List[object]
+        $runnerProofClasses = @{}
+        $noLeaksCatalogHash = $null
+        $noLeaksProducerManifestHash = $null
+        $noLeaksProducerSourceHash = $null
+        if ($gateId -ceq "P2-NO-LEAKS") {
+            $noLeaksCatalogHash = Get-SteinReviewTestStringSha256 `
+                -Value "synthetic-no-leaks-catalog"
+            $producerSourcePath = Join-Path $attachmentRoot "$leaf-producer-source.ps1"
+            [IO.File]::WriteAllText(
+                $producerSourcePath,
+                "# synthetic contract-only sentinel producer source`n",
+                [Text.UTF8Encoding]::new($false))
+            $producerSourceItem = Get-Item `
+                -LiteralPath $producerSourcePath `
+                -Force `
+                -ErrorAction Stop
+            $noLeaksProducerSourceHash = Get-SteinPhase2Sha256 -Path $producerSourcePath
+            $producerManifestPath = Join-Path $attachmentRoot "$leaf-producer-manifest.json"
+            $null = Write-SteinReviewTestJson `
+                -Path $producerManifestPath `
+                -Value ([ordered]@{
+                    schema_version = 1
+                    producer_id = "stein-phase2-no-leaks-artifact-producer-v1"
+                    synthetic_contract_only = $true
+                })
+            $producerManifestItem = Get-Item `
+                -LiteralPath $producerManifestPath `
+                -Force `
+                -ErrorAction Stop
+            $noLeaksProducerManifestHash = Get-SteinPhase2Sha256 -Path $producerManifestPath
+            foreach ($producerArtifact in @(
+                    [pscustomobject]@{
+                        id = "no-leaks-producer-source"
+                        path = $producerSourcePath
+                        hash = $noLeaksProducerSourceHash
+                        size = [long]$producerSourceItem.Length
+                        origin = "source_verification"
+                    },
+                    [pscustomobject]@{
+                        id = "no-leaks-producer-manifest"
+                        path = $producerManifestPath
+                        hash = $noLeaksProducerManifestHash
+                        size = [long]$producerManifestItem.Length
+                        origin = "installed_native"
+                    })) {
+                $artifactRecords.Add([ordered]@{
+                    artifact_id = [string]$producerArtifact.id
+                    proof_class = "privacy_scan"
+                    origin = [string]$producerArtifact.origin
+                    sha256 = [string]$producerArtifact.hash
+                    size = [long]$producerArtifact.size
+                })
+                $artifactMappings.Add([ordered]@{
+                    artifact_id = [string]$producerArtifact.id
+                    path = "attachments/$([IO.Path]::GetFileName([string]$producerArtifact.path))"
+                    sha256 = [string]$producerArtifact.hash
+                    size = [long]$producerArtifact.size
+                })
+                $proofArtifactIdsByOrigin[[string]$producerArtifact.origin].Add(
+                    [string]$producerArtifact.id)
+            }
+        }
+        if ($null -ne $gateSpecification.PSObject.Properties["runner_artifacts"]) {
+            foreach ($runnerArtifactSpecification in @($gateSpecification.runner_artifacts)) {
+                $runnerArtifactId = "runner-$($runnerArtifactSpecification.artifact_role.Replace('_', '-'))"
+                $runnerArtifactPath = Join-Path $attachmentRoot "$leaf-$runnerArtifactId.json"
+                $runnerSubchecks = if (
+                    [string]$runnerArtifactSpecification.artifact_role -ceq "no_leaks_scan") {
+                    @($runnerArtifactSpecification.required_subchecks | ForEach-Object {
+                        [ordered]@{
+                            id = [string]$_
+                            result = "pass"
+                            files_inspected = 1
+                            matches_found = 0
+                        }
+                    })
+                }
+                elseif ([string]$runnerArtifactSpecification.artifact_role -ceq
+                    "no_leaks_sentinel_producer") {
+                    @($runnerArtifactSpecification.required_subchecks | ForEach-Object {
+                        [ordered]@{
+                            id = [string]$_
+                            result = "pass"
+                            artifacts_produced = 1
+                        }
+                    })
+                }
+                else {
+                    @($runnerArtifactSpecification.required_subchecks | ForEach-Object {
+                        [ordered]@{ id = [string]$_; result = "pass" }
+                    })
+                }
+                $runnerArtifactRecord = if (
+                    [string]$runnerArtifactSpecification.artifact_role -ceq "no_leaks_scan") {
+                    [ordered]@{
+                        schema_version = 1
+                        gate_id = "P2-NO-LEAKS"
+                        fixture_id = [string]$runnerArtifactSpecification.fixture_id
+                        runner_id = [string]$runnerArtifactSpecification.runner_id
+                        result = "pass"
+                        bindings = [ordered]@{
+                            package_msix_sha256 = [string]$package.msix_sha256
+                            candidate_git_commit = $sourceCommit
+                            source_verification_sha256 = $sourceReportHash
+                            artifact_catalog_sha256 = $noLeaksCatalogHash
+                            artifact_count = $runnerSubchecks.Count
+                        }
+                        summary = [ordered]@{
+                            required = $runnerSubchecks.Count
+                            passed = $runnerSubchecks.Count
+                            failed = 0
+                            not_run = 0
+                            files_inspected = $runnerSubchecks.Count
+                        }
+                        subchecks = $runnerSubchecks
+                    }
+                }
+                elseif ([string]$runnerArtifactSpecification.artifact_role -ceq
+                    "no_leaks_sentinel_producer") {
+                    [ordered]@{
+                        schema_version = 1
+                        gate_id = "P2-NO-LEAKS"
+                        fixture_id = [string]$runnerArtifactSpecification.fixture_id
+                        runner_id = [string]$runnerArtifactSpecification.runner_id
+                        result = "pass"
+                        bindings = [ordered]@{
+                            package_msix_sha256 = [string]$package.msix_sha256
+                            candidate_git_commit = $sourceCommit
+                            source_verification_sha256 = $sourceReportHash
+                            producer_manifest_sha256 = $noLeaksProducerManifestHash
+                            producer_source_sha256 = $noLeaksProducerSourceHash
+                            artifact_catalog_sha256 = $noLeaksCatalogHash
+                            artifact_count = $runnerSubchecks.Count
+                        }
+                        summary = [ordered]@{
+                            required = $runnerSubchecks.Count
+                            passed = $runnerSubchecks.Count
+                            failed = 0
+                            not_run = 0
+                            artifacts_produced = $runnerSubchecks.Count
+                        }
+                        subchecks = $runnerSubchecks
+                    }
+                }
+                else {
+                    [ordered]@{
+                        schema_version = 1
+                        fixture_id = [string]$runnerArtifactSpecification.fixture_id
+                        runner_id = [string]$runnerArtifactSpecification.runner_id
+                        result = "pass"
+                        summary = [ordered]@{
+                            required = $runnerSubchecks.Count
+                            passed = $runnerSubchecks.Count
+                            failed = 0
+                            not_run = 0
+                        }
+                        subchecks = $runnerSubchecks
+                    }
+                }
+                $null = Write-SteinReviewTestJson `
+                    -Path $runnerArtifactPath `
+                    -Value $runnerArtifactRecord
+                $runnerArtifactItem = Get-Item `
+                    -LiteralPath $runnerArtifactPath `
+                    -Force `
+                    -ErrorAction Stop
+                $runnerArtifactHash = Get-SteinPhase2Sha256 -Path $runnerArtifactPath
+                $artifactRecords.Add([ordered]@{
+                    artifact_id = $runnerArtifactId
+                    proof_class = [string]$runnerArtifactSpecification.proof_class
+                    origin = [string]$runnerArtifactSpecification.origin
+                    sha256 = $runnerArtifactHash
+                    size = [long]$runnerArtifactItem.Length
+                })
+                $artifactMappings.Add([ordered]@{
+                    artifact_id = $runnerArtifactId
+                    path = "attachments/$([IO.Path]::GetFileName($runnerArtifactPath))"
+                    sha256 = $runnerArtifactHash
+                    size = [long]$runnerArtifactItem.Length
+                })
+                $proofArtifactIdsByOrigin[[string]$runnerArtifactSpecification.origin].Add(
+                    $runnerArtifactId)
+                $runnerProofClasses[[string]$runnerArtifactSpecification.proof_class] = $true
+                $runnerArtifactBindings.Add([ordered]@{
+                    artifact_role = [string]$runnerArtifactSpecification.artifact_role
+                    artifact_id = $runnerArtifactId
+                    fixture_id = [string]$runnerArtifactSpecification.fixture_id
+                    runner_id = [string]$runnerArtifactSpecification.runner_id
+                    sha256 = $runnerArtifactHash
+                })
+            }
+        }
+        $proofIndex = 0
+        foreach ($proofClass in @($gateSpecification.required_proof_classes)) {
+            if ($runnerProofClasses.ContainsKey([string]$proofClass)) {
+                continue
+            }
+            if ($gateId -ceq "P2-PORTABLE-FIXTURE" -and
+                [string]$proofClass -ceq "portable_linux") {
+                $proofArtifactIdsByOrigin["linux_ci"].Add($linuxArtifactId)
+                continue
+            }
+            $origin = [string]$origins[$proofIndex % $origins.Count]
+            if ([string]$proofClass -ceq "source_contract" -and
+                "source_verification" -cin $origins) {
+                $origin = "source_verification"
+            }
+            $proofArtifactId = "proof-$($proofClass.Replace('_', '-'))"
+            $proofPath = Join-Path $attachmentRoot "$leaf-$proofArtifactId.json"
+            $null = Write-SteinReviewTestJson `
+                -Path $proofPath `
+                -Value ([ordered]@{
+                    schema_version = 1
+                    gate_id = $gateId
+                    proof_class = [string]$proofClass
+                    origin = $origin
+                    synthetic = $true
+                })
+            $proofItem = Get-Item -LiteralPath $proofPath -Force -ErrorAction Stop
+            $proofHash = Get-SteinPhase2Sha256 -Path $proofPath
+            $artifactRecords.Add([ordered]@{
+                artifact_id = $proofArtifactId
+                proof_class = [string]$proofClass
+                origin = $origin
+                sha256 = $proofHash
+                size = [long]$proofItem.Length
+            })
+            $artifactMappings.Add([ordered]@{
+                artifact_id = $proofArtifactId
+                path = "attachments/$([IO.Path]::GetFileName($proofPath))"
+                sha256 = $proofHash
+                size = [long]$proofItem.Length
+            })
+            $proofArtifactIdsByOrigin[$origin].Add($proofArtifactId)
+            $proofIndex++
+        }
+        foreach ($origin in $origins) {
+            if ($proofArtifactIdsByOrigin[$origin].Count -eq 0) {
+                $fallbackId = "proof-origin-$($origin.Replace('_', '-'))"
+                $fallbackPath = Join-Path $attachmentRoot "$leaf-$fallbackId.json"
+                $null = Write-SteinReviewTestJson `
+                    -Path $fallbackPath `
+                    -Value ([ordered]@{ origin = $origin; synthetic = $true })
+                $fallbackItem = Get-Item -LiteralPath $fallbackPath -Force -ErrorAction Stop
+                $fallbackHash = Get-SteinPhase2Sha256 -Path $fallbackPath
+                $artifactRecords.Add([ordered]@{
+                    artifact_id = $fallbackId
+                    proof_class = [string]@($gateSpecification.required_proof_classes)[0]
+                    origin = $origin
+                    sha256 = $fallbackHash
+                    size = [long]$fallbackItem.Length
+                })
+                $artifactMappings.Add([ordered]@{
+                    artifact_id = $fallbackId
+                    path = "attachments/$([IO.Path]::GetFileName($fallbackPath))"
+                    sha256 = $fallbackHash
+                    size = [long]$fallbackItem.Length
+                })
+                $proofArtifactIdsByOrigin[$origin].Add($fallbackId)
+            }
+        }
+        $firstSubcheckByOrigin = @{}
+        foreach ($subcheckId in @($gateSpecification.required_subchecks)) {
+            $origin = [string]$subcheckOrigins[[string]$subcheckId]
+            $artifactIds = @(if (-not $firstSubcheckByOrigin.ContainsKey($origin)) {
+                    $firstSubcheckByOrigin[$origin] = $true
+                    @($proofArtifactIdsByOrigin[$origin])
+                }
+                else { @([string]$proofArtifactIdsByOrigin[$origin][0]) })
+            if ($null -ne $gateSpecification.PSObject.Properties["runner_artifacts"]) {
+                foreach ($runnerArtifactSpecification in @($gateSpecification.runner_artifacts)) {
+                    if ([string]$subcheckId -cin @($runnerArtifactSpecification.required_subchecks)) {
+                        $runnerBinding = @($runnerArtifactBindings | Where-Object {
+                            [string]$_.artifact_role -ceq
+                                [string]$runnerArtifactSpecification.artifact_role
+                        })[0]
+                        if ([string]$runnerBinding.artifact_id -cnotin $artifactIds) {
+                            $artifactIds += [string]$runnerBinding.artifact_id
+                        }
+                    }
+                }
+            }
+            if ($origin -ceq "linux_ci" -and
+                $linuxLogArtifactIds.ContainsKey([string]$subcheckId)) {
+                $linuxLogArtifactId = $linuxLogArtifactIds[[string]$subcheckId]
+                if ($linuxLogArtifactId -cnotin $artifactIds) {
+                    $artifactIds += $linuxLogArtifactId
+                }
+            }
+            $subcheckRecords.Add([ordered]@{
+                id = [string]$subcheckId
+                origin = $origin
+                result = "pass"
+                artifact_ids = $artifactIds
+                source_check_ids = if ($origin -ceq "source_verification") {
+                    $sourceMappingProperty =
+                        $gateSpecification.source_subcheck_check_ids.PSObject.Properties[
+                            [string]$subcheckId]
+                    @(
+                        @($sourceMappingProperty.Value) +
+                            @(
+                                "pinned-clean-build-environment",
+                                "source-report-command-provenance") |
+                            Sort-Object -Unique)
+                }
+                else { @() }
+            })
+        }
         $fixtureRecord = [ordered]@{
-            schema_version = 1
-            fixture_id = $attachmentId
+            schema_version = 2
+            contract_id = [string]$evidenceSpecification.specification.contract_id
+            contract_sha256 = $evidenceSpecificationSha256
             gate_id = $gateId
+            fixture_id = [string]$gateSpecification.fixture_id
+            runner_id = [string]$gateSpecification.runner_id
             result = "pass"
             recorded_at_utc = $recordedAt
-            command_id = "synthetic:$leaf"
             exit_code = 0
+            runner = [ordered]@{
+                platform = "windows"
+                architecture = "AMD64"
+                non_elevated = $true
+                installed_package = $true
+            }
+            proof_classes = @($gateSpecification.required_proof_classes)
+            subchecks = @($subcheckRecords | ForEach-Object { $_ })
+            bindings = [ordered]@{
+                package = [ordered]@{
+                    package_family_name = [string]$package.package_family_name
+                    version = [string]$package.version
+                    msix_sha256 = [string]$package.msix_sha256
+                    core_sha256 = [string]$package.core_sha256
+                    browser_host_sha256 = [string]$package.browser_host_sha256
+                    cli_executable_size = [long]$package.cli_executable_size
+                    cli_executable_sha256 = [string]$package.cli_executable_sha256
+                    desktop_executable_size = [long]$package.desktop_executable_size
+                    desktop_executable_sha256 = [string]$package.desktop_executable_sha256
+                    desktop_dist_file_count = [int]$package.desktop_dist_file_count
+                    desktop_dist_manifest_sha256 = if (
+                        $MismatchedPackageBinding -and $gateId -ceq "P2-BUILD") {
+                        "d" * 64
+                    }
+                    else { [string]$package.desktop_dist_manifest_sha256 }
+                    candidate_git_commit = [string]$package.candidate_git_commit
+                    candidate_git_tree = [string]$package.candidate_git_tree
+                    source_verification_sha256 = [string]$package.source_verification_sha256
+                    source_root_anchor_sha256 = [string]$package.source_root_anchor_sha256
+                    source_root_digest_sha256 = [string]$package.source_root_digest_sha256
+                }
+                commit = [ordered]@{
+                    object_id = $sourceCommit
+                    tree_id = [string]$package.candidate_git_tree
+                }
+                collector = [ordered]@{
+                    host_identity_sha256 = [string]$hostRecord.host_identity_sha256
+                    evidence_owner_sid_only = $true
+                }
+                source_report = [ordered]@{
+                    report_artifact_id = "source-verification-report"
+                    root_anchor_artifact_id = "source-root-anchor"
+                    report_sha256 = $sourceReportHash
+                    root_anchor_sha256 = $sourceRootHash
+                    root_digest_sha256 = [string]$sourceRootRecord.root_digest_sha256
+                }
+                linux_artifact = $linuxBinding
+                runner_artifacts = @($runnerArtifactBindings | ForEach-Object { $_ })
+            }
+            artifacts = @($artifactRecords | ForEach-Object { $_ })
         }
         $nativePath = Join-Path $attachmentRoot "$leaf.json"
         $null = Write-SteinReviewTestJson -Path $nativePath -Value $fixtureRecord
@@ -450,11 +1190,17 @@ function New-SteinReviewSyntheticFixture {
             file_copied = $false
             semantic_result_verified_by_harness = $false
             native_fixture = [ordered]@{
-                schema_version = 1
-                fixture_id = $attachmentId
-                command_id = "synthetic:$leaf"
+                schema_version = 2
+                contract_id = [string]$fixtureRecord.contract_id
+                contract_sha256 = [string]$fixtureRecord.contract_sha256
+                fixture_id = [string]$fixtureRecord.fixture_id
+                runner_id = [string]$fixtureRecord.runner_id
                 exit_code = 0
                 closed_content_free_schema_verified = $true
+                proof_classes = @($fixtureRecord.proof_classes)
+                subchecks = @($fixtureRecord.subchecks)
+                bindings = $fixtureRecord.bindings
+                artifacts = @($fixtureRecord.artifacts)
             }
         }
         $rowAttachments = New-Object Collections.Generic.List[object]
@@ -465,6 +1211,7 @@ function New-SteinReviewSyntheticFixture {
             kind = "native_fixture_result"
             path = "attachments/$leaf.json"
             sha256 = $nativeHash
+            artifacts = @($artifactMappings | ForEach-Object { $_ })
         })
         if ($gateId -ceq "P2-BUILD") {
             $screenshotPath = Join-Path $attachmentRoot "p2-build.png"
@@ -495,6 +1242,7 @@ function New-SteinReviewSyntheticFixture {
                 kind = "redacted_screenshot"
                 path = "attachments/p2-build.png"
                 sha256 = $screenshotHash
+                artifacts = @()
             })
         }
 
@@ -871,6 +1619,46 @@ try {
         throw "The content-minimized final bundle retained a local path or SID."
     }
     $cases.Add("positive_complete_acceptance")
+
+    $missingSourceContractCheck = New-SteinReviewSyntheticFixture `
+        -Root (Join-Path $testRoot "missing-source-contract-check") `
+        -OmitMandatorySourceCheck
+    $null = Invoke-SteinReviewTestCase `
+        -Fixture $missingSourceContractCheck `
+        -ExpectedExitCode 1
+    $cases.Add("missing_mandatory_source_contract_check_rejected")
+
+    $mutableSourceExecution = New-SteinReviewSyntheticFixture `
+        -Root (Join-Path $testRoot "mutable-source-execution") `
+        -PinnedExecutionNotRun
+    $null = Invoke-SteinReviewTestCase `
+        -Fixture $mutableSourceExecution `
+        -ExpectedExitCode 1
+    $cases.Add("mutable_source_execution_cannot_promote")
+
+    $unboundSourceCommands = New-SteinReviewSyntheticFixture `
+        -Root (Join-Path $testRoot "unbound-source-commands") `
+        -CommandProvenanceNotRun
+    $null = Invoke-SteinReviewTestCase `
+        -Fixture $unboundSourceCommands `
+        -ExpectedExitCode 1
+    $cases.Add("unbound_source_commands_cannot_promote")
+
+    $unattestedPortableRunner = New-SteinReviewSyntheticFixture `
+        -Root (Join-Path $testRoot "unattested-portable-runner") `
+        -PortableAttestationNotRun
+    $null = Invoke-SteinReviewTestCase `
+        -Fixture $unattestedPortableRunner `
+        -ExpectedExitCode 1
+    $cases.Add("unattested_portable_runner_cannot_promote")
+
+    $mismatchedPackageBinding = New-SteinReviewSyntheticFixture `
+        -Root (Join-Path $testRoot "mismatched-package-binding") `
+        -MismatchedPackageBinding
+    $null = Invoke-SteinReviewTestCase `
+        -Fixture $mismatchedPackageBinding `
+        -ExpectedExitCode 1
+    $cases.Add("signed_package_subartifact_mismatch_rejected")
 
     $fabricatedSource = New-SteinReviewSyntheticFixture `
         -Root (Join-Path $testRoot "fabricated-source") `

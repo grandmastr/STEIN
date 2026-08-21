@@ -718,6 +718,129 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_model_packet_golden_binds_the_exact_category_intersection() {
+        let golden: Value = serde_json::from_str(include_str!(
+            "../../../contracts/model/phase2-openai-model-contract-v1.json"
+        ))
+        .expect("checked-in model contract fixture");
+        assert_eq!(golden["schema_version"], 1);
+        assert_eq!(golden["fixture_id"], "phase2-openai-model-contract-v1");
+
+        let request = request();
+        assert_eq!(golden["provider"], request.route.provider);
+        assert_eq!(golden["route"]["placement"], "remote");
+        assert_eq!(
+            golden["route"]["handling_profile"],
+            request.route.handling.profile_id
+        );
+        assert_eq!(
+            golden["route"]["allowed_categories"],
+            json!(
+                request
+                    .route
+                    .allowed_categories
+                    .iter()
+                    .map(|category| category.wire_name())
+                    .collect::<Vec<_>>()
+            )
+        );
+        assert_eq!(
+            golden["packet"]["permitted_categories"],
+            json!(
+                request
+                    .permitted_categories
+                    .iter()
+                    .map(|category| category.wire_name())
+                    .collect::<Vec<_>>()
+            )
+        );
+        assert_eq!(
+            golden["route"]["maximum_input_tokens"],
+            request.route.maximum_input_tokens
+        );
+        assert_eq!(
+            golden["route"]["maximum_output_tokens"],
+            request.route.maximum_output_tokens
+        );
+        assert_eq!(
+            golden["route"]["fallback_allowed"],
+            request.route.fallback_allowed
+        );
+
+        let body = build_request(&request).expect("approved bounded request");
+        let provider = &golden["provider_request"];
+        for field in ["model", "store", "background", "tool_choice", "tools"] {
+            assert_eq!(body[field], provider[field], "golden field {field}");
+        }
+        assert_eq!(body["text"]["format"]["strict"], provider["strict_schema"]);
+        let wrapped = body["input"][1]["content"][0]["text"]
+            .as_str()
+            .expect("bounded user packet text");
+        let serialized = wrapped
+            .strip_prefix("<untrusted_context>")
+            .and_then(|value| value.strip_suffix("</untrusted_context>"))
+            .expect("untrusted context delimiter");
+        let packet: Value = serde_json::from_str(serialized).expect("bounded packet JSON");
+        assert_eq!(packet["goal"], golden["packet"]["goal"]);
+        assert_eq!(packet["evidence"], golden["packet"]["evidence"]);
+
+        let encoded = serde_json::to_string(&body).expect("provider request JSON");
+        for forbidden in golden["provider_request"]["forbidden_fields"]
+            .as_array()
+            .expect("forbidden field list")
+        {
+            let forbidden = forbidden.as_str().expect("forbidden field name");
+            assert!(!encoded.contains(forbidden), "forbidden field {forbidden}");
+        }
+    }
+
+    #[test]
+    fn route_packet_and_context_categories_must_have_an_exact_narrowing_chain() {
+        let mut route_too_narrow = request();
+        route_too_narrow
+            .route
+            .allowed_categories
+            .remove(&DataCategory::WorkspaceActivity);
+        assert_eq!(
+            validate_route_and_packet(&route_too_narrow)
+                .unwrap_err()
+                .kind,
+            ModelGatewayErrorKind::HandlingMismatch
+        );
+
+        let mut grant_too_narrow = request();
+        grant_too_narrow
+            .permitted_categories
+            .remove(&DataCategory::WorkspaceActivity);
+        assert_eq!(
+            validate_route_and_packet(&grant_too_narrow)
+                .unwrap_err()
+                .kind,
+            ModelGatewayErrorKind::HandlingMismatch
+        );
+
+        let mut unapproved_category = request();
+        unapproved_category
+            .permitted_categories
+            .insert(DataCategory::BrowserLocation);
+        unapproved_category.context.push(WorkingContextItem {
+            category: DataCategory::BrowserLocation,
+            value: SensitiveText::new("synthetic.example"),
+            source_id: "fixture-browser".to_owned(),
+            resource_id: None,
+            observed_at: unapproved_category.issued_at,
+            age_ms: 25,
+            confidence_basis_points: 8_500,
+        });
+        assert_eq!(
+            validate_route_and_packet(&unapproved_category)
+                .unwrap_err()
+                .kind,
+            ModelGatewayErrorKind::HandlingMismatch
+        );
+    }
+
+    #[test]
     fn authorization_header_is_sensitive_and_rejects_ambiguous_keys() {
         let header = authorization_header(&SecretValue::new(b"synthetic-key".to_vec()))
             .expect("valid header");
@@ -899,6 +1022,50 @@ mod tests {
             normalize_response(tool_output, &request).unwrap_err().kind,
             ModelGatewayErrorKind::InvalidResponse
         );
+    }
+
+    #[test]
+    fn provider_refusal_and_failure_statuses_are_content_free_and_fail_closed() {
+        let refusal: ResponsesEnvelope = serde_json::from_value(json!({
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "status": "completed",
+                "content": [{
+                    "type": "refusal",
+                    "refusal": "synthetic private provider refusal text"
+                }]
+            }],
+            "usage": {"output_tokens": 4}
+        }))
+        .expect("provider refusal envelope");
+        let error = normalize_response(refusal, &request()).unwrap_err();
+        assert_eq!(error.kind, ModelGatewayErrorKind::InvalidResponse);
+        assert!(!error.summary.contains("synthetic private"));
+
+        for (status, kind, retryable) in [
+            (
+                reqwest::StatusCode::UNAUTHORIZED,
+                ModelGatewayErrorKind::RouteNotApproved,
+                false,
+            ),
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                ModelGatewayErrorKind::Unavailable,
+                true,
+            ),
+            (
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                ModelGatewayErrorKind::Unavailable,
+                true,
+            ),
+        ] {
+            let error = map_status(status);
+            assert_eq!(error.kind, kind);
+            assert_eq!(error.retryable, retryable);
+            assert!(!error.summary.contains(status.as_str()));
+            assert!(!error.summary.contains("synthetic private"));
+        }
     }
 
     #[tokio::test]

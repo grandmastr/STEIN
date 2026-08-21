@@ -18,40 +18,239 @@ jobs:
     name: Portable semantic fixture (Linux)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      STEIN_CANDIDATE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Bind the exact candidate
+        id: bind_candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/phase2-portable-semantic-v1"
+          printf 'STEIN_PORTABLE_EVIDENCE_DIR=%s\n' "$evidence_dir" >> "$GITHUB_ENV"
+          mkdir -p "$evidence_dir/logs"
+          actual_commit="$(git rev-parse HEAD)"
+          test "$actual_commit" = "$STEIN_CANDIDATE_COMMIT"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          printf '%s\n' "$actual_commit" > "$evidence_dir/repository-commit.txt"
+          git rev-parse 'HEAD^{tree}' > "$evidence_dir/repository-tree.txt"
+          printf 'true\n' > "$evidence_dir/clean-before.txt"
 
       - name: Install the pinned Rust toolchain
+        id: toolchain
+        shell: bash
         run: rustup show active-toolchain
 
+      - name: Record the exact toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -Vv > "$STEIN_PORTABLE_EVIDENCE_DIR/rustc.txt"
+          cargo -V > "$STEIN_PORTABLE_EVIDENCE_DIR/cargo.txt"
+
       - name: Verify provider-neutral formatting
-        run: cargo fmt --all -- --check
+        id: rust_format
+        shell: bash
+        run: |
+          set +e
+          log="$STEIN_PORTABLE_EVIDENCE_DIR/logs/rust_format.log"
+          printf '%s\n' 'command=cargo fmt --all -- --check' > "$log"
+          cargo fmt --all -- --check 2>&1 | tee -a "$log"
+          status=${PIPESTATUS[0]}
+          printf '%s\n' "$status" > "$STEIN_PORTABLE_EVIDENCE_DIR/rust_format.exit"
+          exit "$status"
 
       - name: Check provider-neutral crates
-        run: >-
-          cargo check --locked --all-targets
-          -p stein-core
-          -p stein-protocol
-          -p stein-ipc
-          -p stein-model-openai
-          -p stein-store-sqlite
+        id: portable_check
+        shell: bash
+        run: |
+          set +e
+          log="$STEIN_PORTABLE_EVIDENCE_DIR/logs/portable_check.log"
+          printf '%s\n' 'command=cargo check --locked --all-targets -p stein-core -p stein-protocol -p stein-ipc -p stein-model-openai -p stein-store-sqlite' > "$log"
+          cargo check --locked --all-targets -p stein-core -p stein-protocol -p stein-ipc -p stein-model-openai -p stein-store-sqlite 2>&1 | tee -a "$log"
+          status=${PIPESTATUS[0]}
+          printf '%s\n' "$status" > "$STEIN_PORTABLE_EVIDENCE_DIR/portable_check.exit"
+          exit "$status"
 
       - name: Lint provider-neutral crates
-        run: >-
-          cargo clippy --locked --all-targets
-          -p stein-core
-          -p stein-protocol
-          -p stein-ipc
-          -p stein-model-openai
-          -p stein-store-sqlite
-          -- -D warnings
+        id: portable_clippy
+        shell: bash
+        run: |
+          set +e
+          log="$STEIN_PORTABLE_EVIDENCE_DIR/logs/portable_clippy.log"
+          printf '%s\n' 'command=cargo clippy --locked --all-targets -p stein-core -p stein-protocol -p stein-ipc -p stein-model-openai -p stein-store-sqlite -- -D warnings' > "$log"
+          cargo clippy --locked --all-targets -p stein-core -p stein-protocol -p stein-ipc -p stein-model-openai -p stein-store-sqlite -- -D warnings 2>&1 | tee -a "$log"
+          status=${PIPESTATUS[0]}
+          printf '%s\n' "$status" > "$STEIN_PORTABLE_EVIDENCE_DIR/portable_clippy.exit"
+          exit "$status"
+
+      - name: Prove the complete policy and delivery loop
+        id: semantic_full_loop
+        shell: bash
+        run: |
+          set +e
+          log="$STEIN_PORTABLE_EVIDENCE_DIR/logs/semantic_full_loop.log"
+          printf '%s\n' 'command=cargo test --locked -p stein-core --lib second_mind::tests::full_loop_records_audited_delivery_and_ephemeral_correction -- --exact' > "$log"
+          cargo test --locked -p stein-core --lib second_mind::tests::full_loop_records_audited_delivery_and_ephemeral_correction -- --exact 2>&1 | tee -a "$log"
+          status=${PIPESTATUS[0]}
+          printf '%s\n' "$status" > "$STEIN_PORTABLE_EVIDENCE_DIR/semantic_full_loop.exit"
+          exit "$status"
+
+      - name: Prove the portable outbox recovery loop
+        id: semantic_outbox_recovery
+        shell: bash
+        run: |
+          set +e
+          log="$STEIN_PORTABLE_EVIDENCE_DIR/logs/semantic_outbox_recovery.log"
+          printf '%s\n' 'command=cargo test --locked -p stein-core --lib second_mind::tests::unavailable_channel_queues_then_fresh_recovery_delivers_once -- --exact' > "$log"
+          cargo test --locked -p stein-core --lib second_mind::tests::unavailable_channel_queues_then_fresh_recovery_delivers_once -- --exact 2>&1 | tee -a "$log"
+          status=${PIPESTATUS[0]}
+          printf '%s\n' "$status" > "$STEIN_PORTABLE_EVIDENCE_DIR/semantic_outbox_recovery.exit"
+          exit "$status"
+
+      - name: Prove portable restart recovery
+        id: semantic_restart_recovery
+        shell: bash
+        run: |
+          set +e
+          log="$STEIN_PORTABLE_EVIDENCE_DIR/logs/semantic_restart_recovery.log"
+          printf '%s\n' 'command=cargo test --locked -p stein-core --lib second_mind::tests::restart_recovery_requires_authorized_continuity_and_fresh_health -- --exact' > "$log"
+          cargo test --locked -p stein-core --lib second_mind::tests::restart_recovery_requires_authorized_continuity_and_fresh_health -- --exact 2>&1 | tee -a "$log"
+          status=${PIPESTATUS[0]}
+          printf '%s\n' "$status" > "$STEIN_PORTABLE_EVIDENCE_DIR/semantic_restart_recovery.exit"
+          exit "$status"
 
       - name: Run the portable semantic fixture
-        run: >-
-          cargo test --locked --all-targets
-          -p stein-core
-          -p stein-protocol
-          -p stein-ipc
-          -p stein-model-openai
-          -p stein-store-sqlite
+        id: portable_full_suite
+        shell: bash
+        run: |
+          set +e
+          log="$STEIN_PORTABLE_EVIDENCE_DIR/logs/portable_full_suite.log"
+          printf '%s\n' 'command=cargo test --locked --all-targets -p stein-core -p stein-protocol -p stein-ipc -p stein-model-openai -p stein-store-sqlite' > "$log"
+          cargo test --locked --all-targets -p stein-core -p stein-protocol -p stein-ipc -p stein-model-openai -p stein-store-sqlite 2>&1 | tee -a "$log"
+          status=${PIPESTATUS[0]}
+          printf '%s\n' "$status" > "$STEIN_PORTABLE_EVIDENCE_DIR/portable_full_suite.exit"
+          exit "$status"
+
+      - name: Build the candidate-bound portable evidence
+        id: portable_evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -z "$(git status --porcelain=v1 --untracked-files=all)"; then
+            printf 'true\n' > "$STEIN_PORTABLE_EVIDENCE_DIR/clean-after.txt"
+          else
+            printf 'false\n' > "$STEIN_PORTABLE_EVIDENCE_DIR/clean-after.txt"
+          fi
+          python3 - "$STEIN_PORTABLE_EVIDENCE_DIR" <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import pathlib
+          import subprocess
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          repository = pathlib.Path.cwd()
+          checks = [
+              ("rust_format", "cargo fmt --all -- --check"),
+              ("portable_check", "cargo check --locked --all-targets -p stein-core -p stein-protocol -p stein-ipc -p stein-model-openai -p stein-store-sqlite"),
+              ("portable_clippy", "cargo clippy --locked --all-targets -p stein-core -p stein-protocol -p stein-ipc -p stein-model-openai -p stein-store-sqlite -- -D warnings"),
+              ("semantic_full_loop", "cargo test --locked -p stein-core --lib second_mind::tests::full_loop_records_audited_delivery_and_ephemeral_correction -- --exact"),
+              ("semantic_outbox_recovery", "cargo test --locked -p stein-core --lib second_mind::tests::unavailable_channel_queues_then_fresh_recovery_delivers_once -- --exact"),
+              ("semantic_restart_recovery", "cargo test --locked -p stein-core --lib second_mind::tests::restart_recovery_requires_authorized_continuity_and_fresh_health -- --exact"),
+              ("portable_full_suite", "cargo test --locked --all-targets -p stein-core -p stein-protocol -p stein-ipc -p stein-model-openai -p stein-store-sqlite"),
+          ]
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as source:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          subchecks = []
+          for check_id, command in checks:
+              exit_path = root / f"{check_id}.exit"
+              log_path = root / "logs" / f"{check_id}.log"
+              exit_code = int(exit_path.read_text(encoding="utf-8").strip()) if exit_path.is_file() else None
+              artifact = None
+              if log_path.is_file():
+                  artifact = {
+                      "path": f"logs/{log_path.name}",
+                      "size_bytes": log_path.stat().st_size,
+                      "sha256": sha256(log_path),
+                  }
+              subchecks.append({
+                  "id": check_id,
+                  "command": command,
+                  "exit_code": exit_code,
+                  "result": "pass" if exit_code == 0 else ("fail" if exit_code is not None else "not_run"),
+                  "artifact": artifact,
+              })
+
+          commit = (root / "repository-commit.txt").read_text(encoding="utf-8").strip()
+          tree = (root / "repository-tree.txt").read_text(encoding="utf-8").strip()
+          clean_before = (root / "clean-before.txt").read_text(encoding="utf-8").strip() == "true"
+          clean_after = (root / "clean-after.txt").read_text(encoding="utf-8").strip() == "true"
+          expected = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          passed = (
+              commit == expected
+              and clean_before
+              and clean_after
+              and all(check["exit_code"] == 0 and check["result"] == "pass" for check in subchecks)
+          )
+          workflow = repository / ".github" / "workflows" / "portable-semantic.yml"
+          report = {
+              "schema_version": 1,
+              "gate_id": "P2-PORTABLE-FIXTURE",
+              "fixture_id": "phase2-portable-semantic-v1",
+              "runner_id": "github-actions-ubuntu-portable-v1",
+              "result": "pass" if passed else "fail",
+              "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+              "repository": {
+                  "commit": commit,
+                  "tree": tree,
+                  "clean_before": clean_before,
+                  "clean_after": clean_after,
+              },
+              "toolchain": {
+                  "rustc_verbose": (root / "rustc.txt").read_text(encoding="utf-8"),
+                  "cargo_version": (root / "cargo.txt").read_text(encoding="utf-8").strip(),
+                  "rust_toolchain_sha256": sha256(repository / "rust-toolchain.toml"),
+                  "cargo_lock_sha256": sha256(repository / "Cargo.lock"),
+              },
+              "generator": {
+                  "workflow_path": ".github/workflows/portable-semantic.yml",
+                  "workflow_sha256": sha256(workflow),
+              },
+              "subchecks": subchecks,
+          }
+          output = root / "portable-fixture.json"
+          output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(json.dumps({
+              "fixture_id": report["fixture_id"],
+              "repository_commit": commit,
+              "result": report["result"],
+              "subcheck_count": len(subchecks),
+          }, separators=(",", ":")))
+          if not passed:
+              raise SystemExit(1)
+          PY
+          printf 'path=%s\n' "$STEIN_PORTABLE_EVIDENCE_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Retain the portable evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: phase2-portable-semantic-${{ env.STEIN_CANDIDATE_COMMIT }}
+          path: ${{ runner.temp }}/phase2-portable-semantic-v1
+          if-no-files-found: error
+          retention-days: 30

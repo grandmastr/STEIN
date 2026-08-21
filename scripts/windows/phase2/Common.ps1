@@ -6,7 +6,7 @@ $script:SteinPhase2BrokerApplicationId = "PrivateBroker"
 $script:SteinPhase2BrowserProducerApplicationId = "BrowserObservationProducer"
 $script:SteinPhase2TaskPrefix = "STEIN Core SID-"
 $script:SteinPhase2InstallSchemaVersion = 2
-$script:SteinPhase2IdentitySchemaVersion = 1
+$script:SteinPhase2IdentitySchemaVersion = 3
 $script:SteinPhase2CredentialPrefix = "STEIN:model-route:"
 $script:SteinPhase2RestartCount = 10
 $script:SteinPhase2RestartInterval = "PT1M"
@@ -290,6 +290,15 @@ function Get-SteinPhase2ReleaseBundle {
             "core_executable_size",
             "core_executable_sha256",
             "browser_host_sha256",
+            "candidate_git_commit",
+            "candidate_git_tree",
+            "source_verification_sha256",
+            "source_root_anchor_sha256",
+            "source_root_digest_sha256",
+            "desktop_executable_size",
+            "desktop_executable_sha256",
+            "desktop_dist_file_count",
+            "desktop_dist_manifest_sha256",
             "cli_executable_file",
             "cli_executable_size",
             "cli_executable_sha256",
@@ -313,7 +322,9 @@ function Get-SteinPhase2ReleaseBundle {
     $expectedDesktopAumid = "$derivedFamily!$script:SteinPhase2DesktopApplicationId"
     $expectedBrokerAumid = "$derivedFamily!$script:SteinPhase2BrokerApplicationId"
     $expectedBrowserProducerAumid = "$derivedFamily!$script:SteinPhase2BrowserProducerApplicationId"
-    if ([int]$identity.identity_schema_version -ne $script:SteinPhase2IdentitySchemaVersion -or
+    if (($identity.identity_schema_version -isnot [int] -and
+            $identity.identity_schema_version -isnot [long]) -or
+        [long]$identity.identity_schema_version -ne $script:SteinPhase2IdentitySchemaVersion -or
         [string]$identity.package_name -cne $script:SteinPhase2PackageName -or
         [string]$identity.publisher -cne $Publisher -or
         [string]$identity.package_family_name -cne $derivedFamily -or
@@ -322,7 +333,25 @@ function Get-SteinPhase2ReleaseBundle {
         [string]$identity.browser_producer_aumid -cne $expectedBrowserProducerAumid -or
         [string]$identity.version -cne $Version -or
         [string]$identity.architecture -cne "x64" -or
-        ([string]$identity.signing_certificate_thumbprint).ToUpperInvariant() -cne $normalizedThumbprint) {
+        ([string]$identity.signing_certificate_thumbprint).ToUpperInvariant() -cne $normalizedThumbprint -or
+        -not (Test-SteinPackageGitObjectId -Value ([string]$identity.candidate_git_commit)) -or
+        -not (Test-SteinPackageGitObjectId -Value ([string]$identity.candidate_git_tree)) -or
+        ([string]$identity.candidate_git_commit).Length -ne
+            ([string]$identity.candidate_git_tree).Length -or
+        -not (Test-SteinPackageSha256Value -Value ([string]$identity.source_verification_sha256)) -or
+        -not (Test-SteinPackageSha256Value -Value ([string]$identity.source_root_anchor_sha256)) -or
+        -not (Test-SteinPackageSha256Value -Value ([string]$identity.source_root_digest_sha256)) -or
+        ($identity.desktop_executable_size -isnot [int] -and
+            $identity.desktop_executable_size -isnot [long]) -or
+        [long]$identity.desktop_executable_size -le 0 -or
+        -not (Test-SteinPackageSha256Value `
+            -Value ([string]$identity.desktop_executable_sha256)) -or
+        ($identity.desktop_dist_file_count -isnot [int] -and
+            $identity.desktop_dist_file_count -isnot [long]) -or
+        [long]$identity.desktop_dist_file_count -le 0 -or
+        [long]$identity.desktop_dist_file_count -gt 10000 -or
+        -not (Test-SteinPackageSha256Value `
+            -Value ([string]$identity.desktop_dist_manifest_sha256))) {
         throw "The release identity does not match the exact operator-pinned production identity."
     }
 
@@ -352,14 +381,41 @@ function Get-SteinPhase2ReleaseBundle {
         -Publisher $Publisher `
         -Version $Version `
         -ExpectedCoreSha256 ([string]$identity.core_executable_sha256) `
-        -ExpectedHostSha256 ([string]$identity.browser_host_sha256)
+        -ExpectedHostSha256 ([string]$identity.browser_host_sha256) `
+        -ExpectedCliSize ([long]$identity.cli_executable_size) `
+        -ExpectedCliSha256 ([string]$identity.cli_executable_sha256) `
+        -ExpectedDesktopSize ([long]$identity.desktop_executable_size) `
+        -ExpectedDesktopSha256 ([string]$identity.desktop_executable_sha256) `
+        -ExpectedDesktopDistFileCount ([int]$identity.desktop_dist_file_count) `
+        -ExpectedDesktopDistManifestSha256 `
+            ([string]$identity.desktop_dist_manifest_sha256) `
+        -ExpectedCandidateGitCommit ([string]$identity.candidate_git_commit) `
+        -ExpectedCandidateGitTree ([string]$identity.candidate_git_tree) `
+        -ExpectedSourceVerificationSha256 ([string]$identity.source_verification_sha256) `
+        -ExpectedSourceRootAnchorSha256 ([string]$identity.source_root_anchor_sha256) `
+        -ExpectedSourceRootDigestSha256 ([string]$identity.source_root_digest_sha256)
     if ($null -eq $verification -or
         $verification.PackageFamilyName -cne $derivedFamily -or
         $verification.DesktopAumid -cne $expectedDesktopAumid -or
         $verification.BrokerAumid -cne $expectedBrokerAumid -or
         $verification.BrowserProducerAumid -cne $expectedBrowserProducerAumid -or
         $verification.BrokerPinnedCoreSha256 -cne [string]$identity.core_executable_sha256 -or
+        $verification.CliExecutableSize -ne [long]$identity.cli_executable_size -or
+        $verification.CliExecutableSha256 -cne [string]$identity.cli_executable_sha256 -or
+        $verification.DesktopExecutableSize -ne
+            [long]$identity.desktop_executable_size -or
+        $verification.DesktopExecutableSha256 -cne
+            [string]$identity.desktop_executable_sha256 -or
+        $verification.DesktopDistFileCount -ne
+            [int]$identity.desktop_dist_file_count -or
+        $verification.DesktopDistManifestSha256 -cne
+            [string]$identity.desktop_dist_manifest_sha256 -or
         $verification.BrowserHostSha256 -cne [string]$identity.browser_host_sha256 -or
+        $verification.CandidateGitCommit -cne [string]$identity.candidate_git_commit -or
+        $verification.CandidateGitTree -cne [string]$identity.candidate_git_tree -or
+        $verification.SourceVerificationSha256 -cne [string]$identity.source_verification_sha256 -or
+        $verification.SourceRootAnchorSha256 -cne [string]$identity.source_root_anchor_sha256 -or
+        $verification.SourceRootDigestSha256 -cne [string]$identity.source_root_digest_sha256 -or
         $verification.Sha256 -cne [string]$identity.msix_sha256) {
         throw "Independent MSIX verification did not reproduce the identity record."
     }
@@ -386,6 +442,15 @@ function Get-SteinPhase2ReleaseBundle {
         CoreSize = [long]$identity.core_executable_size
         CoreSha256 = [string]$identity.core_executable_sha256
         BrowserHostSha256 = [string]$identity.browser_host_sha256
+        CandidateGitCommit = [string]$identity.candidate_git_commit
+        CandidateGitTree = [string]$identity.candidate_git_tree
+        SourceVerificationSha256 = [string]$identity.source_verification_sha256
+        SourceRootAnchorSha256 = [string]$identity.source_root_anchor_sha256
+        SourceRootDigestSha256 = [string]$identity.source_root_digest_sha256
+        DesktopSize = [long]$identity.desktop_executable_size
+        DesktopSha256 = [string]$identity.desktop_executable_sha256
+        DesktopDistFileCount = [int]$identity.desktop_dist_file_count
+        DesktopDistManifestSha256 = [string]$identity.desktop_dist_manifest_sha256
         InstalledPayloadFiles = @($verification.InstalledPayloadFiles)
         CliSize = [long]$identity.cli_executable_size
         CliSha256 = [string]$identity.cli_executable_sha256

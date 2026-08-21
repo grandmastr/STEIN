@@ -25,8 +25,11 @@ the lifecycle:
 - verifies the closed identity-record schema and companion filenames;
 - derives the exact PFN from the pinned Publisher and checks both exact AUMIDs;
 - checks every recorded file size and SHA-256;
-- checks that the signed MSIX's closed `Metadata\CoreBinding.json` digest equals
-  the adjacent CORE digest that the broker build was given;
+- checks that the signed MSIX's closed schema-3 `Metadata\CoreBinding.json`
+  equals the adjacent schema-3 release identity for the CORE, diagnostic CLI,
+  desktop executable, and desktop-distribution identities plus the candidate
+  Git commit/tree, source-verification report digest, source-root-anchor digest,
+  and source-root digest; schema-1/2 bundles are rejected;
 - verifies valid Authenticode trust, exact signer thumbprint, exact signer
   Subject, and code-signing EKU on the MSIX, CORE, and diagnostic CLI;
 - unpacks and validates the closed MSIX manifest/layout; and
@@ -35,6 +38,10 @@ the lifecycle:
 
 The scripts never generate, import, trust, replace, or remove a certificate.
 The selected signing chain must already be trusted by Windows.
+Release bundles with schema-1/2 CoreBinding/identity metadata are not accepted
+as schema-3 upgrade inputs. Use the version-matched lifecycle to remove or
+recover that older release before a fresh schema-3 install. The protected
+installed `install.json` record remains schema 2.
 
 ## Fresh install
 
@@ -176,18 +183,70 @@ private-client, persistence, upgrade, policy, native, interactive, or external
 gates into `pass`. Missing fixtures remain `not_run`; unavailable prerequisites
 are `blocked`; an observed prerequisite or attached native failure is `fail`.
 
-The optional `-AttachmentManifest` accepts a closed JSON schema. Start with the
-generated `attachments-template.json`. Each entry binds one gate to either a
-reviewed synthetic PNG screenshot or a content-free JSON native-fixture result,
-plus its exact SHA-256, declared result, UTC timestamp, and affirmative
-`privacy_reviewed`/`synthetic_only` flags. The harness verifies the regular file,
-format, size, and digest but never copies the file or retains its source path.
-Native results must also match the generated
-`native-fixture-result-template.json`: a closed schema containing only bounded
-fixture/command identifiers, gate, result, timestamp, and exit code. A screenshot
-never changes a result. A native `fail` or `blocked` is conservatively reflected;
-a declared native `pass` remains `not_run` until independent semantic review.
-Hash and envelope validation are not validation of fixture meaning.
+The optional `-AttachmentManifest` accepts schema 2 only. Start with the
+generated `attachments-template.json`. `Evidence-Spec.json` is the checked-in
+policy root for the exact 32 gate IDs. For every gate it fixes the outer
+fixture/runner IDs, proof classes, required subchecks, each subcheck's
+`source_verification`, `installed_native`, or `linux_ci` origin, and required
+package/commit/source/Linux/runner bindings. The native result schema 2 must
+match that specification exactly. An arbitrary JSON object, a zero exit code,
+or caller-authored success booleans cannot promote a row.
+
+Each native result enumerates its proof artifacts by content-free ID, class,
+origin, size, and SHA-256. The manifest separately maps every one of those IDs
+to a regular, non-reparse file. The collector opens bounded JSON through a
+write-denying file handle, reads the bytes once, and computes the size/hash and
+strict UTF-8 parse from those same bytes. It rechecks the exact external set
+before and after ledger finalization, but retains neither source paths nor
+private payloads. Source-origin subchecks name exact `source-verification.json`
+check IDs; the report and root anchor must match the provenance values attested
+by the signed schema-3 CoreBinding. That signature selects and binds the source
+evidence; the source report remains source-only content-integrity evidence, not
+installed runtime proof.
+
+The contract maps every named source subcheck to its exact check ID set. A broad
+`rust-tests` pass cannot promote a gate-specific deterministic claim. Thirteen
+gate-specific source-fixture checks therefore remain explicit `not_run` rows
+until closed targeted commands/receipts exist. In addition, every
+`source_verification` subcheck has the common required dependency
+`pinned-clean-build-environment` and `source-report-command-provenance`. They
+are currently `not_run` because `Verify-Source.ps1` still executes the mutable
+worktree, may reuse ignored Rust/frontend outputs, and has no independently
+closed command/argument/working-directory registry; consequently no source-
+backed row can promote from the current report. Native-only rows remain
+independently reviewable.
+
+The source-report contract fixes 44 exact checks—25 required `pass` rows and 19
+allowed `not_run`/`pass` rows—and fourteen generator files.
+Source provenance schema 2 binds launcher and rustup-selected Cargo/rustc
+payloads, the pnpm JavaScript entrypoint, and both the Git-for-Windows launcher
+and resolved `mingw64\bin\git.exe` payload without retaining local paths.
+`P2-BUILD` also remains `not_run` on `native-toolchain-provenance`: the
+VS/MSVC/Windows SDK/MakeAppx/SignTool payload/library set is not yet attested.
+
+The closed private-diagnostic and toast-COM denial receipts have fixed CLI
+fixture/runner IDs and exact ordered subchecks. The portable Linux receipt has
+fixed workflow/fixture/runner IDs, candidate commit/tree and toolchain/workflow
+hashes, seven exact ordered checks, and separately extracted log files whose
+sizes and hashes are recomputed. Its `runner_id` is still a content claim, not
+authenticated GitHub execution provenance. `P2-NO-LEAKS` additionally requires
+the fixed sentinel-producer receipt, producer source and manifest hashes, and
+the exact `no-leaks-producer-workflow` source check; producer and scanner must
+bind the same package, commit, source report, artifact-catalog digest, and count.
+Until that real candidate-owned producer/check exists, the gate remains
+`not_run`; a synthetic scanner self-test or clean filler cannot promote it.
+`P2-PORTABLE-FIXTURE` also requires `portable-runner-attestation=pass`. That
+check remains `not_run` until an authenticated GitHub artifact attestation (or
+equivalent Sigstore bundle) binds the repository, workflow, candidate commit,
+and exact portable-artifact digest; self-declared runner JSON cannot promote it.
+
+A screenshot never changes a result. Native `fail` or `blocked` results are
+reflected conservatively; a structurally valid native `pass` remains `not_run`
+until a trusted independent reviewer inspects the exact signed package, closed
+fixture receipts, underlying artifact hashes, and the claimed native semantics.
+The mechanism is tamper-evident and content-bound; it is not proof against a
+malicious evidence owner and does not independently authenticate the fixture
+operator or local runner.
 
 Exit code `0` means the read-only installed machine checks passed and the ledger
 was written. It does not mean Phase 2 acceptance is complete. Exit `1` means a
@@ -210,12 +269,16 @@ scripts\windows\phase2\Review-Installed.cmd ^
 
 `-OutputRoot` is optional and, when supplied, must remain below the repository
 `artifacts` directory. The reviewer rehashes the collector generator, host,
-ledger, all 32 row artifacts, and the exact attachment set before it evaluates
-the 32 closed review records. A row can become `pass` only when its collector
-row is not `fail` or `blocked`, its bound native result is an exact successful
-content-free fixture, and the manifest explicitly records completed independent,
-semantic, privacy, and synthetic-only review. Screenshots never promote a row.
-Source `fail` and `blocked` results propagate conservatively.
+ledger, all 32 row artifacts, every native result, and every mapped underlying
+proof file before it evaluates the 32 closed review records. JSON policy and
+evidence are decoded from the same locked bytes that supplied their size and
+SHA-256, and all files are checked again during finalization. A row can become
+`pass` only when its collector row is not `fail` or `blocked`, its evidence
+matches the exact checked-in gate contract and signed candidate/source
+bindings, all required subchecks and closed runner receipts pass, and the
+manifest records completed independent semantic, privacy, and synthetic-only
+review. Screenshots never promote a row. Source `fail` and `blocked` results
+propagate conservatively.
 
 The manifest booleans and `review_identity` are process declarations. They
 record that a review procedure was followed; they do not cryptographically
@@ -267,8 +330,9 @@ signed installed bundle is still present.
 the exact 32-gate set, mandatory trust pins, quoted launcher, attachment
 fail-closed rules, and no direct install/task/process/credential mutation
 commands. `Test-ReviewInstalled.ps1` exercises one complete 32-row promotion and
-23 fail-closed source-set, tree-closure, tamper, command-binding, output-integrity,
-mapping, privacy, result-propagation, and incomplete-review cases.
+24 fail-closed source-contract, source-set, tree-closure, tamper,
+command-binding, output-integrity, mapping, privacy, result-propagation, and
+incomplete-review cases.
 `packaging\windows-msix\Test-Static.ps1` runs both contracts alongside its
 parser, launcher, source-contract, MakeAppx schema, and temporary-directory
 safety checks only. It does not run
@@ -314,18 +378,25 @@ compile-time PFN/hash/extension values are never represented as an installed or
 signed identity.
 
 `source-verification.json` schema 2 also records bounded, content-free source
-provenance: the exact Git HEAD, clean/dirty categories and digests without file
-names, Cargo/rustc/Node/pnpm/Git/pwsh versions and executable hashes, checked-in
-package and lockfile hashes, and the application-schema, migration-catalog,
+provenance schema 2: the exact Git HEAD, clean/dirty categories and digests
+without file names, tool versions and launcher hashes, the exact
+rustup-selected Cargo/rustc payload hashes and toolchain ID, the pnpm JavaScript
+entrypoint hash, checked-in package and lockfile hashes, and the
+application-schema, migration-catalog,
 protocol, message-schema, and policy-profile identifiers compiled by the run.
 The discovered `pwsh.exe` is mandatory and fails closed unless it is a regular,
 non-reparse file with a valid Authenticode signature whose exact signer Subject
 is Microsoft Corporation; an unsigned earlier PATH entry is rejected. Its
 validated signer Subject, signature status, version, and executable hash are
 retained in the bounded provenance. The verifier samples provenance before and
-after the suite and fails the run if it changes. Its nine-file generator binds
-the source verifier plus the installed reviewer, launcher, reviewer test, and
-reviewer runtime dependencies. `root-anchor.json` binds the report, generator,
+after the suite and fails the run if it changes. Its fourteen-file generator
+binds the source verifier, installed reviewer, fail-closed evidence
+specification/contract, no-leaks scanner/launcher/test, and their runtime
+dependencies. The separate passing `no-leaks-scanner-static` source check
+exercises the scanner contract without claiming that the absent real sentinel
+producer ran. The separately required `no-leaks-producer-workflow` check is
+retained explicitly as `not_run` with a bounded implementation-gap reason.
+`root-anchor.json` binds the report, generator,
 provenance, check records, and hashed logs through one deterministic root digest.
 Generator files are accepted only through regular, non-reparse ancestors below
 the repository root; a junction-to-external-source negative fixture enforces that

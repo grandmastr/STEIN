@@ -201,6 +201,9 @@ health and approval review must account for later changes.
   bypasses durable session/grant/policy authority.
 - Golden request fixtures contain only categories allowed by both current grants
   and the exact route approval, at the least sensitive useful granularity.
+- The checked-in `phase2-openai-model-contract-v1` fixture binds the exact
+  route-permission-context narrowing chain and provider request invariants;
+  route, grant, or context category broadening fails before serialization.
 - Requests set `store: false`, omit tools, conversations, previous-response state,
   background mode, hosted features, and unapproved media.
 - Strict-schema, extra-field, tool-shaped, prompt-injected, unknown-reference,
@@ -210,6 +213,8 @@ health and approval review must account for later changes.
 - Timeout, cancellation, offline, authentication, rate-limit, quota, malformed
   response, and provider error fixtures remain silent and emit content-free
   technical outcomes.
+- Explicit provider-refusal and HTTP failure fixtures prove that provider text
+  and status details never enter the normalized error contract.
 - No prompt, raw response, response identifier, credential, or private provider
   error appears in SQLite, logs, audit, protocol, crash output, or evidence.
 - Closing the full desktop does not cancel a request owned by an authorized

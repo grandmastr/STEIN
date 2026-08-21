@@ -18,3 +18,9 @@ stein-protocol = { path = "../../crates/stein-protocol" }
 tokio.workspace = true
 tokio-util.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Notifications",
+] }

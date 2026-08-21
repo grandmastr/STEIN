@@ -92,7 +92,8 @@ if ($env:OS -cne "Windows_NT") {
     throw "Phase 2 source verification must run with native Windows tools."
 }
 
-foreach ($tool in @("cargo.exe", "rustc.exe", "node.exe", "pnpm.cmd", "git.exe")) {
+foreach ($tool in @(
+        "cargo.exe", "rustc.exe", "rustup.exe", "node.exe", "pnpm.cmd", "git.exe")) {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
         throw "Required source-verification tool is unavailable: $tool"
     }
@@ -116,11 +117,12 @@ $null = New-Item -ItemType Directory -Path $evidencePath -Force
 $checks = New-Object Collections.Generic.List[object]
 $startedAt = (Get-Date).ToUniversalTime()
 $toolExecutables = [ordered]@{
-    cargo = (Get-Command "cargo.exe" -ErrorAction Stop).Source
-    rustc = (Get-Command "rustc.exe" -ErrorAction Stop).Source
-    node = (Get-Command "node.exe" -ErrorAction Stop).Source
-    pnpm = (Get-Command "pnpm.cmd" -ErrorAction Stop).Source
-    git = (Get-Command "git.exe" -ErrorAction Stop).Source
+    cargo = [string]@(Get-Command "cargo.exe" -CommandType Application -ErrorAction Stop)[0].Source
+    rustc = [string]@(Get-Command "rustc.exe" -CommandType Application -ErrorAction Stop)[0].Source
+    rustup = [string]@(Get-Command "rustup.exe" -CommandType Application -ErrorAction Stop)[0].Source
+    node = [string]@(Get-Command "node.exe" -CommandType Application -ErrorAction Stop)[0].Source
+    pnpm = [string]@(Get-Command "pnpm.cmd" -CommandType Application -ErrorAction Stop)[0].Source
+    git = [string]@(Get-Command "git.exe" -CommandType Application -ErrorAction Stop)[0].Source
     pwsh = $pwsh
 }
 $initialProvenance = Get-SteinSourceEvidenceProvenance `
@@ -341,6 +343,67 @@ try {
             "-ExecutionPolicy", "Bypass",
             "-File", (Join-Path $repoRoot "scripts\windows\phase2\Test-VerifyInstalled.ps1")
         ) -WorkingDirectory $repoRoot
+    Invoke-SteinSourceCheck -Id "no-leaks-scanner-static" -Executable $powershell `
+        -Arguments @(
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", (Join-Path $repoRoot "scripts\windows\phase2\Test-ScanNoLeaks.ps1")
+        ) -WorkingDirectory $repoRoot
+    Add-SteinNotRunCheck `
+        -Id "no-leaks-producer-workflow" `
+        -Reason "Candidate-owned installed artifact producer is not implemented."
+    Add-SteinNotRunCheck `
+        -Id "native-toolchain-provenance" `
+        -Reason "Exact VS/MSVC/Windows SDK/makeappx/signtool payload+library provenance is not implemented."
+    Add-SteinNotRunCheck `
+        -Id "pinned-clean-build-environment" `
+        -Reason "Source verification still executes the mutable worktree and may reuse ignored Rust/frontend outputs."
+    Add-SteinNotRunCheck `
+        -Id "portable-runner-attestation" `
+        -Reason "Authenticated GitHub artifact attestation tied to repository, workflow, commit, and artifact digest is not implemented."
+    Add-SteinNotRunCheck `
+        -Id "source-report-command-provenance" `
+        -Reason "Independent closed command/argument/working-directory provenance for every source-report check is not implemented."
+    Add-SteinNotRunCheck `
+        -Id "phase2-source-fixture-goals" `
+        -Reason "Closed gate-specific source fixture receipt is not implemented."
+    Add-SteinNotRunCheck `
+        -Id "phase2-source-fixture-identity" `
+        -Reason "Closed gate-specific source fixture receipt is not implemented."
+    Add-SteinNotRunCheck `
+        -Id "phase2-source-fixture-intervention" `
+        -Reason "Closed gate-specific source fixture receipt is not implemented."
+    Add-SteinNotRunCheck `
+        -Id "phase2-source-fixture-model-contract" `
+        -Reason "Closed gate-specific source fixture receipt is not implemented."
+    Add-SteinNotRunCheck `
+        -Id "phase2-source-fixture-notification" `
+        -Reason "Closed gate-specific source fixture receipt is not implemented."
+    Add-SteinNotRunCheck `
+        -Id "phase2-source-fixture-outbox-recovery" `
+        -Reason "Closed gate-specific source fixture receipt is not implemented."
+    Add-SteinNotRunCheck `
+        -Id "phase2-source-fixture-phase1-regression" `
+        -Reason "Closed gate-specific source fixture receipt is not implemented."
+    Add-SteinNotRunCheck `
+        -Id "phase2-source-fixture-pixels" `
+        -Reason "Closed gate-specific source fixture receipt is not implemented."
+    Add-SteinNotRunCheck `
+        -Id "phase2-source-fixture-policy-failsafe" `
+        -Reason "Closed gate-specific source fixture receipt is not implemented."
+    Add-SteinNotRunCheck `
+        -Id "phase2-source-fixture-retention" `
+        -Reason "Closed gate-specific source fixture receipt is not implemented."
+    Add-SteinNotRunCheck `
+        -Id "phase2-source-fixture-revocation-race" `
+        -Reason "Closed gate-specific source fixture receipt is not implemented."
+    Add-SteinNotRunCheck `
+        -Id "phase2-source-fixture-secrets" `
+        -Reason "Closed gate-specific source fixture receipt is not implemented."
+    Add-SteinNotRunCheck `
+        -Id "phase2-source-fixture-upgrade" `
+        -Reason "Closed gate-specific source fixture receipt is not implemented."
     Invoke-SteinSourceCheck `
         -Id "installed-reviewer-windows-powershell-contract" `
         -Executable $powershell `
@@ -433,6 +496,11 @@ $generator = Get-SteinSourceEvidenceGenerator `
         (Join-Path $PSScriptRoot "Review-Installed.cmd"),
         (Join-Path $PSScriptRoot "Test-ReviewInstalled.ps1"),
         (Join-Path $PSScriptRoot "Common.ps1"),
+        (Join-Path $PSScriptRoot "Evidence-Spec.json"),
+        (Join-Path $PSScriptRoot "Evidence-Contract.ps1"),
+        (Join-Path $PSScriptRoot "Scan-NoLeaks.ps1"),
+        (Join-Path $PSScriptRoot "Scan-NoLeaks.cmd"),
+        (Join-Path $PSScriptRoot "Test-ScanNoLeaks.ps1"),
         (Join-Path $repoRoot "packaging\windows-msix\PackageTools.ps1")
     )
 $checksDigest = Get-SteinSourceEvidenceObjectDigest -Value @($checks | ForEach-Object { $_ })

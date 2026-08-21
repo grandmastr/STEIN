@@ -226,6 +226,10 @@ recovery before those platform capabilities are called supported.
   no private toast or status content; unlock waits for fresh source health.
 - A toast activation opens the registered client with only opaque arguments and
   resolves the intervention through an authenticated authoritative query.
+- The signed diagnostic CLI invokes the fixed registered COM class with a
+  synthetic canonical action and a fixed wrong AUMID; the packaged callback
+  returns `E_INVALIDARG`. The CLI accepts no CLSID, AUMID, action, or payload
+  input and emits only a content-free candidate-bound denial receipt.
 - Tests distinguish OS acceptance, definite failure, ambiguous outcome, and any
   stronger future receipt; no fixture equates acceptance with sight.
 - With every channel unavailable, one allowed item queues. Recovery before expiry

@@ -45,6 +45,9 @@ delivery acknowledgement.
 - Every public protocol addition must have matching Rust and TypeScript fixtures.
 - A screenshot supplements process/test evidence; it does not prove authority,
   retention, race, or absence-of-data behavior by itself.
+- A generic JSON success result, process exit zero, or self-declared review
+  boolean is not gate evidence. The result must satisfy the checked-in exact
+  gate contract and bind the underlying proof bytes.
 
 ## Synthetic acceptance workspace
 
@@ -121,15 +124,61 @@ contract does not publish owner policy state; policy-dependent rows therefore
 cannot pass from this harness alone.
 
 Operator screenshots and native-fixture results may be attached through the
-closed manifest documented beside the harness. The collector validates a
-reviewed-synthetic declaration, regular-file bounds, and exact SHA-256, then
-retains only content-free metadata: it neither copies the file nor retains its
-source path. A native result must additionally match the generated closed,
-content-free result schema of bounded fixture/command identifiers, gate, result,
-timestamp, and exit code. Screenshots are always supplemental. A declared native
-pass remains `not_run` pending independent semantic review; declared failure or
-blockage may only lower the row to `fail` or `blocked`. Missing attachments never
-become passes.
+closed schema-2 manifest documented beside the harness. The checked-in
+`Evidence-Spec.json` fixes all 32 gate IDs and, per gate, the exact
+fixture/runner IDs, proof classes, required subchecks, proof origin, and
+package/commit/source/Linux/runner bindings. Every proof artifact is mapped by
+content-free ID to exact size and SHA-256. Bounded JSON is hashed and strictly
+decoded from one locked byte capture, and the exact tree is rechecked through
+finalization. The collector retains neither the local paths nor private proof
+payloads.
+
+Source-origin subchecks map to exact passing check IDs in the separately
+supplied source report only after that report/root chain equals the candidate
+commit/tree and source digests attested by the signed schema-3 CoreBinding.
+Installed-native and Linux-CI subchecks must cite their own exact artifacts;
+source tests cannot silently stand in for native behavior. The private denial,
+toast COM denial, Linux portable, no-leaks scanner, and no-leaks producer
+receipts have closed identities and exact ordered subchecks. Screenshots are
+always supplemental. A declared native pass remains `not_run` pending
+independent semantic/privacy review; failure or blockage may only lower the row.
+Missing or mismatched proof remains `not_run`, `blocked`, or `fail`, never pass.
+The source-evidence generator hash includes the checked-in evidence policy and
+contract plus `Scan-NoLeaks.ps1`, its fixed launcher, and its dual-shell test.
+`no-leaks-scanner-static` validates those scanner mechanics but is deliberately
+not the required `no-leaks-producer-workflow` check and cannot promote
+`P2-NO-LEAKS`. The producer check is present in the source report as explicit
+`not_run` evidence with the bounded reason that the candidate-owned installed
+artifact producer is not implemented.
+
+The same checked-in contract fixes the full 44-row source-report check set (25
+required `pass`; 19 explicitly allowed `not_run`/`pass`) and the exact fourteen
+generator paths. Source provenance schema 2 records both the
+launcher shims and the rustup-selected Cargo/rustc payload hashes/toolchain ID,
+the pnpm JavaScript entrypoint hash, and both the Git-for-Windows launcher and
+resolved `mingw64\bin\git.exe` payload; a proxy or command shim alone is not
+accepted as tool identity.
+
+Each named source subcheck maps to an exact check ID set. A generic
+`rust-tests` pass does not prove that a gate-specific fixture exists or ran.
+The thirteen `phase2-source-fixture-*` checks are therefore explicit `not_run`
+placeholders with the bounded reason `Closed gate-specific source fixture
+receipt is not implemented.` until targeted commands and closed receipts are
+added. Every source-origin subcheck also requires
+`pinned-clean-build-environment=pass` and
+`source-report-command-provenance=pass`; their current bounded reasons record
+that source verification still executes the mutable worktree/may reuse ignored
+Rust/frontend outputs and that independent closed command/argument/working-
+directory provenance is not implemented. This blocks all source-backed
+promotion while leaving native-only gates independently reviewable.
+
+The signed schema-3 build exports and locks the selected Git tree, uses private
+Cargo targets/home and fresh frozen-lockfile renderer output, and signer-binds
+the CLI, desktop executable, and desktop distribution. It remains explicitly
+non-hermetic: `native-toolchain-provenance` and
+`source-report-command-provenance` are `not_run`, so `P2-BUILD` cannot promote
+until the exact native payload/library set and independently closed per-check
+command/argument/working-directory provenance are implemented.
 
 ## Completion ledger
 
@@ -165,8 +214,35 @@ become passes.
 | `P2-DESKTOP-CLOSED` | Active background-authorized focus session continues capture, context, scheduling, reasoning, status, and native delivery while the full desktop is closed; reconnect replaces cache with an authoritative snapshot/cursor. | NOT RUN |
 | `P2-DAEMON-RESTART` | Only unexpired restart-authorized work recovers; unauthorized work stops; all source health/context resets to unknown; no absence reasoning occurs before fresh evidence. | NOT RUN |
 | `P2-RETENTION` | Controllable clock proves raw-immediate, observation-10-minute, context-session, outbox-actionability, and audit-30-day boundaries plus direct deletion across every read/assembly/export path. | NOT RUN |
-| `P2-NO-LEAKS` | Database/journal/recovery copy, Credential Manager metadata, logs, errors, traces, audit, outbox, protocol, crash output, package, and retained evidence contain none of the prohibited raw/private/secret fields. | NOT RUN |
-| `P2-PORTABLE-FIXTURE` | Complete semantic session/policy/outbox/restart fixture passes against fake adapters on a non-Windows host; domain/application/protocol crates import no Windows/OpenAI/SQLite/Tauri types. | NOT RUN |
+| `P2-NO-LEAKS` | A candidate-owned fixed producer injects the public synthetic sentinel through every defined sink and emits its closed producer/source/manifest proof; the closed scanner then proves database/journal/recovery copy, Credential Manager metadata, logs, errors, traces, audit, outbox, protocol, crash output, package, and retained evidence contain no sentinel or prohibited raw/private/secret fields. Producer and scanner package/commit/source/catalog bindings must match. | NOT RUN |
+| `P2-PORTABLE-FIXTURE` | Complete semantic session/policy/outbox/restart fixture passes against fake adapters on a non-Windows host with exact extracted log hashes/sizes; domain/application/protocol crates import no Windows/OpenAI/SQLite/Tauri types. The retained artifact is content-integrity evidence unless GitHub execution provenance is authenticated separately. | NOT RUN |
+
+`P2-NO-LEAKS` cannot pass from the scanner receipt or its synthetic self-test
+alone. It also requires the fixed `phase2-no-leaks-sentinel-producer-v1`
+receipt, producer source and manifest artifacts, and a passing exact
+`no-leaks-producer-workflow` source-report check. That real producer/check is not
+yet present, so the row remains `NOT RUN` even when the scanner's isolated
+synthetic fixtures pass.
+
+The `P2-PORTABLE-FIXTURE` schema binds the candidate, workflow/toolchain hashes,
+seven named check receipts, and each extracted log's bytes. Its fixture and
+runner IDs are not by themselves authenticated GitHub Actions provenance;
+retain a separately authenticated run/attestation when that assurance is
+needed.
+The gate additionally requires the exact `portable-runner-attestation` source-
+report check. It remains `not_run` until an authenticated GitHub artifact
+attestation or equivalent Sigstore bundle binds the repository, workflow,
+candidate commit, and portable-artifact digest. A self-declared schema-1 JSON
+and `runner_id` cannot promote the gate.
+
+For installed-only gates, the explicit trust boundary is a trusted independent
+reviewer who inspects the exact signed package, closed fixture receipts,
+underlying artifact hashes, and native semantics before promotion. The retained
+mechanism is tamper-evident and content-bound, but it is not proof against a
+malicious evidence owner and does not cryptographically authenticate a local
+runner controlled by that same owner. The portable gate is stricter because it
+asserts execution by an external GitHub runner and therefore remains blocked on
+the separate attestation obligation above.
 
 The `P2-RETENTION` source fixture invokes the public one-shot maintenance path
 with a controllable clock immediately before, exactly at, and after the

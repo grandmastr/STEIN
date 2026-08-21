@@ -16,16 +16,30 @@ subject. The build publishes the MSIX, an
 adjacent `.msix.core.exe` containing the exact signed CORE bytes pinned into the
 broker, a signed diagnostic `.msix.cli.exe`, and an `.identity.json` record with
 the exact PFN, all three AUMIDs, the signed browser-host digest, and the MSIX and executable-companion filenames/sizes/
-SHA-256 values, package version, and exact signer thumbprint. A separate
+SHA-256 values, package version, exact signer thumbprint, candidate Git
+commit/tree, and Phase 2 source-report/root-anchor digests. A separate
 `.browser.json` binds the blocked browser host AUMID/digest/publisher and exact
 Edge Add-ons ID/version without changing the Phase 2 lifecycle identity schema. Changing Publisher
 deliberately rotates the package family and therefore the admitted AppContainer
 SID.
 
-The signed MSIX also contains the closed `Metadata\CoreBinding.json` record.
-Its digest must equal both the adjacent CORE digest and the value supplied to the
-broker build. Lifecycle preflight rejects a bundle unless that signed internal
-binding, the adjacent identity record, and the exact signed CORE bytes agree.
+The release identity also projects the signer-bound diagnostic CLI size/hash,
+packaged desktop size/hash, and fresh renderer file-count/manifest digest. The
+signed MSIX contains the closed schema-3
+`Metadata\CoreBinding.json` record. Its CORE digest must equal both the
+adjacent CORE digest and the value supplied to the broker build. The same
+signed record binds the exact clean Git commit/tree and the SHA-256 of the
+passing `source-verification.json`, its `root-anchor.json`, and the anchor's
+root digest. It also binds the external CLI and packaged desktop/renderer byte
+identities. Lifecycle preflight rejects a bundle unless that signed internal
+binding, the adjacent schema-3 identity record, both signed companions, and the
+packaged desktop bytes agree.
+
+This is a signer attestation about which candidate and source-evidence bytes
+were selected for the package. It does not make the Git commit a Git-signed
+commit, authenticate the source verifier as a person, or turn source-only
+evidence into installed acceptance evidence. The report must be evaluated only
+after its exact signed hash and anchor chain have been reproduced.
 
 The package declares only the `runFullTrust` restricted capability required by
 the desktop application. It declares no network, broad-file-system, device,
@@ -102,13 +116,75 @@ Build with an already provisioned, currently valid code-signing certificate:
   -Version '0.1.0.0' `
   -EdgeExtensionId '<exact published 32-character ID>' `
   -EdgeExtensionVersion '<exact published version>' `
-  -EdgePublisherSha256 '<lowercase SHA-256 certificate thumbprint>'
+  -EdgePublisherSha256 '<lowercase SHA-256 certificate thumbprint>' `
+  -ExpectedCandidateGitCommit '<git rev-parse HEAD>' `
+  -ExpectedCandidateGitTree '<git rev-parse HEAD^{tree}>' `
+  -SourceVerificationReportPath '<repository artifacts path>\source-verification.json' `
+  -SourceRootAnchorPath '<same evidence directory>\root-anchor.json' `
+  -ExpectedSourceVerificationSha256 '<lowercase report SHA-256>' `
+  -ExpectedSourceRootAnchorSha256 '<lowercase root-anchor file SHA-256>'
 ```
 
 The build script searches only `Cert:\CurrentUser\My`, requires the exact thumbprint,
 exact Subject/Publisher match, an accessible private key, current validity, and
-the code-signing EKU. They never generate, import, trust, install, or remove a
-certificate or package. Missing identity or trust prerequisites fail closed.
+the code-signing EKU. It requires matching operator-pinned commit/tree IDs and
+a passing schema-2 Phase 2 source report plus valid schema-1 root anchor below
+`artifacts\evidence\phase-2`. It exports the pinned Git tree into a random,
+owner-only private directory, rejects omitted/extra archive entries, verifies
+every extracted file against its Git blob ID, and holds tracked files against
+replacement throughout the build. Cargo uses private home/target directories,
+the rustup-resolved Cargo/rustc payloads recorded by source verification, and
+`--locked`. The desktop begins without `node_modules` or `dist`, installs with
+the recorded Node/pnpm entrypoint and frozen lockfile, then generates and locks
+a fresh renderer manifest before Tauri compilation. Each final compiler output
+is locked and compared to the complete fixed staging path/size/SHA-256 map.
+MakeAppx receives only an immutable eight-file `/f` mapping, and verification
+requires the unpacked fixed payload map to equal that pre-pack map exactly. The mutable public
+worktree and ignored stale renderer/target outputs are never build inputs. The scripts never
+generate, import, trust, install, or remove a certificate or package. Missing
+identity, provenance, or trust prerequisites fail closed.
+
+This is deliberately not a hermetic native-toolchain claim. The selected
+VS/MSVC compiler, linker, assembler, librarian and library catalogs, Windows
+SDK resource/libraries, and MakeAppx/SignTool payloads are not yet represented
+by a closed signer-attested toolchain manifest. Packaging also validates the
+source report's exact check catalog, shapes, statuses, log bytes, generator
+files and integrity digests, but does not independently reconstruct every
+check's executable/argument/working-directory semantics. Therefore
+`native-toolchain-provenance`, `source-report-command-provenance`, and the
+independent `pinned-clean-build-environment` receipt remain explicit P2-BUILD
+NOT RUN obligations. This slice cannot promote P2-BUILD until dedicated closed
+receipts satisfy those obligations. The source contract can also carry other
+named NOT RUN rows, including `portable-runner-attestation`; accepting their
+exact presence for signing never promotes the gate to which they belong.
+
+Every new MSIX, companion, and identity record is built and verified at an
+explicit sibling temporary path. Existing final artifacts are left untouched
+until the complete set is ready. At the final publication boundary the script
+backs up existing finals, replaces the set, and restores the prior files after
+a controlled mid-publication move or final-byte verification failure. That
+rollback is error recovery, not a filesystem transaction against another
+same-user process concurrently modifying the old backup paths. The stronger
+interference invariant applies to the selected new bytes: before any backup is
+deleted, every published final is re-read against its exact verified temporary
+size/SHA-256 while a read handle prevents writes or replacement. If old-backup
+cleanup alone fails after that verification, the exact new finals remain
+published, any undeleted backup is retained for explicit operator cleanup, and
+the build exits with an error instead of claiming an entirely clean publish.
+The script never deletes the last known-good bundle merely because compilation,
+signing, verification, or a controlled publication failed.
+
+Schema-1 and schema-2 CoreBinding/main `.identity.json` release records are
+intentionally rejected; they do not contain the complete signer-attested
+source, CLI, desktop, and renderer provenance. Such artifacts must be
+rebuilt from a newly verified clean candidate. The protected Phase 2 install
+record remains schema 2 because it already pins the complete MSIX hash and
+revalidates the retained schema-3 release identity plus signed CoreBinding on
+every lifecycle read. Consequently, a previously installed Phase 2 bundle that
+retains schema-1 or schema-2 package metadata is not an in-place upgrade or rollback source
+for these scripts; use its version-matched lifecycle tooling to uninstall or
+recover it before a fresh schema-3 install. The supported checked transition
+from the installed Phase 1 layout is unchanged.
 
 `Verify-Msix.ps1` re-runs SignTool trust validation, checks the exact signer,
 unpacks with MakeAppx, validates the closed manifest/file layout, and requires

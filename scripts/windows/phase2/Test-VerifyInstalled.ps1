@@ -100,7 +100,10 @@ if ($WindowsPowerShellCompatibilityChild) {
 
 $harnessPath = Join-Path $PSScriptRoot "Verify-Installed.ps1"
 $launcherPath = Join-Path $PSScriptRoot "Verify-Installed.cmd"
-foreach ($path in @($harnessPath, $launcherPath)) {
+$evidenceContractPath = Join-Path $PSScriptRoot "Evidence-Contract.ps1"
+$evidenceSpecificationPath = Join-Path $PSScriptRoot "Evidence-Spec.json"
+foreach ($path in @(
+        $harnessPath, $launcherPath, $evidenceContractPath, $evidenceSpecificationPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "The installed evidence harness is incomplete."
     }
@@ -190,6 +193,118 @@ if ($actualGates.Count -ne $expectedGates.Count -or
     throw "Verify-Installed.ps1 does not emit every exact Phase 2 ledger row."
 }
 
+. (Join-Path $PSScriptRoot "Common.ps1")
+. $evidenceContractPath
+$evidenceSpecificationSha256 = Get-SteinPhase2Sha256 -Path $evidenceSpecificationPath
+$evidenceSpecification = Read-SteinPhase2EvidenceSpecification `
+    -Path $evidenceSpecificationPath `
+    -ExpectedGateIds $expectedGates `
+    -ExpectedSha256 $evidenceSpecificationSha256
+if ($evidenceSpecification.gates_by_id.Count -ne 32 -or
+    [string]$evidenceSpecification.specification.contract_id -cne
+        "stein-phase2-gate-evidence-v1") {
+    throw "The checked-in gate evidence specification is invalid."
+}
+$genericZeroExitRejected = $false
+try {
+    $null = Assert-SteinPhase2GateEvidenceResult `
+        -Value ([pscustomobject]@{
+            schema_version = 2
+            gate_id = "P2-BUILD"
+            result = "pass"
+            exit_code = 0
+        }) `
+        -Specification $evidenceSpecification.specification `
+        -Gate $evidenceSpecification.gates_by_id["P2-BUILD"] `
+        -SpecificationSha256 (Get-SteinPhase2Sha256 -Path $evidenceSpecificationPath) `
+        -ExpectedPackage ([pscustomobject]@{}) `
+        -ExpectedCollector ([pscustomobject]@{}) `
+        -UnderlyingArtifacts @()
+}
+catch {
+    $genericZeroExitRejected = $true
+}
+if (-not $genericZeroExitRejected) {
+    throw "A generic zero-exit JSON object satisfied the gate evidence contract."
+}
+$specificationSwapRejected = $false
+try {
+    $null = Read-SteinPhase2EvidenceSpecification `
+        -Path $evidenceSpecificationPath `
+        -ExpectedGateIds $expectedGates `
+        -ExpectedSha256 ("0" * 64)
+}
+catch {
+    $specificationSwapRejected = $true
+}
+if (-not $specificationSwapRejected) {
+    throw "Evidence-Spec.json was not parsed from its hash-bound locked bytes."
+}
+$privateRunner = @($evidenceSpecification.gates_by_id["P2-PRIVATE-CLIENT"].runner_artifacts |
+    Where-Object { [string]$_.artifact_role -ceq "private_diagnostic_denial" })[0]
+$outOfOrderPrivateReceipt = [pscustomobject]@{
+    schema_version = 1
+    fixture_id = [string]$privateRunner.fixture_id
+    runner_id = [string]$privateRunner.runner_id
+    result = "pass"
+    summary = [pscustomobject]@{ required = 5; passed = 5; failed = 0; not_run = 0 }
+    subchecks = @(
+        @($privateRunner.required_subchecks | ForEach-Object {
+            [pscustomobject]@{ id = [string]$_; result = "pass" }
+        })[1],
+        @($privateRunner.required_subchecks | ForEach-Object {
+            [pscustomobject]@{ id = [string]$_; result = "pass" }
+        })[0]
+    ) + @($privateRunner.required_subchecks | Select-Object -Skip 2 | ForEach-Object {
+        [pscustomobject]@{ id = [string]$_; result = "pass" }
+    })
+}
+$runnerOrderRejected = $false
+try {
+    $null = Assert-SteinPhase2PrivateDiagnosticArtifact `
+        -Artifact $outOfOrderPrivateReceipt `
+        -RunnerArtifact $privateRunner
+}
+catch {
+    $runnerOrderRejected = $true
+}
+if (-not $runnerOrderRejected) {
+    throw "An out-of-order closed runner receipt was accepted."
+}
+$noLeaksGate = $evidenceSpecification.gates_by_id["P2-NO-LEAKS"]
+Assert-SteinPhase2EvidenceExactSet `
+    -Actual @($noLeaksGate.runner_artifacts | ForEach-Object { $_.artifact_role }) `
+    -Expected @("no_leaks_scan", "no_leaks_sentinel_producer") `
+    -FailureCode "no_leaks_runner_pair_missing"
+Assert-SteinPhase2EvidenceExactSet `
+    -Actual @($noLeaksGate.source_report_check_ids) `
+    -Expected @("no-leaks-producer-workflow") `
+    -FailureCode "no_leaks_source_producer_check_missing"
+$noLeaksPairMismatchRejected = $false
+try {
+    $null = Assert-SteinPhase2NoLeaksReceiptPair `
+        -ScannerArtifact ([pscustomobject]@{ bindings = [pscustomobject]@{
+            package_msix_sha256 = "1" * 64
+            candidate_git_commit = "2" * 40
+            source_verification_sha256 = "3" * 64
+            artifact_catalog_sha256 = "4" * 64
+            artifact_count = 12
+        }}) `
+        -ProducerArtifact ([pscustomobject]@{ bindings = [pscustomobject]@{
+            package_msix_sha256 = "1" * 64
+            candidate_git_commit = "2" * 40
+            source_verification_sha256 = "3" * 64
+            artifact_catalog_sha256 = "5" * 64
+            artifact_count = 12
+        }})
+}
+catch {
+    $noLeaksPairMismatchRejected = $true
+}
+if (-not $noLeaksPairMismatchRejected) {
+    throw "Mismatched no-leaks scanner and producer receipts were accepted."
+}
+
 $gateFunction = @($ast.FindAll({
     param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
@@ -275,6 +390,22 @@ foreach ($required in @(
         "synthetic_only",
         "redacted_screenshot",
         "native_fixture_result",
+        "Evidence-Spec.json",
+        "Evidence-Contract.ps1",
+        "Assert-SteinPhase2GateEvidenceResult",
+        "Assert-SteinPhase2SourceEvidenceBinding",
+        "Assert-SteinPhase2LinuxPortableArtifact",
+        "Assert-SteinPhase2ToastComDenialArtifact",
+        "Assert-SteinPhase2NoLeaksProducerArtifact",
+        "Assert-SteinPhase2NoLeaksReceiptPair",
+        "Read-SteinInstalledLockedJsonFile",
+        "[IO.FileShare]::Read",
+        "Assert-SteinInstalledExternalEvidenceFilesStable",
+        "runner_artifacts",
+        "source_check_ids",
+        "cli_executable_size",
+        "desktop_executable_sha256",
+        "desktop_dist_manifest_sha256",
         "native-fixture-result-template.json",
         "closed_content_free_schema_verified = `$true",
         "semantic_result_verified_by_harness = `$false",
@@ -399,4 +530,9 @@ if ($launcher -match '(?im)^\s*powershell\.exe(?:\s|$)' -or
     windows_powershell_acl_compatibility = $true
     installed_extra_file_rejected = $true
     installed_payload_tamper_rejected = $true
+    generic_zero_exit_json_rejected = $genericZeroExitRejected
+    evidence_spec_swap_rejected = $specificationSwapRejected
+    closed_runner_order_enforced = $runnerOrderRejected
+    no_leaks_pair_mismatch_rejected = $noLeaksPairMismatchRejected
+    exact_gate_evidence_contract = $true
 }

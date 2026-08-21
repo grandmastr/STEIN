@@ -1,0 +1,538 @@
+{
+  "schema_version": 1,
+  "contract_id": "stein-phase2-gate-evidence-v1",
+  "evidence_result_schema_version": 2,
+  "default_subcheck_origin": "installed_native",
+  "binding_requirements": [
+    "package",
+    "commit",
+    "source_report"
+  ],
+  "source_report_contract": {
+    "required_pass_check_ids": [
+      "boundary-contract",
+      "desktop-build",
+      "desktop-lint",
+      "desktop-tests",
+      "desktop-typecheck",
+      "edge-extension-tests",
+      "edge-host-check",
+      "edge-host-clippy",
+      "edge-host-format",
+      "edge-host-tests",
+      "installed-evidence-harness-static",
+      "installed-reviewer-pwsh-contract",
+      "installed-reviewer-windows-powershell-contract",
+      "msix-static-contract",
+      "no-leaks-scanner-static",
+      "release-edge-host",
+      "release-production-core",
+      "release-tauri-no-bundle",
+      "release-workspace",
+      "rust-check",
+      "rust-clippy",
+      "rust-format",
+      "rust-tests",
+      "source-evidence-contract",
+      "source-provenance-stability"
+    ],
+    "allowed_not_run_check_ids": [
+      "native-toolchain-provenance",
+      "no-leaks-producer-workflow",
+      "phase2-source-fixture-goals",
+      "phase2-source-fixture-identity",
+      "phase2-source-fixture-intervention",
+      "phase2-source-fixture-model-contract",
+      "phase2-source-fixture-notification",
+      "phase2-source-fixture-outbox-recovery",
+      "phase2-source-fixture-phase1-regression",
+      "phase2-source-fixture-pixels",
+      "phase2-source-fixture-policy-failsafe",
+      "phase2-source-fixture-retention",
+      "phase2-source-fixture-revocation-race",
+      "phase2-source-fixture-secrets",
+      "phase2-source-fixture-upgrade",
+      "pinned-clean-build-environment",
+      "portable-runner-attestation",
+      "source-report-command-provenance",
+      "windows-native-ignored-fixtures"
+    ],
+    "required_generator_paths": [
+      "scripts/windows/phase2/Verify-Source.ps1",
+      "scripts/windows/phase2/Verify-Source.cmd",
+      "scripts/windows/phase2/Source-Evidence.ps1",
+      "scripts/windows/phase2/Test-VerifySource.ps1",
+      "scripts/windows/phase2/Review-Installed.ps1",
+      "scripts/windows/phase2/Review-Installed.cmd",
+      "scripts/windows/phase2/Test-ReviewInstalled.ps1",
+      "scripts/windows/phase2/Common.ps1",
+      "scripts/windows/phase2/Evidence-Spec.json",
+      "scripts/windows/phase2/Evidence-Contract.ps1",
+      "scripts/windows/phase2/Scan-NoLeaks.ps1",
+      "scripts/windows/phase2/Scan-NoLeaks.cmd",
+      "scripts/windows/phase2/Test-ScanNoLeaks.ps1",
+      "packaging/windows-msix/PackageTools.ps1"
+    ]
+  },
+  "gates": [
+    {
+      "gate_id": "P2-BUILD",
+      "fixture_id": "phase2-build-acceptance-v1",
+      "runner_id": "stein.phase2.build-acceptance.v1",
+      "required_proof_classes": ["signed_package", "source_build"],
+      "required_subchecks": ["dependency_boundaries", "native_toolchain_provenance", "pinned_clean_build_environment", "release_cli", "release_core", "release_msix", "release_native_host", "release_tauri", "rust_check", "rust_clippy", "rust_format", "rust_tests", "source_report_command_provenance", "typescript_lint", "typescript_tests", "typescript_typecheck"],
+      "source_subchecks": ["dependency_boundaries", "native_toolchain_provenance", "pinned_clean_build_environment", "release_cli", "release_core", "release_msix", "release_native_host", "release_tauri", "rust_check", "rust_clippy", "rust_format", "rust_tests", "source_report_command_provenance", "typescript_lint", "typescript_tests", "typescript_typecheck"],
+      "source_subcheck_check_ids": {
+        "dependency_boundaries": ["boundary-contract"],
+        "native_toolchain_provenance": ["native-toolchain-provenance"],
+        "pinned_clean_build_environment": ["pinned-clean-build-environment"],
+        "release_cli": ["release-workspace"],
+        "release_core": ["release-production-core"],
+        "release_msix": ["msix-static-contract"],
+        "release_native_host": ["release-edge-host"],
+        "release_tauri": ["release-tauri-no-bundle"],
+        "rust_check": ["rust-check"],
+        "rust_clippy": ["rust-clippy"],
+        "rust_format": ["rust-format"],
+        "rust_tests": ["rust-tests"],
+        "source_report_command_provenance": ["source-report-command-provenance"],
+        "typescript_lint": ["desktop-lint"],
+        "typescript_tests": ["desktop-tests", "edge-extension-tests"],
+        "typescript_typecheck": ["desktop-typecheck"]
+      },
+      "source_report_check_ids": ["boundary-contract", "desktop-lint", "desktop-tests", "desktop-typecheck", "edge-extension-tests", "msix-static-contract", "native-toolchain-provenance", "pinned-clean-build-environment", "release-edge-host", "release-production-core", "release-tauri-no-bundle", "release-workspace", "rust-check", "rust-clippy", "rust-format", "rust-tests", "source-report-command-provenance"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-PHASE1-REGRESSION",
+      "fixture_id": "phase2-phase1-regression-v1",
+      "runner_id": "stein.phase2.phase1-regression.v1",
+      "required_proof_classes": ["installed_lifecycle", "protocol_regression"],
+      "required_subchecks": ["cancellation", "capacity", "install", "lifecycle", "protocol", "reconnect", "reinstall", "supervision", "uninstall"],
+      "source_subchecks": ["cancellation", "capacity", "protocol"],
+      "source_subcheck_check_ids": {
+        "cancellation": ["phase2-source-fixture-phase1-regression"],
+        "capacity": ["phase2-source-fixture-phase1-regression"],
+        "protocol": ["phase2-source-fixture-phase1-regression"]
+      },
+      "source_report_check_ids": ["phase2-source-fixture-phase1-regression"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-PRIVATE-CLIENT",
+      "fixture_id": "phase2-private-client-v1",
+      "runner_id": "stein.phase2.private-client.v1",
+      "required_proof_classes": ["adversarial_access", "package_identity"],
+      "required_subchecks": ["appcontainer_positive", "diagnostic_snapshot_redacted", "invalid_private_write_denied", "prior_daemon_denied", "private_cancel_denied", "private_identity_denied", "private_snapshot_denied", "renamed_binary_denied", "replayed_capability_denied", "same_sid_adversary_denied", "spoofed_identity_denied", "unpackaged_denied", "wrong_sid_denied"],
+      "runner_artifacts": [
+        {
+          "artifact_role": "private_diagnostic_denial",
+          "proof_class": "adversarial_access",
+          "origin": "installed_native",
+          "fixture_id": "phase2-private-diagnostic-denial-v1",
+          "runner_id": "stein-cli-private-denial-v1",
+          "required_subchecks": ["diagnostic_snapshot_redacted", "private_snapshot_denied", "private_identity_denied", "invalid_private_write_denied", "private_cancel_denied"]
+        }
+      ],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-PERSISTENCE",
+      "fixture_id": "phase2-persistence-v1",
+      "runner_id": "stein.phase2.persistence.v1",
+      "required_proof_classes": ["durable_state", "restart_recovery"],
+      "required_subchecks": ["allowed_state_survives", "content_absent", "dacl_owner", "expiry", "integrity", "repository_ownership", "sqlite_pragmas"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-UPGRADE",
+      "fixture_id": "phase2-upgrade-v1",
+      "runner_id": "stein.phase2.upgrade.v1",
+      "required_proof_classes": ["failure_recovery", "package_upgrade"],
+      "required_subchecks": ["failure_restores_safely", "migration_atomicity_source", "migration_catalog_source", "one_daemon_and_package", "phase1_to_phase2", "recovery_copy", "supported_state_preserved"],
+      "source_subchecks": ["migration_atomicity_source", "migration_catalog_source"],
+      "source_subcheck_check_ids": {
+        "migration_atomicity_source": ["phase2-source-fixture-upgrade"],
+        "migration_catalog_source": ["phase2-source-fixture-upgrade"]
+      },
+      "source_report_check_ids": ["phase2-source-fixture-upgrade"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-SECRETS",
+      "fixture_id": "phase2-secrets-v1",
+      "runner_id": "stein.phase2.secrets.v1",
+      "required_proof_classes": ["failure_recovery", "native_secret_store"],
+      "required_subchecks": ["delete", "delete_failure_obligation", "no_client_read", "no_fallback", "read", "replace", "restart", "uninstall_semantics", "write"],
+      "source_subchecks": ["delete_failure_obligation", "no_client_read", "no_fallback"],
+      "source_subcheck_check_ids": {
+        "delete_failure_obligation": ["phase2-source-fixture-secrets"],
+        "no_client_read": ["phase2-source-fixture-secrets"],
+        "no_fallback": ["phase2-source-fixture-secrets"]
+      },
+      "source_report_check_ids": ["phase2-source-fixture-secrets"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-IDENTITY",
+      "fixture_id": "phase2-identity-v1",
+      "runner_id": "stein.phase2.identity.v1",
+      "required_proof_classes": ["durable_state", "policy_behavior"],
+      "required_subchecks": ["direct_user_only", "implicit_learning_denied", "persistence", "revision_conflict", "stricter_policy", "versioned_identity"],
+      "source_subchecks": ["implicit_learning_denied", "revision_conflict", "stricter_policy"],
+      "source_subcheck_check_ids": {
+        "implicit_learning_denied": ["phase2-source-fixture-identity"],
+        "revision_conflict": ["phase2-source-fixture-identity"],
+        "stricter_policy": ["phase2-source-fixture-identity"]
+      },
+      "source_report_check_ids": ["phase2-source-fixture-identity"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-GOALS",
+      "fixture_id": "phase2-goals-v1",
+      "runner_id": "stein.phase2.goals.v1",
+      "required_proof_classes": ["durable_state", "protocol_behavior"],
+      "required_subchecks": ["abandon", "complete", "create", "delete_cascade", "direct_user_only", "idempotency", "revision_conflict", "update", "upgrade_persistence"],
+      "source_subchecks": ["delete_cascade", "idempotency", "revision_conflict"],
+      "source_subcheck_check_ids": {
+        "delete_cascade": ["phase2-source-fixture-goals"],
+        "idempotency": ["phase2-source-fixture-goals"],
+        "revision_conflict": ["phase2-source-fixture-goals"]
+      },
+      "source_report_check_ids": ["phase2-source-fixture-goals"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-GRANTS",
+      "fixture_id": "phase2-grants-v1",
+      "runner_id": "stein.phase2.grants.v1",
+      "required_proof_classes": ["authority_boundary", "revocation"],
+      "required_subchecks": ["expired_denied", "independent_scopes", "missing_denied", "narrower_denied", "restart_disallowed_denied", "revocation_immediate", "superseded_denied", "wrong_resource_denied", "wrong_route_denied"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-CONSENT",
+      "fixture_id": "phase2-consent-v1",
+      "runner_id": "stein.phase2.consent.v1",
+      "required_proof_classes": ["authority_boundary", "interactive_ui"],
+      "required_subchecks": ["category_disclosure", "continuity_disclosure", "delete_control", "expiry_disclosure", "handling_disclosure", "mute_control", "purpose_disclosure", "resource_disclosure", "retention_disclosure", "revoke_control", "stop_control"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-PRESENCE",
+      "fixture_id": "phase2-presence-v1",
+      "runner_id": "stein.phase2.presence.v1",
+      "required_proof_classes": ["native_observation", "session_lifecycle"],
+      "required_subchecks": ["active", "fresh_after_unlock", "idle", "lock_pauses", "logout_pauses", "no_input_content", "switch_pauses"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-APPLICATION",
+      "fixture_id": "phase2-application-v1",
+      "runner_id": "stein.phase2.application.v1",
+      "required_proof_classes": ["minimization", "native_observation"],
+      "required_subchecks": ["foreground_selected", "narrow_grant_no_content", "narrow_grant_no_pixels", "narrow_grant_no_title", "no_inventory", "notepad_identity"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-DOCUMENT",
+      "fixture_id": "phase2-document-v1",
+      "runner_id": "stein.phase2.document.v1",
+      "required_proof_classes": ["adversarial_access", "native_observation"],
+      "required_subchecks": ["authorized_activity", "authorized_content", "path_escape_denied", "rename_denied", "reparse_denied", "replacement_denied", "revocation_denied", "unrelated_file_denied"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-BROWSER",
+      "fixture_id": "phase2-browser-v1",
+      "runner_id": "stein.phase2.browser.v1",
+      "required_proof_classes": ["adversarial_access", "external_identity", "native_observation", "published_extension"],
+      "required_subchecks": ["background_absent", "exact_profile", "exact_site", "exact_tab", "exact_url_scope", "fresh_invocation_after_restart", "history_absent", "native_host_admission", "protected_content_absent", "published_identity", "unpacked_denied", "unrelated_absent"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-UIA",
+      "fixture_id": "phase2-uia-v1",
+      "runner_id": "stein.phase2.uia.v1",
+      "required_proof_classes": ["native_observation", "protected_surface"],
+      "required_subchecks": ["bounded_visible_text", "consent_surface_denied", "other_window_denied", "password_denied", "protected_surface_denied", "secure_surface_denied", "selected_hwnd", "unverifiable_pauses"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-PIXELS",
+      "fixture_id": "phase2-pixels-v1",
+      "runner_id": "stein.phase2.pixels.v1",
+      "required_proof_classes": ["interactive_capture", "native_status", "transient_data"],
+      "required_subchecks": ["bounded_frame", "explicit_picker", "frame_destroyed", "lock_drops", "native_status_visible", "region_grant", "restart_requires_selection", "revocation_drops", "structured_source_preferred"],
+      "source_subchecks": ["bounded_frame", "frame_destroyed", "structured_source_preferred"],
+      "source_subcheck_check_ids": {
+        "bounded_frame": ["phase2-source-fixture-pixels"],
+        "frame_destroyed": ["phase2-source-fixture-pixels"],
+        "structured_source_preferred": ["phase2-source-fixture-pixels"]
+      },
+      "source_report_check_ids": ["phase2-source-fixture-pixels"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-MODEL-CONTRACT",
+      "fixture_id": "phase2-model-contract-v1",
+      "runner_id": "stein.phase2.model-contract.v1",
+      "required_proof_classes": ["privacy_scan", "source_contract"],
+      "required_subchecks": ["credential_absent", "diagnostic_minimized", "least_sensitive_packet", "no_provider_objects", "no_raw_response", "persistence_minimized", "route_intersection", "tools_absent", "unapproved_category_absent"],
+      "source_subchecks": ["credential_absent", "diagnostic_minimized", "least_sensitive_packet", "no_provider_objects", "no_raw_response", "persistence_minimized", "route_intersection", "tools_absent", "unapproved_category_absent"],
+      "source_subcheck_check_ids": {
+        "credential_absent": ["phase2-source-fixture-model-contract"],
+        "diagnostic_minimized": ["phase2-source-fixture-model-contract"],
+        "least_sensitive_packet": ["phase2-source-fixture-model-contract"],
+        "no_provider_objects": ["phase2-source-fixture-model-contract"],
+        "no_raw_response": ["phase2-source-fixture-model-contract"],
+        "persistence_minimized": ["phase2-source-fixture-model-contract"],
+        "route_intersection": ["phase2-source-fixture-model-contract"],
+        "tools_absent": ["phase2-source-fixture-model-contract"],
+        "unapproved_category_absent": ["phase2-source-fixture-model-contract"]
+      },
+      "source_report_check_ids": ["phase2-source-fixture-model-contract"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-MODEL-LIVE",
+      "fixture_id": "phase2-model-live-v1",
+      "runner_id": "stein.phase2.model-live.v1",
+      "required_proof_classes": ["external_service", "privacy_scan", "scheduler_runtime"],
+      "required_subchecks": ["approved_exact_route", "cancellation", "content_free_receipt", "deadline", "handling_disclosure", "new_request_identity", "no_background", "no_tools", "scheduler_owned", "store_false", "strict_schema"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-SILENCE",
+      "fixture_id": "phase2-silence-v1",
+      "runner_id": "stein.phase2.silence.v1",
+      "required_proof_classes": ["negative_behavior", "policy_trace"],
+      "required_subchecks": ["foreground_change_no_call", "healthy_trace", "no_intervention", "no_model_call", "relevant_working_trace"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-INTERVENTION",
+      "fixture_id": "phase2-intervention-v1",
+      "runner_id": "stein.phase2.intervention.v1",
+      "required_proof_classes": ["audit_trace", "native_delivery", "scheduler_runtime"],
+      "required_subchecks": ["allow_decision", "audit_acknowledged", "candidate_validated", "native_notification_once", "near_deadline_trace", "uncertainty_qualified"],
+      "source_subchecks": ["allow_decision", "audit_acknowledged", "candidate_validated", "near_deadline_trace", "uncertainty_qualified"],
+      "source_subcheck_check_ids": {
+        "allow_decision": ["phase2-source-fixture-intervention"],
+        "audit_acknowledged": ["phase2-source-fixture-intervention"],
+        "candidate_validated": ["phase2-source-fixture-intervention"],
+        "near_deadline_trace": ["phase2-source-fixture-intervention"],
+        "uncertainty_qualified": ["phase2-source-fixture-intervention"]
+      },
+      "source_report_check_ids": ["phase2-source-fixture-intervention"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-POLICY-FAILSAFE",
+      "fixture_id": "phase2-policy-failsafe-v1",
+      "runner_id": "stein.phase2.policy-failsafe.v1",
+      "required_proof_classes": ["negative_behavior", "policy_trace", "source_contract"],
+      "required_subchecks": ["audit_failure_denies", "authority_absent_denies", "cap_cooldown_denies", "installed_policy_smoke", "invalid_output_denies", "legacy_empty_trace_denies", "lock_denies", "model_failure_denies", "mute_denies", "policy_failure_denies", "refusal_denies", "revision_mismatch_denies", "stale_source_denies", "tool_shaped_denies", "trace_content_free"],
+      "source_subchecks": ["audit_failure_denies", "authority_absent_denies", "cap_cooldown_denies", "invalid_output_denies", "legacy_empty_trace_denies", "lock_denies", "model_failure_denies", "mute_denies", "policy_failure_denies", "refusal_denies", "revision_mismatch_denies", "stale_source_denies", "tool_shaped_denies", "trace_content_free"],
+      "source_subcheck_check_ids": {
+        "audit_failure_denies": ["phase2-source-fixture-policy-failsafe"],
+        "authority_absent_denies": ["phase2-source-fixture-policy-failsafe"],
+        "cap_cooldown_denies": ["phase2-source-fixture-policy-failsafe"],
+        "invalid_output_denies": ["phase2-source-fixture-policy-failsafe"],
+        "legacy_empty_trace_denies": ["phase2-source-fixture-policy-failsafe"],
+        "lock_denies": ["phase2-source-fixture-policy-failsafe"],
+        "model_failure_denies": ["phase2-source-fixture-policy-failsafe"],
+        "mute_denies": ["phase2-source-fixture-policy-failsafe"],
+        "policy_failure_denies": ["phase2-source-fixture-policy-failsafe"],
+        "refusal_denies": ["phase2-source-fixture-policy-failsafe"],
+        "revision_mismatch_denies": ["phase2-source-fixture-policy-failsafe"],
+        "stale_source_denies": ["phase2-source-fixture-policy-failsafe"],
+        "tool_shaped_denies": ["phase2-source-fixture-policy-failsafe"],
+        "trace_content_free": ["phase2-source-fixture-policy-failsafe"]
+      },
+      "source_report_check_ids": ["phase2-source-fixture-policy-failsafe"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-NATIVE-CONTROL",
+      "fixture_id": "phase2-native-control-v1",
+      "runner_id": "stein.phase2.native-control.v1",
+      "required_proof_classes": ["desktop_closed", "native_status"],
+      "required_subchecks": ["capture_categories_exact", "emergency_stop_immediate", "health_truthful", "status_loop_loss_pauses", "tauri_closed"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-NOTIFICATION",
+      "fixture_id": "phase2-notification-v1",
+      "runner_id": "stein.phase2.notification.v1",
+      "required_proof_classes": ["activation_contract", "adversarial_access", "native_delivery"],
+      "required_subchecks": ["accepted_by_channel", "audit_truthful", "canonical_activation", "desktop_focus", "diagnostic_denied", "input_bearing_denied", "malformed_denied", "packaged_class_activated", "private_explanation", "registered_aumid", "unpackaged_denied", "wrong_aumid_denied"],
+      "source_subchecks": ["audit_truthful", "diagnostic_denied", "input_bearing_denied", "malformed_denied", "unpackaged_denied"],
+      "source_subcheck_check_ids": {
+        "audit_truthful": ["phase2-source-fixture-notification"],
+        "diagnostic_denied": ["phase2-source-fixture-notification"],
+        "input_bearing_denied": ["phase2-source-fixture-notification"],
+        "malformed_denied": ["phase2-source-fixture-notification"],
+        "unpackaged_denied": ["phase2-source-fixture-notification"]
+      },
+      "source_report_check_ids": ["phase2-source-fixture-notification"],
+      "runner_artifacts": [
+        {
+          "artifact_role": "toast_com_denial",
+          "proof_class": "adversarial_access",
+          "origin": "installed_native",
+          "fixture_id": "phase2-toast-com-denial-v1",
+          "runner_id": "stein-cli-toast-com-denial-v1",
+          "required_subchecks": ["packaged_class_activated", "wrong_aumid_denied"]
+        }
+      ],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-OUTBOX-RECOVERY",
+      "fixture_id": "phase2-outbox-recovery-v1",
+      "runner_id": "stein.phase2.outbox-recovery.v1",
+      "required_proof_classes": ["crash_consistency", "restart_recovery"],
+      "required_subchecks": ["atomic_attempt_marker", "before_marker_no_call", "legacy_repair", "os_submission_unknown", "post_marker_unknown", "queue_once", "recovery_attempt_once", "repository_open_no_semantic_recovery", "terminal_audit_unknown"],
+      "source_subchecks": ["atomic_attempt_marker", "before_marker_no_call", "legacy_repair", "os_submission_unknown", "post_marker_unknown", "repository_open_no_semantic_recovery", "terminal_audit_unknown"],
+      "source_subcheck_check_ids": {
+        "atomic_attempt_marker": ["phase2-source-fixture-outbox-recovery"],
+        "before_marker_no_call": ["phase2-source-fixture-outbox-recovery"],
+        "legacy_repair": ["phase2-source-fixture-outbox-recovery"],
+        "os_submission_unknown": ["phase2-source-fixture-outbox-recovery"],
+        "post_marker_unknown": ["phase2-source-fixture-outbox-recovery"],
+        "repository_open_no_semantic_recovery": ["phase2-source-fixture-outbox-recovery"],
+        "terminal_audit_unknown": ["phase2-source-fixture-outbox-recovery"]
+      },
+      "source_report_check_ids": ["phase2-source-fixture-outbox-recovery"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-OUTBOX-EXPIRY",
+      "fixture_id": "phase2-outbox-expiry-v1",
+      "runner_id": "stein.phase2.outbox-expiry.v1",
+      "required_proof_classes": ["privacy_scan", "restart_recovery"],
+      "required_subchecks": ["expired_text_scrubbed", "missed_history_minimal", "no_notification_burst", "relevance_loss_scrubbed"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-FEEDBACK",
+      "fixture_id": "phase2-feedback-v1",
+      "runner_id": "stein.phase2.feedback.v1",
+      "required_proof_classes": ["policy_behavior", "protocol_behavior"],
+      "required_subchecks": ["accept", "correct", "correction_no_history_rewrite", "correction_no_memory_learning", "correction_no_preference_learning", "dismiss", "mute", "stop"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-REVOCATION-RACE",
+      "fixture_id": "phase2-revocation-race-v1",
+      "runner_id": "stein.phase2.revocation-race.v1",
+      "required_proof_classes": ["authority_boundary", "race_recovery"],
+      "required_subchecks": ["credential_cleanup_pending", "delivery_late_denied", "health_content_free", "native_cleanup_pending", "observation_late_denied", "queue_late_denied", "reasoning_late_denied", "revocation_immediate"],
+      "source_subchecks": ["credential_cleanup_pending", "delivery_late_denied", "native_cleanup_pending", "observation_late_denied", "queue_late_denied", "reasoning_late_denied"],
+      "source_subcheck_check_ids": {
+        "credential_cleanup_pending": ["phase2-source-fixture-revocation-race"],
+        "delivery_late_denied": ["phase2-source-fixture-revocation-race"],
+        "native_cleanup_pending": ["phase2-source-fixture-revocation-race"],
+        "observation_late_denied": ["phase2-source-fixture-revocation-race"],
+        "queue_late_denied": ["phase2-source-fixture-revocation-race"],
+        "reasoning_late_denied": ["phase2-source-fixture-revocation-race"]
+      },
+      "source_report_check_ids": ["phase2-source-fixture-revocation-race"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-DESKTOP-CLOSED",
+      "fixture_id": "phase2-desktop-closed-v1",
+      "runner_id": "stein.phase2.desktop-closed.v1",
+      "required_proof_classes": ["desktop_closed", "scheduler_runtime"],
+      "required_subchecks": ["capture_continues", "context_continues", "native_delivery_continues", "reconnect_authoritative", "reasoning_continues", "scheduling_continues", "status_continues"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-DAEMON-RESTART",
+      "fixture_id": "phase2-daemon-restart-v1",
+      "runner_id": "stein.phase2.daemon-restart.v1",
+      "required_proof_classes": ["authority_boundary", "restart_recovery"],
+      "required_subchecks": ["fresh_evidence_required", "no_absence_reasoning", "restart_authorized_recovers", "source_health_unknown", "unauthorized_stops", "working_context_absent"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-RETENTION",
+      "fixture_id": "phase2-retention-v1",
+      "runner_id": "stein.phase2.retention.v1",
+      "required_proof_classes": ["controllable_clock", "privacy_scan"],
+      "required_subchecks": ["audit_thirty_day", "context_session", "deletion_all_paths", "installed_deletion_scan", "observation_ten_minute", "outbox_actionability", "raw_immediate", "sweep_cadence", "sweep_shutdown_join"],
+      "source_subchecks": ["audit_thirty_day", "context_session", "deletion_all_paths", "observation_ten_minute", "outbox_actionability", "raw_immediate", "sweep_cadence", "sweep_shutdown_join"],
+      "source_subcheck_check_ids": {
+        "audit_thirty_day": ["phase2-source-fixture-retention"],
+        "context_session": ["phase2-source-fixture-retention"],
+        "deletion_all_paths": ["phase2-source-fixture-retention"],
+        "observation_ten_minute": ["phase2-source-fixture-retention"],
+        "outbox_actionability": ["phase2-source-fixture-retention"],
+        "raw_immediate": ["phase2-source-fixture-retention"],
+        "sweep_cadence": ["phase2-source-fixture-retention"],
+        "sweep_shutdown_join": ["phase2-source-fixture-retention"]
+      },
+      "source_report_check_ids": ["phase2-source-fixture-retention"],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-NO-LEAKS",
+      "fixture_id": "phase2-no-leaks-v1",
+      "runner_id": "stein.phase2.no-leaks.v1",
+      "required_proof_classes": ["artifact_inspection", "privacy_scan"],
+      "required_subchecks": ["audit_clean", "audit_sentinel_roundtrip", "crash_output_clean", "crash_output_sentinel_roundtrip", "credential_metadata_clean", "credential_metadata_sentinel_roundtrip", "database_clean", "database_sentinel_roundtrip", "errors_clean", "errors_sentinel_roundtrip", "evidence_clean", "evidence_sentinel_roundtrip", "logs_clean", "logs_sentinel_roundtrip", "outbox_clean", "outbox_sentinel_roundtrip", "package_clean", "package_sentinel_roundtrip", "protocol_clean", "protocol_sentinel_roundtrip", "recovery_copy_clean", "recovery_copy_sentinel_roundtrip", "sentinel_producer_contract", "traces_clean", "traces_sentinel_roundtrip"],
+      "source_subchecks": ["sentinel_producer_contract"],
+      "source_subcheck_check_ids": {
+        "sentinel_producer_contract": ["no-leaks-producer-workflow"]
+      },
+      "source_report_check_ids": ["no-leaks-producer-workflow"],
+      "runner_artifacts": [
+        {
+          "artifact_role": "no_leaks_scan",
+          "proof_class": "artifact_inspection",
+          "origin": "installed_native",
+          "fixture_id": "phase2-no-leaks-sentinel-scan-v1",
+          "runner_id": "stein-phase2-no-leaks-scan-v1",
+          "required_subchecks": ["audit_clean", "crash_output_clean", "credential_metadata_clean", "database_clean", "errors_clean", "evidence_clean", "logs_clean", "outbox_clean", "package_clean", "protocol_clean", "recovery_copy_clean", "traces_clean"]
+        },
+        {
+          "artifact_role": "no_leaks_sentinel_producer",
+          "proof_class": "privacy_scan",
+          "origin": "installed_native",
+          "fixture_id": "phase2-no-leaks-sentinel-producer-v1",
+          "runner_id": "stein-phase2-no-leaks-producer-v1",
+          "required_subchecks": ["audit_sentinel_roundtrip", "crash_output_sentinel_roundtrip", "credential_metadata_sentinel_roundtrip", "database_sentinel_roundtrip", "errors_sentinel_roundtrip", "evidence_sentinel_roundtrip", "logs_sentinel_roundtrip", "outbox_sentinel_roundtrip", "package_sentinel_roundtrip", "protocol_sentinel_roundtrip", "recovery_copy_sentinel_roundtrip", "traces_sentinel_roundtrip"],
+          "producer_source_artifact_id": "no-leaks-producer-source",
+          "producer_manifest_artifact_id": "no-leaks-producer-manifest",
+          "source_report_check_id": "no-leaks-producer-workflow"
+        }
+      ],
+      "required_bindings": ["package", "commit", "source_report"]
+    },
+    {
+      "gate_id": "P2-PORTABLE-FIXTURE",
+      "fixture_id": "phase2-portable-acceptance-v1",
+      "runner_id": "stein.phase2.portable-acceptance.v1",
+      "required_proof_classes": ["portable_linux", "source_contract"],
+      "required_subchecks": ["dependency_boundaries", "portable_runner_attestation", "rust_format", "portable_check", "portable_clippy", "semantic_full_loop", "semantic_outbox_recovery", "semantic_restart_recovery", "portable_full_suite"],
+      "source_subchecks": ["dependency_boundaries", "portable_runner_attestation"],
+      "source_subcheck_check_ids": {
+        "dependency_boundaries": ["boundary-contract"],
+        "portable_runner_attestation": ["portable-runner-attestation"]
+      },
+      "source_report_check_ids": ["boundary-contract", "portable-runner-attestation"],
+      "linux_subchecks": ["rust_format", "portable_check", "portable_clippy", "semantic_full_loop", "semantic_outbox_recovery", "semantic_restart_recovery", "portable_full_suite"],
+      "required_bindings": ["package", "commit", "source_report", "linux_artifact"],
+      "linux_artifact": {
+        "schema_version": 1,
+        "fixture_id": "phase2-portable-semantic-v1",
+        "runner_id": "github-actions-ubuntu-portable-v1",
+        "artifact_id_prefix": "linux-log-",
+        "required_subchecks": ["rust_format", "portable_check", "portable_clippy", "semantic_full_loop", "semantic_outbox_recovery", "semantic_restart_recovery", "portable_full_suite"]
+      }
+    }
+  ]
+}

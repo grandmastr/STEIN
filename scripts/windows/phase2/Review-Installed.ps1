@@ -87,6 +87,14 @@ $script:SteinReviewRuntimeSourceDefinitions = @(
     [pscustomobject]@{ role = "launcher"; path = (Join-Path $PSScriptRoot "Review-Installed.cmd") },
     [pscustomobject]@{ role = "phase2-common"; path = $commonPath },
     [pscustomobject]@{
+        role = "evidence-contract"
+        path = (Join-Path $PSScriptRoot "Evidence-Contract.ps1")
+    },
+    [pscustomobject]@{
+        role = "evidence-spec"
+        path = (Join-Path $PSScriptRoot "Evidence-Spec.json")
+    },
+    [pscustomobject]@{
         role = "package-tools"
         path = (Join-Path $repoRoot "packaging\windows-msix\PackageTools.ps1")
     }
@@ -136,9 +144,25 @@ $script:SteinPhase2ReviewGateIds = @(
     "P2-NO-LEAKS",
     "P2-PORTABLE-FIXTURE"
 )
+$evidenceContractPath = Join-Path $PSScriptRoot "Evidence-Contract.ps1"
+$evidenceSpecificationPath = Join-Path $PSScriptRoot "Evidence-Spec.json"
+. $evidenceContractPath
+$initialEvidenceSpecification = @($script:SteinReviewInitialRuntimeSources | Where-Object {
+        [string]$_.role -ceq "evidence-spec"
+    })
+if ($initialEvidenceSpecification.Count -ne 1) {
+    throw "evidence_spec_runtime_source_missing"
+}
+$script:SteinPhase2ReviewEvidenceSpecificationSha256 =
+    [string]$initialEvidenceSpecification[0].sha256
+$script:SteinPhase2ReviewEvidenceSpecification = Read-SteinPhase2EvidenceSpecification `
+    -Path $evidenceSpecificationPath `
+    -ExpectedGateIds $script:SteinPhase2ReviewGateIds `
+    -ExpectedSha256 $script:SteinPhase2ReviewEvidenceSpecificationSha256
 $script:SteinReviewArtifactCache = @{}
 $script:SteinReviewAttachmentFiles = @{}
 $script:SteinReviewCollectorRuntimeSourceFiles = @{}
+$script:SteinReviewCollectorHostRecord = $null
 
 function Assert-SteinReviewJsonShape {
     param(
@@ -455,10 +479,19 @@ function Read-SteinReviewJsonFile {
             ($ExpectedSize -ge 0 -and $stream.Length -ne $ExpectedSize)) {
             throw "json_artifact_hash_or_size_mismatch"
         }
+        $bytes = New-Object byte[] ([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) {
+                throw "json_artifact_hash_or_size_mismatch"
+            }
+            $offset += $read
+        }
         if (-not [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
             $sha256 = [Security.Cryptography.SHA256]::Create()
             try {
-                $digest = [BitConverter]::ToString($sha256.ComputeHash($stream)).
+                $digest = [BitConverter]::ToString($sha256.ComputeHash($bytes)).
                     Replace("-", "").ToLowerInvariant()
             }
             finally {
@@ -467,20 +500,16 @@ function Read-SteinReviewJsonFile {
             if ($digest -cne $ExpectedSha256) {
                 throw "json_artifact_hash_or_size_mismatch"
             }
-            $stream.Position = 0
         }
-        $reader = [IO.StreamReader]::new(
-            $stream,
-            [Text.UTF8Encoding]::new($false, $true),
-            $true)
         try {
-            $jsonText = $reader.ReadToEnd()
+            $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+            $jsonText = $strictUtf8.GetString($bytes)
+            if ($jsonText.Length -gt 0 -and [int][char]$jsonText[0] -eq 0xFEFF) {
+                $jsonText = $jsonText.Substring(1)
+            }
         }
         catch {
             throw $FailureCode
-        }
-        finally {
-            $reader.Dispose()
         }
     }
     finally {
@@ -765,6 +794,14 @@ function Assert-SteinReviewGenerator {
             path = "scripts/windows/phase2/Common.ps1"
         },
         [pscustomobject]@{
+            role = "evidence-contract"
+            path = "scripts/windows/phase2/Evidence-Contract.ps1"
+        },
+        [pscustomobject]@{
+            role = "evidence-spec"
+            path = "scripts/windows/phase2/Evidence-Spec.json"
+        },
+        [pscustomobject]@{
             role = "phase2-status"
             path = "scripts/windows/phase2/Status.ps1"
         }
@@ -943,13 +980,22 @@ function Assert-SteinReviewAttachmentMetadata {
     if ([string]$Attachment.kind -ceq "native_fixture_result") {
         Assert-SteinReviewJsonShape -Value $Attachment.native_fixture `
             -ExpectedProperties @(
-                "schema_version", "fixture_id", "command_id", "exit_code",
-                "closed_content_free_schema_verified") `
+                "schema_version", "contract_id", "contract_sha256", "fixture_id",
+                "runner_id", "exit_code", "closed_content_free_schema_verified",
+                "proof_classes", "subchecks", "bindings", "artifacts") `
             -FailureCode "collector_native_fixture_metadata_invalid"
-        Assert-SteinReviewSchemaVersion -Value $Attachment.native_fixture.schema_version `
-            -FailureCode "collector_native_fixture_metadata_invalid"
-        if ([string]$Attachment.native_fixture.fixture_id -cnotmatch '^[a-z0-9][a-z0-9._-]{0,63}$' -or
-            [string]$Attachment.native_fixture.command_id -cnotmatch '^[a-z0-9][a-z0-9._:-]{0,127}$') {
+        $gateSpecification = $script:SteinPhase2ReviewEvidenceSpecification.gates_by_id[$ExpectedGate]
+        if (($Attachment.native_fixture.schema_version -isnot [int] -and
+                $Attachment.native_fixture.schema_version -isnot [long]) -or
+            [long]$Attachment.native_fixture.schema_version -ne 2 -or
+            [string]$Attachment.native_fixture.contract_id -cne
+                [string]$script:SteinPhase2ReviewEvidenceSpecification.specification.contract_id -or
+            [string]$Attachment.native_fixture.contract_sha256 -cne
+                $script:SteinPhase2ReviewEvidenceSpecificationSha256 -or
+            [string]$Attachment.native_fixture.fixture_id -cne
+                [string]$gateSpecification.fixture_id -or
+            [string]$Attachment.native_fixture.runner_id -cne
+                [string]$gateSpecification.runner_id) {
             throw "collector_native_fixture_metadata_invalid"
         }
         Assert-SteinReviewBoolean `
@@ -1040,7 +1086,12 @@ function Assert-SteinReviewLedgerEnvelope {
             "release_identity_schema_version", "install_record_schema_version",
             "package_family_name", "desktop_aumid", "broker_aumid",
             "browser_producer_aumid", "msix_sha256", "core_sha256",
-            "browser_host_sha256", "installed_payload_file_count", "cli_sha256") `
+            "browser_host_sha256", "candidate_git_commit", "candidate_git_tree",
+            "source_verification_sha256", "source_root_anchor_sha256",
+            "source_root_digest_sha256", "installed_payload_file_count",
+            "cli_executable_size", "cli_executable_sha256",
+            "desktop_executable_size", "desktop_executable_sha256",
+            "desktop_dist_file_count", "desktop_dist_manifest_sha256") `
         -FailureCode "collector_package_provenance_schema_invalid"
     if ([string]$Ledger.package.package_path -cnotmatch
             '^<local-path-sha256:[0-9a-f]{64}>$' -or
@@ -1049,15 +1100,57 @@ function Assert-SteinReviewLedgerEnvelope {
     }
     foreach ($property in @(
             "release_identity_schema_version", "install_record_schema_version",
-            "installed_payload_file_count")) {
+            "installed_payload_file_count", "cli_executable_size",
+            "desktop_executable_size", "desktop_dist_file_count")) {
         Assert-SteinReviewInteger -Value $Ledger.package.$property `
             -FailureCode "collector_package_provenance_invalid"
     }
+    if ([long]$Ledger.package.release_identity_schema_version -ne 3 -or
+        [long]$Ledger.package.install_record_schema_version -ne 2 -or
+        [long]$Ledger.package.cli_executable_size -lt 0 -or
+        [long]$Ledger.package.desktop_executable_size -lt 0 -or
+        [long]$Ledger.package.desktop_dist_file_count -lt 0 -or
+        [long]$Ledger.package.desktop_dist_file_count -gt 10000) {
+        throw "collector_package_provenance_invalid"
+    }
     foreach ($property in @(
-            "msix_sha256", "core_sha256", "browser_host_sha256", "cli_sha256")) {
+            "msix_sha256", "core_sha256", "browser_host_sha256",
+            "cli_executable_sha256", "desktop_executable_sha256",
+            "desktop_dist_manifest_sha256",
+            "source_verification_sha256", "source_root_anchor_sha256",
+            "source_root_digest_sha256")) {
         Assert-SteinReviewHash -Value $Ledger.package.$property `
             -AllowNull `
             -FailureCode "collector_package_provenance_invalid"
+    }
+    $boundPackageHashes = @(
+        $Ledger.package.core_sha256,
+        $Ledger.package.browser_host_sha256,
+        $Ledger.package.cli_executable_sha256,
+        $Ledger.package.desktop_executable_sha256,
+        $Ledger.package.desktop_dist_manifest_sha256)
+    if ($null -ne $Ledger.package.msix_sha256) {
+        if (@($boundPackageHashes | Where-Object { $null -eq $_ }).Count -ne 0 -or
+            [long]$Ledger.package.cli_executable_size -le 0 -or
+            [long]$Ledger.package.desktop_executable_size -le 0 -or
+            [long]$Ledger.package.desktop_dist_file_count -le 0) {
+            throw "collector_package_provenance_invalid"
+        }
+    }
+    elseif (@($boundPackageHashes | Where-Object { $null -ne $_ }).Count -ne 0 -or
+        [long]$Ledger.package.cli_executable_size -ne 0 -or
+        [long]$Ledger.package.desktop_executable_size -ne 0 -or
+        [long]$Ledger.package.desktop_dist_file_count -ne 0) {
+        throw "collector_package_provenance_invalid"
+    }
+    if ($null -ne $Ledger.package.candidate_git_commit -and
+        ([string]$Ledger.package.candidate_git_commit -cnotmatch
+                '^(?:[0-9a-f]{40}|[0-9a-f]{64})$' -or
+            [string]$Ledger.package.candidate_git_tree -cnotmatch
+                '^(?:[0-9a-f]{40}|[0-9a-f]{64})$' -or
+            ([string]$Ledger.package.candidate_git_commit).Length -ne
+                ([string]$Ledger.package.candidate_git_tree).Length)) {
+        throw "collector_package_provenance_invalid"
     }
 
     Assert-SteinReviewJsonShape -Value $Ledger.schema_versions `
@@ -1127,6 +1220,10 @@ function Assert-SteinReviewVersionProvenance {
             -Minimum 1 `
             -FailureCode "collector_version_provenance_invalid"
     }
+    if ([long]$Versions.release_identity_schema_version -ne 3 -or
+        [long]$Versions.install_record_schema_version -ne 2) {
+        throw "collector_version_provenance_invalid"
+    }
     if ($null -ne $Versions.protocol_version) {
         Assert-SteinReviewInteger -Value $Versions.protocol_version `
             -Minimum 1 `
@@ -1142,9 +1239,16 @@ function Assert-SteinReviewVersionProvenance {
 function Read-SteinReviewNativeFixture {
     param(
         [Parameter(Mandatory = $true)][string] $Path,
-        [Parameter(Mandatory = $true)] $Metadata
+        [Parameter(Mandatory = $true)] $Metadata,
+        [Parameter(Mandatory = $true)][object[]] $UnderlyingArtifacts,
+        [Parameter(Mandatory = $true)] $UnderlyingPaths,
+        [Parameter(Mandatory = $true)] $ExpectedPackage
     )
 
+    $underlyingById = @{}
+    foreach ($underlyingArtifact in @($UnderlyingArtifacts)) {
+        $underlyingById[[string]$underlyingArtifact.artifact_id] = $underlyingArtifact
+    }
     $fixture = Read-SteinReviewJsonFile `
         -Path $Path `
         -MaximumBytes 4MB `
@@ -1153,13 +1257,29 @@ function Read-SteinReviewNativeFixture {
         -ExpectedSize ([long]$Metadata.size)
     Assert-SteinReviewJsonShape -Value $fixture `
         -ExpectedProperties @(
-            "schema_version", "fixture_id", "gate_id", "result", "recorded_at_utc",
-            "command_id", "exit_code") `
+            "schema_version", "contract_id", "contract_sha256", "gate_id",
+            "fixture_id", "runner_id", "result", "recorded_at_utc", "exit_code",
+            "runner", "proof_classes", "subchecks", "bindings", "artifacts") `
         -FailureCode "native_fixture_result_schema_invalid"
-    Assert-SteinReviewSchemaVersion -Value $fixture.schema_version `
-        -FailureCode "native_fixture_result_schema_invalid"
-    if ([string]$fixture.fixture_id -cne [string]$Metadata.native_fixture.fixture_id -or
-        [string]$fixture.command_id -cne [string]$Metadata.native_fixture.command_id -or
+    $gateSpecification =
+        $script:SteinPhase2ReviewEvidenceSpecification.gates_by_id[[string]$Metadata.gate_id]
+    try {
+        $null = Assert-SteinPhase2GateEvidenceResult `
+            -Value $fixture `
+            -Specification $script:SteinPhase2ReviewEvidenceSpecification.specification `
+            -Gate $gateSpecification `
+            -SpecificationSha256 $script:SteinPhase2ReviewEvidenceSpecificationSha256 `
+            -ExpectedPackage $ExpectedPackage `
+            -ExpectedCollector $script:SteinReviewCollectorHostRecord `
+            -UnderlyingArtifacts $UnderlyingArtifacts
+    }
+    catch {
+        throw $_.Exception.Message
+    }
+    if ([string]$fixture.contract_id -cne [string]$Metadata.native_fixture.contract_id -or
+        [string]$fixture.contract_sha256 -cne [string]$Metadata.native_fixture.contract_sha256 -or
+        [string]$fixture.fixture_id -cne [string]$Metadata.native_fixture.fixture_id -or
+        [string]$fixture.runner_id -cne [string]$Metadata.native_fixture.runner_id -or
         [string]$fixture.gate_id -cne [string]$Metadata.gate_id -or
         [string]$fixture.result -cne [string]$Metadata.declared_result -or
         (ConvertTo-SteinReviewTimestampString `
@@ -1187,6 +1307,123 @@ function Read-SteinReviewNativeFixture {
     }
     elseif ([long]$exitCode -ne [long]$Metadata.native_fixture.exit_code) {
         throw "native_fixture_result_exit_binding_invalid"
+    }
+    foreach ($binding in @(
+            [pscustomobject]@{ left = $fixture.proof_classes; right = $Metadata.native_fixture.proof_classes },
+            [pscustomobject]@{ left = $fixture.subchecks; right = $Metadata.native_fixture.subchecks },
+            [pscustomobject]@{ left = $fixture.bindings; right = $Metadata.native_fixture.bindings },
+            [pscustomobject]@{ left = $fixture.artifacts; right = $Metadata.native_fixture.artifacts })) {
+        if (-not (Test-SteinReviewJsonEqual -Left $binding.left -Right $binding.right)) {
+            throw "native_fixture_result_metadata_binding_invalid"
+        }
+    }
+    $sourceBinding = $fixture.bindings.source_report
+    $sourceReportPath = $UnderlyingPaths[[string]$sourceBinding.report_artifact_id]
+    $sourceRootPath = $UnderlyingPaths[[string]$sourceBinding.root_anchor_artifact_id]
+    $sourceReportDescriptor = $underlyingById[[string]$sourceBinding.report_artifact_id]
+    $sourceRootDescriptor = $underlyingById[[string]$sourceBinding.root_anchor_artifact_id]
+    if ([string]::IsNullOrWhiteSpace($sourceReportPath) -or
+        [string]::IsNullOrWhiteSpace($sourceRootPath) -or
+        $null -eq $sourceReportDescriptor -or $null -eq $sourceRootDescriptor) {
+        throw "source_evidence_artifact_missing"
+    }
+    $sourceReport = Read-SteinReviewJsonFile `
+        -Path $sourceReportPath `
+        -MaximumBytes 16MB `
+        -FailureCode "source_evidence_report_invalid" `
+        -ExpectedSha256 ([string]$sourceReportDescriptor.sha256) `
+        -ExpectedSize ([long]$sourceReportDescriptor.size)
+    $sourceRoot = Read-SteinReviewJsonFile `
+        -Path $sourceRootPath `
+        -MaximumBytes 1MB `
+        -FailureCode "source_evidence_root_invalid" `
+        -ExpectedSha256 ([string]$sourceRootDescriptor.sha256) `
+        -ExpectedSize ([long]$sourceRootDescriptor.size)
+    $null = Assert-SteinPhase2SourceEvidenceBinding `
+        -EvidenceResult $fixture `
+        -SourceReport $sourceReport `
+        -SourceRootAnchor $sourceRoot `
+        -EvidenceSpecification $script:SteinPhase2ReviewEvidenceSpecification.specification
+    if ([string]$Metadata.gate_id -ceq "P2-PORTABLE-FIXTURE") {
+        $linuxPath = $UnderlyingPaths[[string]$fixture.bindings.linux_artifact.artifact_id]
+        if ([string]::IsNullOrWhiteSpace($linuxPath)) {
+            throw "linux_artifact_missing"
+        }
+        $linuxDescriptor = $underlyingById[
+            [string]$fixture.bindings.linux_artifact.artifact_id]
+        if ($null -eq $linuxDescriptor) {
+            throw "linux_artifact_missing"
+        }
+        $linuxArtifact = Read-SteinReviewJsonFile `
+            -Path $linuxPath `
+            -MaximumBytes 4MB `
+            -FailureCode "linux_artifact_invalid" `
+            -ExpectedSha256 ([string]$linuxDescriptor.sha256) `
+            -ExpectedSize ([long]$linuxDescriptor.size)
+        $null = Assert-SteinPhase2LinuxPortableArtifact `
+            -Artifact $linuxArtifact `
+            -Gate $gateSpecification `
+            -ExpectedCommit ([string]$fixture.bindings.commit.object_id) `
+            -ExpectedTree ([string]$fixture.bindings.commit.tree_id) `
+            -SourceReport $sourceReport `
+            -EvidenceResult $fixture `
+            -UnderlyingArtifacts $UnderlyingArtifacts
+    }
+    $noLeaksScannerArtifact = $null
+    $noLeaksProducerArtifact = $null
+    foreach ($runnerBinding in @($fixture.bindings.runner_artifacts)) {
+        $runnerSpecification = @($gateSpecification.runner_artifacts | Where-Object {
+            [string]$_.artifact_role -ceq [string]$runnerBinding.artifact_role
+        })[0]
+        $runnerPath = $UnderlyingPaths[[string]$runnerBinding.artifact_id]
+        $runnerDescriptor = $underlyingById[[string]$runnerBinding.artifact_id]
+        if ($null -eq $runnerSpecification -or
+            [string]::IsNullOrWhiteSpace($runnerPath) -or
+            $null -eq $runnerDescriptor) {
+            throw "runner_artifact_missing"
+        }
+        $runnerArtifact = Read-SteinReviewJsonFile `
+            -Path $runnerPath `
+            -MaximumBytes 4MB `
+            -FailureCode "runner_artifact_invalid" `
+            -ExpectedSha256 ([string]$runnerDescriptor.sha256) `
+            -ExpectedSize ([long]$runnerDescriptor.size)
+        if ([string]$runnerBinding.artifact_role -ceq "private_diagnostic_denial") {
+            $null = Assert-SteinPhase2PrivateDiagnosticArtifact `
+                -Artifact $runnerArtifact `
+                -RunnerArtifact $runnerSpecification
+        }
+        elseif ([string]$runnerBinding.artifact_role -ceq "toast_com_denial") {
+            $null = Assert-SteinPhase2ToastComDenialArtifact `
+                -Artifact $runnerArtifact `
+                -RunnerArtifact $runnerSpecification
+        }
+        elseif ([string]$runnerBinding.artifact_role -ceq "no_leaks_scan") {
+            $null = Assert-SteinPhase2NoLeaksArtifact `
+                -Artifact $runnerArtifact `
+                -RunnerArtifact $runnerSpecification `
+                -EvidenceResult $fixture
+            $noLeaksScannerArtifact = $runnerArtifact
+        }
+        elseif ([string]$runnerBinding.artifact_role -ceq
+            "no_leaks_sentinel_producer") {
+            $null = Assert-SteinPhase2NoLeaksProducerArtifact `
+                -Artifact $runnerArtifact `
+                -RunnerArtifact $runnerSpecification `
+                -EvidenceResult $fixture
+            $noLeaksProducerArtifact = $runnerArtifact
+        }
+        else {
+            throw "runner_artifact_role_unsupported"
+        }
+    }
+    if ([string]$Metadata.gate_id -ceq "P2-NO-LEAKS") {
+        if ($null -eq $noLeaksScannerArtifact -or $null -eq $noLeaksProducerArtifact) {
+            throw "no_leaks_receipt_pair_missing"
+        }
+        $null = Assert-SteinPhase2NoLeaksReceiptPair `
+            -ScannerArtifact $noLeaksScannerArtifact `
+            -ProducerArtifact $noLeaksProducerArtifact
     }
     Assert-SteinReviewNoPrivateValues -Value $fixture -Context "native_fixture"
     return $fixture
@@ -1304,6 +1541,7 @@ $hostRecord = Read-SteinReviewJsonFile `
     -FailureCode "collector_host_invalid" `
     -ExpectedSha256 ([string]$rootAnchor.host.sha256) `
     -ExpectedSize ([long]$rootAnchor.host.size)
+$script:SteinReviewCollectorHostRecord = $hostRecord
 $ledger = Read-SteinReviewJsonFile `
     -Path $ledgerPath `
     -MaximumBytes 16MB `
@@ -1702,7 +1940,8 @@ if ($attachmentMappings.Count -ne $sourceAttachmentsById.Count) {
 $mappingsById = @{}
 foreach ($mapping in $attachmentMappings) {
     Assert-SteinReviewJsonShape -Value $mapping `
-        -ExpectedProperties @("attachment_id", "gate_id", "kind", "path", "sha256") `
+        -ExpectedProperties @(
+            "attachment_id", "gate_id", "kind", "path", "sha256", "artifacts") `
         -FailureCode "review_attachment_schema_invalid"
     $attachmentId = [string]$mapping.attachment_id
     if ($attachmentId -cnotmatch '^[a-z0-9][a-z0-9._-]{0,63}$' -or
@@ -1737,11 +1976,71 @@ foreach ($mapping in $attachmentMappings) {
         (Get-SteinPhase2Sha256 -Path $attachmentPath) -cne [string]$metadata.sha256) {
         throw "review_attachment_hash_or_size_mismatch"
     }
+    $underlyingArtifacts = New-Object Collections.Generic.List[object]
+    $underlyingPaths = @{}
+    $expectedUnderlying = if ([string]$metadata.kind -ceq "native_fixture_result") {
+        @($metadata.native_fixture.artifacts)
+    }
+    else { @() }
+    $expectedUnderlyingById = @{}
+    foreach ($descriptor in $expectedUnderlying) {
+        $expectedUnderlyingById[[string]$descriptor.artifact_id] = $descriptor
+    }
+    $underlyingMappings = @($mapping.artifacts)
+    if ($underlyingMappings.Count -ne $expectedUnderlyingById.Count) {
+        throw "review_underlying_artifact_set_invalid"
+    }
+    foreach ($artifactMapping in $underlyingMappings) {
+        Assert-SteinReviewJsonShape -Value $artifactMapping `
+            -ExpectedProperties @("artifact_id", "path", "sha256", "size") `
+            -FailureCode "review_underlying_artifact_schema_invalid"
+        $artifactId = [string]$artifactMapping.artifact_id
+        if ($artifactId -cnotmatch '^[a-z0-9][a-z0-9._-]{2,95}$' -or
+            $underlyingPaths.ContainsKey($artifactId) -or
+            -not $expectedUnderlyingById.ContainsKey($artifactId)) {
+            throw "review_underlying_artifact_set_invalid"
+        }
+        Assert-SteinReviewHash -Value $artifactMapping.sha256 `
+            -FailureCode "review_underlying_artifact_invalid"
+        Assert-SteinReviewInteger -Value $artifactMapping.size -Minimum 1 `
+            -FailureCode "review_underlying_artifact_invalid"
+        $expectedDescriptor = $expectedUnderlyingById[$artifactId]
+        if ([string]$artifactMapping.sha256 -cne [string]$expectedDescriptor.sha256 -or
+            [long]$artifactMapping.size -ne [long]$expectedDescriptor.size) {
+            throw "review_underlying_artifact_binding_invalid"
+        }
+        $artifactPath = Resolve-SteinReviewContainedFile `
+            -Root $manifestBase `
+            -RelativePath $artifactMapping.path `
+            -FailureCode "review_underlying_artifact_path_invalid"
+        $artifactItem = Get-Item -LiteralPath $artifactPath -Force -ErrorAction Stop
+        if ($artifactItem.Length -ne [long]$artifactMapping.size -or
+            $artifactItem.Length -gt 64MB -or
+            (Get-SteinPhase2Sha256 -Path $artifactPath) -cne
+                [string]$artifactMapping.sha256) {
+            throw "review_underlying_artifact_hash_or_size_mismatch"
+        }
+        $underlyingArtifacts.Add([pscustomobject]@{
+            artifact_id = $artifactId
+            sha256 = [string]$artifactMapping.sha256
+            size = [long]$artifactMapping.size
+        })
+        $underlyingPaths[$artifactId] = $artifactPath
+        $script:SteinReviewAttachmentFiles["artifact:$attachmentId`:$artifactId"] =
+            [pscustomobject]@{
+                path = $artifactPath
+                size = [long]$artifactItem.Length
+                sha256 = [string]$artifactMapping.sha256
+            }
+    }
     $fixture = $null
     if ([string]$metadata.kind -ceq "native_fixture_result") {
         $fixture = Read-SteinReviewNativeFixture `
             -Path $attachmentPath `
-            -Metadata $metadata
+            -Metadata $metadata `
+            -UnderlyingArtifacts @($underlyingArtifacts | ForEach-Object { $_ }) `
+            -UnderlyingPaths $underlyingPaths `
+            -ExpectedPackage $ledger.package
     }
     $mappingsById[$attachmentId] = [pscustomobject]@{
         mapping = $mapping
@@ -1751,7 +2050,8 @@ foreach ($mapping in $attachmentMappings) {
         size = [long]$attachmentItem.Length
         sha256 = [string]$metadata.sha256
     }
-    $script:SteinReviewAttachmentFiles[$attachmentId] = $mappingsById[$attachmentId]
+    $script:SteinReviewAttachmentFiles["attachment:$attachmentId"] =
+        $mappingsById[$attachmentId]
 }
 
 $reviews = @($manifest.reviews)

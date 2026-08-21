@@ -12,6 +12,11 @@ $reviewerPath = Join-Path $PSScriptRoot "Review-Installed.ps1"
 $reviewerLauncherPath = Join-Path $PSScriptRoot "Review-Installed.cmd"
 $reviewerTestPath = Join-Path $PSScriptRoot "Test-ReviewInstalled.ps1"
 $commonPath = Join-Path $PSScriptRoot "Common.ps1"
+$evidenceSpecPath = Join-Path $PSScriptRoot "Evidence-Spec.json"
+$evidenceContractPath = Join-Path $PSScriptRoot "Evidence-Contract.ps1"
+$noLeaksScannerPath = Join-Path $PSScriptRoot "Scan-NoLeaks.ps1"
+$noLeaksScannerLauncherPath = Join-Path $PSScriptRoot "Scan-NoLeaks.cmd"
+$noLeaksScannerTestPath = Join-Path $PSScriptRoot "Test-ScanNoLeaks.ps1"
 $packageToolsPath = Join-Path $repoRoot "packaging\windows-msix\PackageTools.ps1"
 foreach ($path in @(
         $helperPath,
@@ -21,6 +26,11 @@ foreach ($path in @(
         $reviewerLauncherPath,
         $reviewerTestPath,
         $commonPath,
+        $evidenceSpecPath,
+        $evidenceContractPath,
+        $noLeaksScannerPath,
+        $noLeaksScannerLauncherPath,
+        $noLeaksScannerTestPath,
         $packageToolsPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "The source-evidence verifier is incomplete."
@@ -55,6 +65,10 @@ foreach ($required in @(
         'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US',
         'installed-reviewer-windows-powershell-contract',
         'installed-reviewer-pwsh-contract',
+        'no-leaks-scanner-static',
+        'Test-ScanNoLeaks.ps1',
+        'no-leaks-producer-workflow',
+        'Candidate-owned installed artifact producer is not implemented.',
         'Test-ReviewInstalled.ps1')) {
     if ($verifySource.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
         throw "Verify-Source.ps1 is missing a source-evidence invariant."
@@ -87,6 +101,11 @@ $expectedGeneratorRelativePaths = @(
     "scripts/windows/phase2/Review-Installed.cmd",
     "scripts/windows/phase2/Test-ReviewInstalled.ps1",
     "scripts/windows/phase2/Common.ps1",
+    "scripts/windows/phase2/Evidence-Spec.json",
+    "scripts/windows/phase2/Evidence-Contract.ps1",
+    "scripts/windows/phase2/Scan-NoLeaks.ps1",
+    "scripts/windows/phase2/Scan-NoLeaks.cmd",
+    "scripts/windows/phase2/Test-ScanNoLeaks.ps1",
     "packaging/windows-msix/PackageTools.ps1"
 )
 if ($generatorRelativePaths.Count -ne $expectedGeneratorRelativePaths.Count -or
@@ -95,6 +114,64 @@ if ($generatorRelativePaths.Count -ne $expectedGeneratorRelativePaths.Count -or
         -DifferenceObject ($generatorRelativePaths | Sort-Object) `
         -CaseSensitive).Count -ne 0) {
     throw "Verify-Source.ps1 does not hash its exact source-evidence generator set."
+}
+$evidenceSpec = Get-Content -LiteralPath $evidenceSpecPath -Raw -Encoding UTF8 |
+    ConvertFrom-Json -ErrorAction Stop
+$contractGeneratorPaths = @(
+    $evidenceSpec.source_report_contract.required_generator_paths)
+if ($contractGeneratorPaths.Count -ne $expectedGeneratorRelativePaths.Count -or
+    @(Compare-Object `
+        -ReferenceObject ($expectedGeneratorRelativePaths | Sort-Object) `
+        -DifferenceObject ($contractGeneratorPaths | Sort-Object) `
+        -CaseSensitive).Count -ne 0) {
+    throw "The evidence specification and source generator path sets disagree."
+}
+$implementedSourceCheckIds = @(
+    [regex]::Matches(
+        $verifySource,
+        '(?ms)(?:Invoke-SteinSourceCheck|Add-SteinNotRunCheck)\s+`?\s*-Id\s+"(?<id>[a-z][a-z0-9-]+)"') |
+        ForEach-Object { [string]$_.Groups['id'].Value }
+    'source-provenance-stability'
+) | Sort-Object -Unique
+$contractSourceCheckIds = @(
+    @($evidenceSpec.source_report_contract.required_pass_check_ids) +
+    @($evidenceSpec.source_report_contract.allowed_not_run_check_ids))
+if ($implementedSourceCheckIds.Count -ne $contractSourceCheckIds.Count -or
+    @(Compare-Object `
+        -ReferenceObject ($contractSourceCheckIds | Sort-Object) `
+        -DifferenceObject ($implementedSourceCheckIds | Sort-Object) `
+        -CaseSensitive).Count -ne 0) {
+    throw "The evidence specification and source check implementations disagree."
+}
+$gateSpecificPlaceholderIds = @(
+    $evidenceSpec.source_report_contract.allowed_not_run_check_ids |
+        Where-Object { [string]$_ -cmatch '^phase2-source-fixture-' })
+if ($gateSpecificPlaceholderIds.Count -ne 13) {
+    throw "The exact gate-specific source-fixture placeholder set is invalid."
+}
+$mappedGateSpecificPlaceholderIds = New-Object Collections.Generic.List[string]
+foreach ($gate in @($evidenceSpec.gates | Where-Object {
+            $null -ne $_.PSObject.Properties['source_subcheck_check_ids']
+        })) {
+    foreach ($mapping in @($gate.source_subcheck_check_ids.PSObject.Properties)) {
+        $mappedIds = @($mapping.Value)
+        if ('rust-tests' -cin $mappedIds -and
+            ([string]$gate.gate_id -cne 'P2-BUILD' -or
+                [string]$mapping.Name -cne 'rust_tests')) {
+            throw "A generic Rust suite is mapped to a named source semantic."
+        }
+        foreach ($mappedId in @($mappedIds | Where-Object {
+                    [string]$_ -cmatch '^phase2-source-fixture-'
+                })) {
+            $mappedGateSpecificPlaceholderIds.Add([string]$mappedId)
+        }
+    }
+}
+if (@(Compare-Object `
+        -ReferenceObject ($gateSpecificPlaceholderIds | Sort-Object -Unique) `
+        -DifferenceObject ($mappedGateSpecificPlaceholderIds | Sort-Object -Unique) `
+        -CaseSensitive).Count -ne 0) {
+    throw "The gate-specific source-fixture mappings are incomplete."
 }
 
 $reviewerHostBindings = @{}
@@ -192,11 +269,12 @@ if ([string]::IsNullOrWhiteSpace($resolvedTrustedPwsh) -or
 }
 
 $toolExecutables = [ordered]@{
-    cargo = (Get-Command "cargo.exe" -ErrorAction Stop).Source
-    rustc = (Get-Command "rustc.exe" -ErrorAction Stop).Source
-    node = (Get-Command "node.exe" -ErrorAction Stop).Source
-    pnpm = (Get-Command "pnpm.cmd" -ErrorAction Stop).Source
-    git = (Get-Command "git.exe" -ErrorAction Stop).Source
+    cargo = [string]@(Get-Command "cargo.exe" -CommandType Application -ErrorAction Stop)[0].Source
+    rustc = [string]@(Get-Command "rustc.exe" -CommandType Application -ErrorAction Stop)[0].Source
+    rustup = [string]@(Get-Command "rustup.exe" -CommandType Application -ErrorAction Stop)[0].Source
+    node = [string]@(Get-Command "node.exe" -CommandType Application -ErrorAction Stop)[0].Source
+    pnpm = [string]@(Get-Command "pnpm.cmd" -CommandType Application -ErrorAction Stop)[0].Source
+    git = [string]@(Get-Command "git.exe" -CommandType Application -ErrorAction Stop)[0].Source
     pwsh = $resolvedTrustedPwsh
 }
 $ignoredGeneratedPaths = @(
@@ -228,9 +306,9 @@ if ($provenanceJson.IndexOf($repoRoot, [StringComparison]::OrdinalIgnoreCase) -g
         $provenanceJson.IndexOf($env:USERPROFILE, [StringComparison]::OrdinalIgnoreCase) -ge 0)) {
     throw "Source provenance retained a local filesystem path."
 }
-$expectedToolNames = @("cargo", "rustc", "node", "pnpm", "git", "pwsh")
+$expectedToolNames = @("cargo", "rustc", "rustup", "node", "pnpm", "git", "pwsh")
 $actualToolNames = @($provenance.toolchain.Keys | ForEach-Object { [string]$_ })
-if ([int]$provenance.schema_version -ne 1 -or
+if ([int]$provenance.schema_version -ne 2 -or
     [string]$provenance.classification -cne "bounded_content_free_source_provenance" -or
     [string]$provenance.repository.head_commit -notmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$' -or
     [string]$provenance.repository.state_sha256 -notmatch '^[0-9a-f]{64}$' -or
@@ -240,6 +318,51 @@ if ([int]$provenance.schema_version -ne 1 -or
         -DifferenceObject ($actualToolNames | Sort-Object) `
         -CaseSensitive).Count -ne 0) {
     throw "Source repository provenance is invalid."
+}
+foreach ($rustToolName in @("cargo", "rustc")) {
+    $rustTool = $provenance.toolchain.$rustToolName
+    $rustProperties = @($rustTool.Keys | ForEach-Object { [string]$_ })
+    $expectedRustProperties = @(
+        "version",
+        "executable_sha256",
+        "rustup_toolchain",
+        "resolved_version",
+        "resolved_executable_sha256")
+    if ($rustProperties.Count -ne $expectedRustProperties.Count -or
+        @(Compare-Object `
+            -ReferenceObject ($expectedRustProperties | Sort-Object) `
+            -DifferenceObject ($rustProperties | Sort-Object) `
+            -CaseSensitive).Count -ne 0 -or
+        [string]$rustTool.rustup_toolchain -notmatch
+            '^[0-9A-Za-z][0-9A-Za-z._-]{2,127}$' -or
+        [string]$rustTool.resolved_version -cne [string]$rustTool.version -or
+        [string]$rustTool.resolved_executable_sha256 -notmatch '^[0-9a-f]{64}$') {
+        throw "A rustup-selected source toolchain record is invalid."
+    }
+}
+if ([string]$provenance.toolchain.cargo.rustup_toolchain -cne
+        [string]$provenance.toolchain.rustc.rustup_toolchain -or
+    [string]$provenance.toolchain.pnpm.resolved_entrypoint_sha256 -notmatch
+        '^[0-9a-f]{64}$' -or
+    [string]$provenance.toolchain.git.resolved_version -cne
+        [string]$provenance.toolchain.git.version -or
+    [string]$provenance.toolchain.git.resolved_executable_sha256 -notmatch
+        '^[0-9a-f]{64}$') {
+    throw "Resolved source toolchain payload provenance is invalid."
+}
+$gitProperties = @(
+    $provenance.toolchain.git.Keys | ForEach-Object { [string]$_ })
+$expectedGitProperties = @(
+    "version",
+    "executable_sha256",
+    "resolved_version",
+    "resolved_executable_sha256")
+if ($gitProperties.Count -ne $expectedGitProperties.Count -or
+    @(Compare-Object `
+        -ReferenceObject ($expectedGitProperties | Sort-Object) `
+        -DifferenceObject ($gitProperties | Sort-Object) `
+        -CaseSensitive).Count -ne 0) {
+    throw "The resolved Git source toolchain record is invalid."
 }
 foreach ($toolName in $expectedToolNames) {
     $tool = $provenance.toolchain.$toolName
@@ -291,10 +414,15 @@ $generator = Get-SteinSourceEvidenceGenerator `
         $reviewerLauncherPath,
         $reviewerTestPath,
         $commonPath,
+        $evidenceSpecPath,
+        $evidenceContractPath,
+        $noLeaksScannerPath,
+        $noLeaksScannerLauncherPath,
+        $noLeaksScannerTestPath,
         $packageToolsPath)
 $generatorJson = $generator | ConvertTo-Json -Depth 8 -Compress
 if ([int]$generator.schema_version -ne 1 -or
-    @($generator.files).Count -ne 9 -or
+    @($generator.files).Count -ne 14 -or
     [string]$generator.digest_sha256 -notmatch '^[0-9a-f]{64}$' -or
     $generatorJson.IndexOf($repoRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
     throw "Source generator provenance is invalid."
@@ -329,6 +457,17 @@ try {
     }
     if (-not $junctionRejected) {
         throw "Source generator provenance accepted a reparse ancestor."
+    }
+    $toolJunctionRejected = $false
+    try {
+        $null = Get-SteinSourceEvidenceRegularFileItem `
+            -Path (Join-Path $junctionPath "external-source.ps1")
+    }
+    catch {
+        $toolJunctionRejected = $true
+    }
+    if (-not $toolJunctionRejected) {
+        throw "Source tool provenance accepted a reparse ancestor."
     }
     [IO.Directory]::Delete($junctionPath, $false)
     if (-not (Test-Path -LiteralPath $externalSourcePath -PathType Leaf)) {
@@ -441,8 +580,11 @@ finally {
 [pscustomobject]@{
     verified = $true
     report_schema_version = 2
-    provenance_schema_version = 1
+    provenance_schema_version = 2
     generator_file_count = @($generator.files).Count
+    source_report_check_count = $contractSourceCheckIds.Count
+    source_report_contract_bound = $true
+    gate_specific_source_mapping_bound = $true
     repository_state_content_free = $true
     generated_outputs_ignored = $true
     toolchain_version_count = $actualToolNames.Count
@@ -450,6 +592,7 @@ finally {
     pwsh_path_poison_rejected = $true
     trusted_pwsh_resolved = $true
     generator_reparse_ancestor_rejected = $true
+    tool_reparse_ancestor_rejected = $true
     migration_identifier_count = [int]$contracts.migrations.count
     protocol_version = [string]$contracts.protocol.current
     policy_profile = [string]$contracts.policy.profile_id

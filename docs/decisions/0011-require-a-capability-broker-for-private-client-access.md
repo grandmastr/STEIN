@@ -193,7 +193,10 @@ validation on macOS require platform ADRs and native adversarial suites.
   diagnostic-only.
 - A same-SID adversarial program that speaks valid framing and protocol cannot
   obtain a private snapshot, subscription, command, shutdown, grant, or route
-  operation.
+  operation. The shipped diagnostic CLI provides a fixed, non-mutating raw-wire
+  denial proof for this boundary. It accepts no endpoint, payload, identity,
+  credential, or fault input; its content-free receipt is independently bound to
+  the signed candidate by the installed acceptance harness.
 - A different Windows SID fails at endpoint and peer authentication before broker
   admission or domain decoding.
 - A copied, replayed, expired, cross-connection, and prior-daemon capability is

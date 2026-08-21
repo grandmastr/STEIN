@@ -8,7 +8,7 @@ function Get-SteinSourceEvidenceSha256 {
         $Path,
         [IO.FileMode]::Open,
         [IO.FileAccess]::Read,
-        [IO.FileShare]::ReadWrite)
+        [IO.FileShare]::Read)
     try {
         $sha256 = [Security.Cryptography.SHA256]::Create()
         try {
@@ -37,6 +37,91 @@ function Get-SteinSourceEvidenceTextSha256 {
     }
     finally {
         $sha256.Dispose()
+    }
+}
+
+function Get-SteinSourceEvidenceRegularFileItem {
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    $candidate = [IO.Path]::GetFullPath($Path)
+    $probe = Split-Path -Parent $candidate
+    while (-not [string]::IsNullOrWhiteSpace($probe)) {
+        $ancestor = Get-Item -LiteralPath $probe -Force -ErrorAction Stop
+        if (-not $ancestor.PSIsContainer -or
+            (($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            throw "A source tool path has an invalid ancestor."
+        }
+        $parent = Split-Path -Parent $probe
+        if ([string]::IsNullOrWhiteSpace($parent) -or
+            [string]::Equals($parent, $probe, [StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $probe = $parent
+    }
+    $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        $item.Length -le 0) {
+        throw "A source tool path is not a regular non-empty file."
+    }
+    return $item
+}
+
+function Read-SteinSourceEvidenceLockedUtf8File {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [int] $MaximumBytes = 65536
+    )
+
+    $item = Get-SteinSourceEvidenceRegularFileItem -Path $Path
+    if ($item.Length -gt $MaximumBytes) {
+        throw "A source-evidence UTF-8 file is invalid."
+    }
+    $stream = [IO.FileStream]::new(
+        $item.FullName,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read)
+    try {
+        if ($stream.Length -ne $item.Length -or
+            $stream.Length -le 0 -or $stream.Length -gt $MaximumBytes) {
+            throw "A source-evidence UTF-8 file changed during capture."
+        }
+        $bytes = New-Object byte[] ([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) {
+                throw "A source-evidence UTF-8 file could not be captured."
+            }
+            $offset += $read
+        }
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $digest = [BitConverter]::ToString($sha256.ComputeHash($bytes)).Replace(
+                "-",
+                "").ToLowerInvariant()
+        }
+        finally {
+            $sha256.Dispose()
+        }
+        try {
+            $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+            if ($text.Length -gt 0 -and [int][char]$text[0] -eq 0xFEFF) {
+                $text = $text.Substring(1)
+            }
+        }
+        catch {
+            throw "A source-evidence UTF-8 file has invalid encoding."
+        }
+        return [pscustomobject]@{
+            text = $text
+            size = [long]$bytes.Length
+            sha256 = $digest
+        }
+    }
+    finally {
+        $stream.Dispose()
     }
 }
 
@@ -542,11 +627,14 @@ function Get-SteinSourceEvidenceToolRecord {
     param(
         [Parameter(Mandatory = $true)][string] $Executable,
         [Parameter(Mandatory = $true)][string[]] $VersionArguments,
-        [Parameter(Mandatory = $true)][string] $WorkingDirectory
+        [Parameter(Mandatory = $true)][string] $WorkingDirectory,
+        [switch] $AllowStandardError
     )
 
+    $item = Get-SteinSourceEvidenceRegularFileItem -Path $Executable
+    $initialHash = Get-SteinSourceEvidenceSha256 -Path $item.FullName
     $result = Invoke-SteinSourceEvidenceProcess `
-        -Executable $Executable `
+        -Executable $item.FullName `
         -Arguments $VersionArguments `
         -WorkingDirectory $WorkingDirectory `
         -MaximumStandardOutputCharacters 512 `
@@ -556,18 +644,185 @@ function Get-SteinSourceEvidenceToolRecord {
         $version.Length -gt 160 -or
         $version -notmatch '^[\x20-\x7e]+$' -or
         $version.Contains("`r") -or
-        $version.Contains("`n")) {
+        $version.Contains("`n") -or
+        (-not $AllowStandardError -and
+            -not [string]::IsNullOrWhiteSpace([string]$result.stderr))) {
         throw "A source tool returned an invalid bounded version."
     }
-    $item = Get-Item -LiteralPath $Executable -Force -ErrorAction Stop
-    if ($item.PSIsContainer -or
-        (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
-        $item.Length -le 0) {
-        throw "A source tool executable is invalid."
+    $completedHash = Get-SteinSourceEvidenceSha256 -Path $item.FullName
+    if ($initialHash -cne $completedHash) {
+        throw "A source tool executable changed during provenance capture."
     }
     return [ordered]@{
         version = $version
-        executable_sha256 = Get-SteinSourceEvidenceSha256 -Path $item.FullName
+        executable_sha256 = $completedHash
+    }
+}
+
+function Get-SteinSourceEvidenceRustupToolchainId {
+    param(
+        [Parameter(Mandatory = $true)][string] $RustupExecutable,
+        [Parameter(Mandatory = $true)][string] $WorkingDirectory
+    )
+
+    $result = Invoke-SteinSourceEvidenceProcess `
+        -Executable $RustupExecutable `
+        -Arguments @("show", "active-toolchain") `
+        -WorkingDirectory $WorkingDirectory `
+        -MaximumStandardOutputCharacters 4096 `
+        -MaximumStandardErrorCharacters 512
+    if (-not [string]::IsNullOrWhiteSpace([string]$result.stderr)) {
+        throw "The active Rust toolchain emitted unexpected diagnostics."
+    }
+    $active = $result.stdout.Trim()
+    if ($active.Length -le 0 -or $active.Length -gt 4096 -or
+        $active.Contains("`r") -or $active.Contains("`n")) {
+        throw "The active Rust toolchain identity is invalid."
+    }
+    $toolchain = @($active -split '\s+', 2)[0]
+    if ($toolchain -notmatch '^[0-9A-Za-z][0-9A-Za-z._-]{2,127}$') {
+        throw "The active Rust toolchain identity is invalid."
+    }
+    return $toolchain
+}
+
+function Get-SteinSourceEvidenceRustToolRecord {
+    param(
+        [Parameter(Mandatory = $true)][string] $LauncherExecutable,
+        [Parameter(Mandatory = $true)][string] $RustupExecutable,
+        [Parameter(Mandatory = $true)][ValidateSet("cargo", "rustc")][string] $ToolName,
+        [Parameter(Mandatory = $true)][string] $RustupToolchain,
+        [Parameter(Mandatory = $true)][string] $WorkingDirectory
+    )
+
+    $launcher = Get-SteinSourceEvidenceToolRecord `
+        -Executable $LauncherExecutable `
+        -VersionArguments @("--version") `
+        -WorkingDirectory $WorkingDirectory
+    $whichResult = Invoke-SteinSourceEvidenceProcess `
+        -Executable $RustupExecutable `
+        -Arguments @("which", "--toolchain", $RustupToolchain, $ToolName) `
+        -WorkingDirectory $WorkingDirectory `
+        -MaximumStandardOutputCharacters 4096 `
+        -MaximumStandardErrorCharacters 512
+    $resolvedPath = $whichResult.stdout.Trim()
+    if (-not [string]::IsNullOrWhiteSpace([string]$whichResult.stderr) -or
+        $resolvedPath.Length -le 0 -or $resolvedPath.Length -gt 4096 -or
+        $resolvedPath.Contains("`r") -or $resolvedPath.Contains("`n") -or
+        -not [IO.Path]::IsPathRooted($resolvedPath) -or
+        [IO.Path]::GetFileName($resolvedPath) -cne "$ToolName.exe") {
+        throw "A rustup-selected tool executable is invalid."
+    }
+    $resolved = Get-SteinSourceEvidenceToolRecord `
+        -Executable ([IO.Path]::GetFullPath($resolvedPath)) `
+        -VersionArguments @("--version") `
+        -WorkingDirectory $WorkingDirectory
+    if ([string]$launcher.version -cne [string]$resolved.version) {
+        throw "A Rust launcher and rustup-selected payload disagree."
+    }
+    return [ordered]@{
+        version = [string]$launcher.version
+        executable_sha256 = [string]$launcher.executable_sha256
+        rustup_toolchain = $RustupToolchain
+        resolved_version = [string]$resolved.version
+        resolved_executable_sha256 = [string]$resolved.executable_sha256
+    }
+}
+
+function Get-SteinSourceEvidencePnpmToolRecord {
+    param(
+        [Parameter(Mandatory = $true)][string] $Executable,
+        [Parameter(Mandatory = $true)][string] $NodeExecutable,
+        [Parameter(Mandatory = $true)][string] $WorkingDirectory
+    )
+
+    $record = Get-SteinSourceEvidenceToolRecord `
+        -Executable $Executable `
+        -VersionArguments @("--version") `
+        -WorkingDirectory $WorkingDirectory
+    $shim = Read-SteinSourceEvidenceLockedUtf8File `
+        -Path $Executable `
+        -MaximumBytes 65536
+    if ([string]$shim.sha256 -cne [string]$record.executable_sha256) {
+        throw "The pnpm launcher changed during provenance capture."
+    }
+    $entrypointMatches = [regex]::Matches(
+        [string]$shim.text,
+        '"%dp0%\\(?<relative>node_modules\\pnpm\\bin\\pnpm\.(?:cjs|mjs|js))"\s+%\*',
+        [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($entrypointMatches.Count -ne 1) {
+        throw "The pnpm launcher entrypoint contract is invalid."
+    }
+    $relativeEntrypoint = [string]$entrypointMatches[0].Groups['relative'].Value
+    if ($relativeEntrypoint.Length -le 0 -or $relativeEntrypoint.Length -gt 256 -or
+        $relativeEntrypoint.Contains('..') -or
+        [IO.Path]::IsPathRooted($relativeEntrypoint)) {
+        throw "The pnpm launcher entrypoint contract is invalid."
+    }
+    $shimRoot = [IO.Path]::GetFullPath((Split-Path -Parent $Executable)).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar)
+    $entrypointPath = [IO.Path]::GetFullPath((Join-Path $shimRoot $relativeEntrypoint))
+    if (-not $entrypointPath.StartsWith(
+            "$shimRoot$([IO.Path]::DirectorySeparatorChar)",
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The pnpm launcher entrypoint escaped its installation root."
+    }
+    $entrypointItem = Get-SteinSourceEvidenceRegularFileItem -Path $entrypointPath
+    $siblingNode = Join-Path $shimRoot "node.exe"
+    if (Test-Path -LiteralPath $siblingNode -PathType Leaf) {
+        if (-not [string]::Equals(
+                [IO.Path]::GetFullPath($siblingNode),
+                [IO.Path]::GetFullPath($NodeExecutable),
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw "The pnpm launcher selects a different Node runtime."
+        }
+    }
+    return [ordered]@{
+        version = [string]$record.version
+        executable_sha256 = [string]$record.executable_sha256
+        resolved_entrypoint_sha256 = Get-SteinSourceEvidenceSha256 `
+            -Path $entrypointItem.FullName
+    }
+}
+
+function Get-SteinSourceEvidenceGitToolRecord {
+    param(
+        [Parameter(Mandatory = $true)][string] $Executable,
+        [Parameter(Mandatory = $true)][string] $WorkingDirectory
+    )
+
+    $launcherItem = Get-SteinSourceEvidenceRegularFileItem -Path $Executable
+    $launcherDirectory = Split-Path -Parent $launcherItem.FullName
+    if ([IO.Path]::GetFileName($launcherItem.FullName) -cne "git.exe" -or
+        [IO.Path]::GetFileName($launcherDirectory) -cne "cmd") {
+        throw "The Git for Windows launcher location is invalid."
+    }
+    $installationRoot = [IO.Path]::GetFullPath(
+        (Split-Path -Parent $launcherDirectory))
+    $resolvedPath = [IO.Path]::GetFullPath(
+        (Join-Path $installationRoot "mingw64\bin\git.exe"))
+    if (-not $resolvedPath.StartsWith(
+            "$installationRoot$([IO.Path]::DirectorySeparatorChar)",
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The resolved Git payload escaped its installation root."
+    }
+    $launcher = Get-SteinSourceEvidenceToolRecord `
+        -Executable $launcherItem.FullName `
+        -VersionArguments @("--version") `
+        -WorkingDirectory $WorkingDirectory
+    $resolved = Get-SteinSourceEvidenceToolRecord `
+        -Executable $resolvedPath `
+        -VersionArguments @("--version") `
+        -WorkingDirectory $WorkingDirectory
+    if ([string]$launcher.version -cne [string]$resolved.version) {
+        throw "The Git launcher and resolved payload disagree."
+    }
+    return [ordered]@{
+        version = [string]$launcher.version
+        executable_sha256 = [string]$launcher.executable_sha256
+        resolved_version = [string]$resolved.version
+        resolved_executable_sha256 = [string]$resolved.executable_sha256
     }
 }
 
@@ -603,32 +858,45 @@ function Get-SteinSourceEvidenceToolchain {
         [Parameter(Mandatory = $true)][Collections.IDictionary] $ToolExecutables
     )
 
-    foreach ($requiredTool in @("cargo", "rustc", "node", "pnpm", "git", "pwsh")) {
+    foreach ($requiredTool in @("cargo", "rustc", "rustup", "node", "pnpm", "git", "pwsh")) {
         if (-not $ToolExecutables.Contains($requiredTool) -or
             [string]::IsNullOrWhiteSpace([string]$ToolExecutables[$requiredTool])) {
             throw "A required source tool executable is unavailable."
         }
     }
+    $rustupExecutable = [string]$ToolExecutables["rustup"]
+    $rustup = Get-SteinSourceEvidenceToolRecord `
+        -Executable $rustupExecutable `
+        -VersionArguments @("--version") `
+        -WorkingDirectory $RepositoryRoot `
+        -AllowStandardError
+    $rustupToolchain = Get-SteinSourceEvidenceRustupToolchainId `
+        -RustupExecutable $rustupExecutable `
+        -WorkingDirectory $RepositoryRoot
     return [ordered]@{
-        cargo = Get-SteinSourceEvidenceToolRecord `
-            -Executable ([string]$ToolExecutables["cargo"]) `
-            -VersionArguments @("--version") `
+        cargo = Get-SteinSourceEvidenceRustToolRecord `
+            -LauncherExecutable ([string]$ToolExecutables["cargo"]) `
+            -RustupExecutable $rustupExecutable `
+            -ToolName "cargo" `
+            -RustupToolchain $rustupToolchain `
             -WorkingDirectory $RepositoryRoot
-        rustc = Get-SteinSourceEvidenceToolRecord `
-            -Executable ([string]$ToolExecutables["rustc"]) `
-            -VersionArguments @("--version") `
+        rustc = Get-SteinSourceEvidenceRustToolRecord `
+            -LauncherExecutable ([string]$ToolExecutables["rustc"]) `
+            -RustupExecutable $rustupExecutable `
+            -ToolName "rustc" `
+            -RustupToolchain $rustupToolchain `
             -WorkingDirectory $RepositoryRoot
+        rustup = $rustup
         node = Get-SteinSourceEvidenceToolRecord `
             -Executable ([string]$ToolExecutables["node"]) `
             -VersionArguments @("--version") `
             -WorkingDirectory $RepositoryRoot
-        pnpm = Get-SteinSourceEvidenceToolRecord `
+        pnpm = Get-SteinSourceEvidencePnpmToolRecord `
             -Executable ([string]$ToolExecutables["pnpm"]) `
-            -VersionArguments @("--version") `
+            -NodeExecutable ([string]$ToolExecutables["node"]) `
             -WorkingDirectory $RepositoryRoot
-        git = Get-SteinSourceEvidenceToolRecord `
+        git = Get-SteinSourceEvidenceGitToolRecord `
             -Executable ([string]$ToolExecutables["git"]) `
-            -VersionArguments @("--version") `
             -WorkingDirectory $RepositoryRoot
         pwsh = Get-SteinSourceEvidencePwshToolRecord `
             -Executable ([string]$ToolExecutables["pwsh"]) `
@@ -650,7 +918,7 @@ function Get-SteinSourceEvidenceProvenance {
         "apps\edge-native-host\Cargo.lock"
     )
     return [ordered]@{
-        schema_version = 1
+        schema_version = 2
         classification = "bounded_content_free_source_provenance"
         repository = Get-SteinSourceEvidenceRepositoryState `
             -RepositoryRoot $repositoryPath `

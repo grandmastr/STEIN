@@ -79,6 +79,14 @@ $script:SteinInstalledRuntimeSourceDefinitions = @(
     [pscustomobject]@{ role = "harness"; path = $PSCommandPath },
     [pscustomobject]@{ role = "launcher"; path = (Join-Path $PSScriptRoot "Verify-Installed.cmd") },
     [pscustomobject]@{ role = "phase2-common"; path = (Join-Path $PSScriptRoot "Common.ps1") },
+    [pscustomobject]@{
+        role = "evidence-contract"
+        path = (Join-Path $PSScriptRoot "Evidence-Contract.ps1")
+    },
+    [pscustomobject]@{
+        role = "evidence-spec"
+        path = (Join-Path $PSScriptRoot "Evidence-Spec.json")
+    },
     [pscustomobject]@{ role = "phase2-status"; path = (Join-Path $PSScriptRoot "Status.ps1") },
     [pscustomobject]@{
         role = "package-tools"
@@ -134,8 +142,23 @@ $script:SteinPhase2GateIds = @(
     "P2-PORTABLE-FIXTURE"
 )
 $script:SteinPhase2ExpectedPolicyProfileId = "phase2-focus-v1"
+. (Join-Path $PSScriptRoot "Evidence-Contract.ps1")
+$script:SteinPhase2EvidenceSpecificationPath = Join-Path $PSScriptRoot "Evidence-Spec.json"
+$initialEvidenceSpecification = @($script:SteinInstalledInitialRuntimeSources | Where-Object {
+        [string]$_.role -ceq "evidence-spec"
+    })
+if ($initialEvidenceSpecification.Count -ne 1) {
+    throw "evidence_spec_runtime_source_missing"
+}
+$script:SteinPhase2EvidenceSpecificationSha256 =
+    [string]$initialEvidenceSpecification[0].sha256
+$script:SteinPhase2EvidenceSpecification = Read-SteinPhase2EvidenceSpecification `
+    -Path $script:SteinPhase2EvidenceSpecificationPath `
+    -ExpectedGateIds $script:SteinPhase2GateIds `
+    -ExpectedSha256 $script:SteinPhase2EvidenceSpecificationSha256
 $script:SteinInstalledChecks = New-Object Collections.Generic.List[object]
 $script:SteinInstalledAttachments = @()
+$script:SteinInstalledExternalEvidenceFiles = @{}
 $script:SteinInstalledSourceBundle = $null
 $script:SteinInstalledRelease = $null
 $script:SteinInstalledStatusProjection = $null
@@ -443,7 +466,10 @@ function Assert-SteinInstalledBundlesEqual {
             "PackageName", "Publisher", "PackageFamilyName", "DesktopAumid", "BrokerAumid",
             "BrowserProducerAumid",
             "Version", "CertificateThumbprint", "MsixSize", "MsixSha256", "CoreSize",
-            "CoreSha256", "BrowserHostSha256", "CliSize", "CliSha256")) {
+            "CoreSha256", "BrowserHostSha256", "CandidateGitCommit", "CandidateGitTree",
+            "SourceVerificationSha256", "SourceRootAnchorSha256", "SourceRootDigestSha256",
+            "CliSize", "CliSha256", "DesktopSize", "DesktopSha256",
+            "DesktopDistFileCount", "DesktopDistManifestSha256")) {
         if ([string]$Expected.$property -cne [string]$Actual.$property) {
             throw "installed_bundle_mismatch"
         }
@@ -503,6 +529,117 @@ function ConvertTo-SteinInstalledStatusProjection {
     }
 }
 
+function Register-SteinInstalledExternalEvidenceFile {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][long] $Size,
+        [Parameter(Mandatory = $true)][string] $Sha256
+    )
+
+    $key = [IO.Path]::GetFullPath($Path).ToLowerInvariant()
+    if ($script:SteinInstalledExternalEvidenceFiles.ContainsKey($key)) {
+        $existing = $script:SteinInstalledExternalEvidenceFiles[$key]
+        if ([long]$existing.size -ne $Size -or [string]$existing.sha256 -cne $Sha256) {
+            throw "external_evidence_descriptor_conflict"
+        }
+        return
+    }
+    $script:SteinInstalledExternalEvidenceFiles[$key] = [pscustomobject]@{
+        path = [IO.Path]::GetFullPath($Path)
+        size = $Size
+        sha256 = $Sha256
+    }
+}
+
+function Assert-SteinInstalledExternalEvidenceFilesStable {
+    foreach ($record in @($script:SteinInstalledExternalEvidenceFiles.Values)) {
+        $item = Get-Item -LiteralPath $record.path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or
+            (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            [long]$item.Length -ne [long]$record.size -or
+            (Get-SteinPhase2Sha256 -Path $item.FullName) -cne [string]$record.sha256) {
+            throw "external_evidence_changed_during_collection"
+        }
+    }
+}
+
+function Read-SteinInstalledLockedJsonFile {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][long] $MaximumBytes,
+        [Parameter(Mandatory = $true)][string] $FailureCode,
+        [string] $ExpectedSha256,
+        [long] $ExpectedSize = -1
+    )
+
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        $item.Length -le 0 -or $item.Length -gt $MaximumBytes -or
+        ($ExpectedSize -ge 0 -and $item.Length -ne $ExpectedSize) -or
+        (-not [string]::IsNullOrWhiteSpace($ExpectedSha256) -and
+            $ExpectedSha256 -cnotmatch '^[0-9a-f]{64}$')) {
+        throw $FailureCode
+    }
+    $stream = [IO.FileStream]::new(
+        $item.FullName,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read)
+    try {
+        if ($stream.Length -ne $item.Length -or
+            $stream.Length -le 0 -or $stream.Length -gt $MaximumBytes -or
+            ($ExpectedSize -ge 0 -and $stream.Length -ne $ExpectedSize)) {
+            throw 'json_artifact_hash_or_size_mismatch'
+        }
+        $bytes = New-Object byte[] ([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) {
+                throw 'json_artifact_hash_or_size_mismatch'
+            }
+            $offset += $read
+        }
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $actualSha256 = [BitConverter]::ToString($sha256.ComputeHash($bytes)).
+                Replace('-', '').ToLowerInvariant()
+        }
+        finally {
+            $sha256.Dispose()
+        }
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedSha256) -and
+            $actualSha256 -cne $ExpectedSha256) {
+            throw 'json_artifact_hash_or_size_mismatch'
+        }
+        try {
+            $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+            $jsonText = $strictUtf8.GetString($bytes)
+            if ($jsonText.Length -gt 0 -and [int][char]$jsonText[0] -eq 0xFEFF) {
+                $jsonText = $jsonText.Substring(1)
+            }
+        }
+        catch {
+            throw $FailureCode
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+    try {
+        $value = $jsonText | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw $FailureCode
+    }
+    return [pscustomobject]@{
+        value = $value
+        sha256 = $actualSha256
+        size = [long]$bytes.Length
+    }
+}
+
 function Read-SteinInstalledAttachments {
     param([Parameter(Mandatory = $true)][string] $ManifestPath)
 
@@ -510,12 +647,21 @@ function Read-SteinInstalledAttachments {
     if ((Get-Item -LiteralPath $resolvedManifest -Force -ErrorAction Stop).Length -gt 1MB) {
         throw "attachment_manifest_size_invalid"
     }
-    $manifest = Get-Content -LiteralPath $resolvedManifest -Raw -Encoding UTF8 |
-        ConvertFrom-Json -ErrorAction Stop
+    $manifestRead = Read-SteinInstalledLockedJsonFile `
+        -Path $resolvedManifest `
+        -MaximumBytes 1MB `
+        -FailureCode 'attachment_manifest_invalid'
+    $manifestHash = [string]$manifestRead.sha256
+    Register-SteinInstalledExternalEvidenceFile `
+        -Path $resolvedManifest `
+        -Size ([long]$manifestRead.size) `
+        -Sha256 $manifestHash
+    $manifest = $manifestRead.value
     Assert-SteinInstalledJsonShape -Value $manifest `
         -ExpectedProperties @("schema_version", "attachments") `
         -FailureCode "attachment_manifest_schema_invalid"
-    if ([int]$manifest.schema_version -ne 1) {
+    if (($manifest.schema_version -isnot [int] -and $manifest.schema_version -isnot [long]) -or
+        [long]$manifest.schema_version -ne 2) {
         throw "attachment_manifest_schema_invalid"
     }
     $entries = @($manifest.attachments)
@@ -529,7 +675,8 @@ function Read-SteinInstalledAttachments {
         Assert-SteinInstalledJsonShape -Value $entry `
             -ExpectedProperties @(
                 "attachment_id", "gate_id", "kind", "path", "sha256",
-                "declared_result", "privacy_reviewed", "synthetic_only", "recorded_at_utc") `
+                "declared_result", "privacy_reviewed", "synthetic_only", "recorded_at_utc",
+                "artifacts") `
             -FailureCode "attachment_entry_schema_invalid"
         $attachmentId = [string]$entry.attachment_id
         $gateId = [string]$entry.gate_id
@@ -579,20 +726,92 @@ function Read-SteinInstalledAttachments {
         if ($actualHash -cne $expectedHash) {
             throw "attachment_hash_mismatch"
         }
+        Register-SteinInstalledExternalEvidenceFile `
+            -Path $path `
+            -Size ([long]$item.Length) `
+            -Sha256 $actualHash
+        $underlyingArtifacts = New-Object Collections.Generic.List[object]
+        $underlyingArtifactPaths = @{}
+        $underlyingArtifactsById = @{}
+        $underlyingArtifactIds = @{}
+        foreach ($artifactEntry in @($entry.artifacts)) {
+            Assert-SteinInstalledJsonShape -Value $artifactEntry `
+                -ExpectedProperties @("artifact_id", "path", "sha256", "size") `
+                -FailureCode "underlying_artifact_entry_schema_invalid"
+            $artifactId = [string]$artifactEntry.artifact_id
+            if ($artifactId -cnotmatch "^[a-z0-9][a-z0-9._-]{2,95}$" -or
+                $underlyingArtifactIds.ContainsKey($artifactId) -or
+                ($artifactEntry.size -isnot [int] -and $artifactEntry.size -isnot [long]) -or
+                [long]$artifactEntry.size -lt 1 -or [long]$artifactEntry.size -gt 67108864) {
+                throw "underlying_artifact_entry_invalid"
+            }
+            $artifactHash = ([string]$artifactEntry.sha256).ToLowerInvariant()
+            if ($artifactHash -cnotmatch "^[0-9a-f]{64}$") {
+                throw "underlying_artifact_hash_invalid"
+            }
+            $artifactPath = Resolve-SteinPhase2RegularFile -Path ([string]$artifactEntry.path)
+            $artifactItem = Get-Item -LiteralPath $artifactPath -Force -ErrorAction Stop
+            if ([long]$artifactItem.Length -ne [long]$artifactEntry.size -or
+                (Get-SteinPhase2Sha256 -Path $artifactPath) -cne $artifactHash) {
+                throw "underlying_artifact_hash_or_size_mismatch"
+            }
+            Register-SteinInstalledExternalEvidenceFile `
+                -Path $artifactPath `
+                -Size ([long]$artifactItem.Length) `
+                -Sha256 $artifactHash
+            $underlyingArtifactIds[$artifactId] = $true
+            $underlyingArtifactPaths[$artifactId] = $artifactPath
+            $underlyingArtifactRecord = [pscustomobject]@{
+                artifact_id = $artifactId
+                sha256 = $artifactHash
+                size = [long]$artifactItem.Length
+            }
+            $underlyingArtifacts.Add($underlyingArtifactRecord)
+            $underlyingArtifactsById[$artifactId] = $underlyingArtifactRecord
+        }
+        if ($kind -ceq "redacted_screenshot" -and $underlyingArtifacts.Count -ne 0) {
+            throw "screenshot_underlying_artifact_unexpected"
+        }
         $nativeFixture = $null
         if ($kind -ceq "native_fixture_result") {
-            $nativeResult = Get-Content -LiteralPath $path -Raw -Encoding UTF8 |
-                ConvertFrom-Json -ErrorAction Stop
-            Assert-SteinInstalledJsonShape -Value $nativeResult `
-                -ExpectedProperties @(
-                    "schema_version", "fixture_id", "gate_id", "result",
-                    "recorded_at_utc", "command_id", "exit_code") `
-                -FailureCode "native_fixture_result_schema_invalid"
-            if ([int]$nativeResult.schema_version -ne 1 -or
-                [string]$nativeResult.fixture_id -cnotmatch "^[a-z0-9][a-z0-9._-]{0,63}$" -or
-                [string]$nativeResult.command_id -cnotmatch "^[a-z0-9][a-z0-9._:-]{0,127}$" -or
-                [string]$nativeResult.gate_id -cne $gateId -or
-                [string]$nativeResult.result -cne $declaredResult) {
+            if ($underlyingArtifacts.Count -lt 1 -or $underlyingArtifacts.Count -gt 64) {
+                throw "native_fixture_underlying_artifact_count_invalid"
+            }
+            $nativeRead = Read-SteinInstalledLockedJsonFile `
+                -Path $path `
+                -MaximumBytes 4MB `
+                -FailureCode 'native_fixture_result_invalid' `
+                -ExpectedSha256 $expectedHash `
+                -ExpectedSize ([long]$item.Length)
+            $nativeResult = $nativeRead.value
+            $gateSpecification = $script:SteinPhase2EvidenceSpecification.gates_by_id[$gateId]
+            $expectedPackage = [pscustomobject]@{
+                package_family_name = [string]$script:SteinInstalledSourceBundle.PackageFamilyName
+                version = [string]$script:SteinInstalledSourceBundle.Version
+                msix_sha256 = [string]$script:SteinInstalledSourceBundle.MsixSha256
+                core_sha256 = [string]$script:SteinInstalledSourceBundle.CoreSha256
+                browser_host_sha256 = [string]$script:SteinInstalledSourceBundle.BrowserHostSha256
+                cli_executable_size = [long]$script:SteinInstalledSourceBundle.CliSize
+                cli_executable_sha256 = [string]$script:SteinInstalledSourceBundle.CliSha256
+                desktop_executable_size = [long]$script:SteinInstalledSourceBundle.DesktopSize
+                desktop_executable_sha256 = [string]$script:SteinInstalledSourceBundle.DesktopSha256
+                desktop_dist_file_count = [int]$script:SteinInstalledSourceBundle.DesktopDistFileCount
+                desktop_dist_manifest_sha256 = [string]$script:SteinInstalledSourceBundle.DesktopDistManifestSha256
+                candidate_git_commit = [string]$script:SteinInstalledSourceBundle.CandidateGitCommit
+                candidate_git_tree = [string]$script:SteinInstalledSourceBundle.CandidateGitTree
+                source_verification_sha256 = [string]$script:SteinInstalledSourceBundle.SourceVerificationSha256
+                source_root_anchor_sha256 = [string]$script:SteinInstalledSourceBundle.SourceRootAnchorSha256
+                source_root_digest_sha256 = [string]$script:SteinInstalledSourceBundle.SourceRootDigestSha256
+            }
+            $null = Assert-SteinPhase2GateEvidenceResult `
+                -Value $nativeResult `
+                -Specification $script:SteinPhase2EvidenceSpecification.specification `
+                -Gate $gateSpecification `
+                -SpecificationSha256 $script:SteinPhase2EvidenceSpecificationSha256 `
+                -ExpectedPackage $expectedPackage `
+                -ExpectedCollector $hostRecord `
+                -UnderlyingArtifacts @($underlyingArtifacts | ForEach-Object { $_ })
+            if ([string]$nativeResult.result -cne $declaredResult) {
                 throw "native_fixture_result_identity_invalid"
             }
             $nativeRecordedAt = [DateTimeOffset]::MinValue
@@ -606,27 +825,132 @@ function Read-SteinInstalledAttachments {
                 throw "native_fixture_result_timestamp_invalid"
             }
             $nativeExitCode = $nativeResult.exit_code
-            if (($declaredResult -ceq "pass" -and
-                    ($nativeExitCode -isnot [int] -and $nativeExitCode -isnot [long] -or
-                        [long]$nativeExitCode -ne 0)) -or
-                ($declaredResult -ceq "fail" -and
-                    ($nativeExitCode -isnot [int] -and $nativeExitCode -isnot [long] -or
-                        [long]$nativeExitCode -eq 0)) -or
-                ($declaredResult -cin @("blocked", "not_run") -and $null -ne $nativeExitCode)) {
-                throw "native_fixture_result_exit_invalid"
+            $sourceBinding = $nativeResult.bindings.source_report
+            $sourceReportPath = $underlyingArtifactPaths[[string]$sourceBinding.report_artifact_id]
+            $sourceRootPath = $underlyingArtifactPaths[[string]$sourceBinding.root_anchor_artifact_id]
+            $sourceReportDescriptor =
+                $underlyingArtifactsById[[string]$sourceBinding.report_artifact_id]
+            $sourceRootDescriptor =
+                $underlyingArtifactsById[[string]$sourceBinding.root_anchor_artifact_id]
+            if ([string]::IsNullOrWhiteSpace($sourceReportPath) -or
+                [string]::IsNullOrWhiteSpace($sourceRootPath) -or
+                $null -eq $sourceReportDescriptor -or $null -eq $sourceRootDescriptor) {
+                throw "source_evidence_artifact_missing"
+            }
+            $sourceReport = (Read-SteinInstalledLockedJsonFile `
+                    -Path $sourceReportPath `
+                    -MaximumBytes 16MB `
+                    -FailureCode 'source_evidence_report_invalid' `
+                    -ExpectedSha256 ([string]$sourceReportDescriptor.sha256) `
+                    -ExpectedSize ([long]$sourceReportDescriptor.size)).value
+            $sourceRoot = (Read-SteinInstalledLockedJsonFile `
+                    -Path $sourceRootPath `
+                    -MaximumBytes 1MB `
+                    -FailureCode 'source_evidence_root_invalid' `
+                    -ExpectedSha256 ([string]$sourceRootDescriptor.sha256) `
+                    -ExpectedSize ([long]$sourceRootDescriptor.size)).value
+            $null = Assert-SteinPhase2SourceEvidenceBinding `
+                -EvidenceResult $nativeResult `
+                -SourceReport $sourceReport `
+                -SourceRootAnchor $sourceRoot `
+                -EvidenceSpecification $script:SteinPhase2EvidenceSpecification.specification
+            if ($gateId -ceq "P2-PORTABLE-FIXTURE") {
+                $linuxPath = $underlyingArtifactPaths[
+                    [string]$nativeResult.bindings.linux_artifact.artifact_id]
+                if ([string]::IsNullOrWhiteSpace($linuxPath)) {
+                    throw "linux_artifact_missing"
+                }
+                $linuxDescriptor = $underlyingArtifactsById[
+                    [string]$nativeResult.bindings.linux_artifact.artifact_id]
+                if ($null -eq $linuxDescriptor) {
+                    throw "linux_artifact_missing"
+                }
+                $linuxArtifact = (Read-SteinInstalledLockedJsonFile `
+                        -Path $linuxPath `
+                        -MaximumBytes 4MB `
+                        -FailureCode 'linux_artifact_invalid' `
+                        -ExpectedSha256 ([string]$linuxDescriptor.sha256) `
+                        -ExpectedSize ([long]$linuxDescriptor.size)).value
+                $null = Assert-SteinPhase2LinuxPortableArtifact `
+                    -Artifact $linuxArtifact `
+                    -Gate $gateSpecification `
+                    -ExpectedCommit ([string]$nativeResult.bindings.commit.object_id) `
+                    -ExpectedTree ([string]$nativeResult.bindings.commit.tree_id) `
+                    -SourceReport $sourceReport `
+                    -EvidenceResult $nativeResult `
+                    -UnderlyingArtifacts @($underlyingArtifacts | ForEach-Object { $_ })
+            }
+            $noLeaksScannerArtifact = $null
+            $noLeaksProducerArtifact = $null
+            foreach ($runnerBinding in @($nativeResult.bindings.runner_artifacts)) {
+                $runnerSpecification = @($gateSpecification.runner_artifacts | Where-Object {
+                    [string]$_.artifact_role -ceq [string]$runnerBinding.artifact_role
+                })[0]
+                $runnerPath = $underlyingArtifactPaths[[string]$runnerBinding.artifact_id]
+                $runnerDescriptor =
+                    $underlyingArtifactsById[[string]$runnerBinding.artifact_id]
+                if ($null -eq $runnerSpecification -or
+                    [string]::IsNullOrWhiteSpace($runnerPath) -or
+                    $null -eq $runnerDescriptor) {
+                    throw "runner_artifact_missing"
+                }
+                $runnerArtifact = (Read-SteinInstalledLockedJsonFile `
+                        -Path $runnerPath `
+                        -MaximumBytes 4MB `
+                        -FailureCode 'runner_artifact_invalid' `
+                        -ExpectedSha256 ([string]$runnerDescriptor.sha256) `
+                        -ExpectedSize ([long]$runnerDescriptor.size)).value
+                if ([string]$runnerBinding.artifact_role -ceq
+                    "private_diagnostic_denial") {
+                    $null = Assert-SteinPhase2PrivateDiagnosticArtifact `
+                        -Artifact $runnerArtifact `
+                        -RunnerArtifact $runnerSpecification
+                }
+                elseif ([string]$runnerBinding.artifact_role -ceq "toast_com_denial") {
+                    $null = Assert-SteinPhase2ToastComDenialArtifact `
+                        -Artifact $runnerArtifact `
+                        -RunnerArtifact $runnerSpecification
+                }
+                elseif ([string]$runnerBinding.artifact_role -ceq "no_leaks_scan") {
+                    $null = Assert-SteinPhase2NoLeaksArtifact `
+                        -Artifact $runnerArtifact `
+                        -RunnerArtifact $runnerSpecification `
+                        -EvidenceResult $nativeResult
+                    $noLeaksScannerArtifact = $runnerArtifact
+                }
+                elseif ([string]$runnerBinding.artifact_role -ceq
+                    "no_leaks_sentinel_producer") {
+                    $null = Assert-SteinPhase2NoLeaksProducerArtifact `
+                        -Artifact $runnerArtifact `
+                        -RunnerArtifact $runnerSpecification `
+                        -EvidenceResult $nativeResult
+                    $noLeaksProducerArtifact = $runnerArtifact
+                }
+                else {
+                    throw "runner_artifact_role_unsupported"
+                }
+            }
+            if ($gateId -ceq "P2-NO-LEAKS") {
+                if ($null -eq $noLeaksScannerArtifact -or
+                    $null -eq $noLeaksProducerArtifact) {
+                    throw "no_leaks_receipt_pair_missing"
+                }
+                $null = Assert-SteinPhase2NoLeaksReceiptPair `
+                    -ScannerArtifact $noLeaksScannerArtifact `
+                    -ProducerArtifact $noLeaksProducerArtifact
             }
             $nativeFixture = [ordered]@{
-                schema_version = 1
+                schema_version = 2
+                contract_id = [string]$nativeResult.contract_id
+                contract_sha256 = [string]$nativeResult.contract_sha256
                 fixture_id = [string]$nativeResult.fixture_id
-                command_id = [string]$nativeResult.command_id
+                runner_id = [string]$nativeResult.runner_id
                 exit_code = $nativeExitCode
                 closed_content_free_schema_verified = $true
-            }
-            $postParseHash = Get-SteinPhase2Sha256 -Path $path
-            $postParseItem = Get-Item -LiteralPath $path -Force -ErrorAction Stop
-            if ($postParseHash -cne $actualHash -or
-                $postParseItem.Length -ne $item.Length) {
-                throw "native_fixture_result_changed_during_validation"
+                proof_classes = @($nativeResult.proof_classes)
+                subchecks = @($nativeResult.subchecks)
+                bindings = $nativeResult.bindings
+                artifacts = @($nativeResult.artifacts)
             }
         }
         $sanitized.Add([ordered]@{
@@ -645,6 +969,7 @@ function Read-SteinInstalledAttachments {
             native_fixture = $nativeFixture
         })
     }
+    Assert-SteinInstalledExternalEvidenceFilesStable
     return @($sanitized | ForEach-Object { $_ })
 }
 
@@ -921,8 +1246,55 @@ else {
         -Action { throw "installed_lifecycle_identity_prerequisite_blocked" }
 }
 
+$templateGate = $script:SteinPhase2EvidenceSpecification.gates_by_id["P2-NOTIFICATION"]
+$templateProofArtifacts = New-Object Collections.Generic.List[object]
+$templateProofArtifactIds = New-Object Collections.Generic.List[string]
+foreach ($proofClass in @($templateGate.required_proof_classes)) {
+    $artifactId = "proof-$($proofClass.Replace('_', '-'))"
+    $templateProofArtifactIds.Add($artifactId)
+    $templateProofArtifacts.Add([ordered]@{
+        artifact_id = $artifactId
+        proof_class = [string]$proofClass
+        origin = "installed_native"
+        sha256 = "<sha256>"
+        size = "<positive-byte-count>"
+    })
+}
+$templateSubchecks = New-Object Collections.Generic.List[object]
+for ($templateIndex = 0; $templateIndex -lt @($templateGate.required_subchecks).Count;
+    $templateIndex++) {
+    $templateSubchecks.Add([ordered]@{
+        id = [string]@($templateGate.required_subchecks)[$templateIndex]
+        origin = "installed_native"
+        result = "pass"
+        artifact_ids = @($templateProofArtifactIds[$templateIndex % $templateProofArtifactIds.Count])
+        source_check_ids = @()
+    })
+}
+$attachmentTemplateArtifacts = @(
+    [ordered]@{
+        artifact_id = "source-verification-report"
+        path = "C:\synthetic-evidence\source-verification.json"
+        sha256 = "<sha256>"
+        size = "<positive-byte-count>"
+    },
+    [ordered]@{
+        artifact_id = "source-root-anchor"
+        path = "C:\synthetic-evidence\source-root-anchor.json"
+        sha256 = "<sha256>"
+        size = "<positive-byte-count>"
+    }
+)
+foreach ($artifact in @($templateProofArtifacts)) {
+    $attachmentTemplateArtifacts += [ordered]@{
+        artifact_id = [string]$artifact.artifact_id
+        path = "C:\synthetic-evidence\$($artifact.artifact_id).json"
+        sha256 = "<sha256>"
+        size = "<positive-byte-count>"
+    }
+}
 $attachmentTemplate = [ordered]@{
-    schema_version = 1
+    schema_version = 2
     attachments = @(
         [ordered]@{
             attachment_id = "notification-screenshot-01"
@@ -934,6 +1306,7 @@ $attachmentTemplate = [ordered]@{
             privacy_reviewed = $true
             synthetic_only = $true
             recorded_at_utc = "2026-08-20T12:00:00Z"
+            artifacts = @()
         },
         [ordered]@{
             attachment_id = "native-notification-fixture-01"
@@ -945,13 +1318,15 @@ $attachmentTemplate = [ordered]@{
             privacy_reviewed = $true
             synthetic_only = $true
             recorded_at_utc = "2026-08-20T12:00:00Z"
+            artifacts = $attachmentTemplateArtifacts
         }
     )
     rules = @(
         "Paths are used only for read-only hash validation and are never retained.",
         "Attachment files are never copied into evidence.",
         "A screenshot never changes a ledger result.",
-        "A native result must use the generated closed content-free result schema.",
+        "Every underlying artifact is rehashed and its source path is never retained.",
+        "A native result must satisfy the checked-in exact gate evidence contract.",
         "A hash-validated native pass remains not_run until independently reviewed."
     )
 }
@@ -959,13 +1334,76 @@ $attachmentTemplateArtifact = Write-SteinInstalledEvidenceJson `
     -RelativePath "attachments-template.json" `
     -Value $attachmentTemplate
 $nativeFixtureResultTemplate = [ordered]@{
-    schema_version = 1
-    fixture_id = "native-notification-fixture-01"
+    schema_version = 2
+    contract_id = [string]$script:SteinPhase2EvidenceSpecification.specification.contract_id
+    contract_sha256 = $script:SteinPhase2EvidenceSpecificationSha256
     gate_id = "P2-NOTIFICATION"
+    fixture_id = [string]$templateGate.fixture_id
+    runner_id = [string]$templateGate.runner_id
     result = "pass"
     recorded_at_utc = "2026-08-20T12:00:00Z"
-    command_id = "installed-native-notification-fixture-v1"
     exit_code = 0
+    runner = [ordered]@{
+        platform = "windows"
+        architecture = "x86_64"
+        non_elevated = $true
+        installed_package = $true
+    }
+    proof_classes = @($templateGate.required_proof_classes)
+    subchecks = @($templateSubchecks | ForEach-Object { $_ })
+    bindings = [ordered]@{
+        package = [ordered]@{
+            package_family_name = "<exact-installed-pfn>"
+            version = $Version
+            msix_sha256 = "<sha256>"
+            core_sha256 = "<sha256>"
+            browser_host_sha256 = "<sha256>"
+            cli_executable_size = 1
+            cli_executable_sha256 = "<sha256>"
+            desktop_executable_size = 1
+            desktop_executable_sha256 = "<sha256>"
+            desktop_dist_file_count = 1
+            desktop_dist_manifest_sha256 = "<sha256>"
+            candidate_git_commit = "<signed-candidate-commit>"
+            candidate_git_tree = "<signed-candidate-tree>"
+            source_verification_sha256 = "<sha256>"
+            source_root_anchor_sha256 = "<sha256>"
+            source_root_digest_sha256 = "<sha256>"
+        }
+        commit = [ordered]@{
+            object_id = "<signed-candidate-commit>"
+            tree_id = "<signed-candidate-tree>"
+        }
+        collector = [ordered]@{
+            host_identity_sha256 = $hostIdentityHash
+            evidence_owner_sid_only = $true
+        }
+        source_report = [ordered]@{
+            report_artifact_id = "source-verification-report"
+            root_anchor_artifact_id = "source-root-anchor"
+            report_sha256 = "<sha256>"
+            root_anchor_sha256 = "<sha256>"
+            root_digest_sha256 = "<sha256>"
+        }
+        linux_artifact = $null
+        runner_artifacts = @()
+    }
+    artifacts = @(
+        [ordered]@{
+            artifact_id = "source-verification-report"
+            proof_class = "source_provenance"
+            origin = "source_verification"
+            sha256 = "<sha256>"
+            size = "<positive-byte-count>"
+        },
+        [ordered]@{
+            artifact_id = "source-root-anchor"
+            proof_class = "source_provenance"
+            origin = "source_verification"
+            sha256 = "<sha256>"
+            size = "<positive-byte-count>"
+        }
+    ) + @($templateProofArtifacts | ForEach-Object { $_ })
 }
 $nativeFixtureResultTemplateArtifact = Write-SteinInstalledEvidenceJson `
     -RelativePath "native-fixture-result-template.json" `
@@ -1139,8 +1577,18 @@ $packageProvenance = [ordered]@{
     msix_sha256 = $null
     core_sha256 = $null
     browser_host_sha256 = $null
+    candidate_git_commit = $null
+    candidate_git_tree = $null
+    source_verification_sha256 = $null
+    source_root_anchor_sha256 = $null
+    source_root_digest_sha256 = $null
     installed_payload_file_count = 0
-    cli_sha256 = $null
+    cli_executable_size = 0
+    cli_executable_sha256 = $null
+    desktop_executable_size = 0
+    desktop_executable_sha256 = $null
+    desktop_dist_file_count = 0
+    desktop_dist_manifest_sha256 = $null
 }
 if ($null -ne $script:SteinInstalledSourceBundle) {
     $packageProvenance.package_family_name = $script:SteinInstalledSourceBundle.PackageFamilyName
@@ -1150,9 +1598,24 @@ if ($null -ne $script:SteinInstalledSourceBundle) {
     $packageProvenance.msix_sha256 = $script:SteinInstalledSourceBundle.MsixSha256
     $packageProvenance.core_sha256 = $script:SteinInstalledSourceBundle.CoreSha256
     $packageProvenance.browser_host_sha256 = $script:SteinInstalledSourceBundle.BrowserHostSha256
+    $packageProvenance.candidate_git_commit = $script:SteinInstalledSourceBundle.CandidateGitCommit
+    $packageProvenance.candidate_git_tree = $script:SteinInstalledSourceBundle.CandidateGitTree
+    $packageProvenance.source_verification_sha256 =
+        $script:SteinInstalledSourceBundle.SourceVerificationSha256
+    $packageProvenance.source_root_anchor_sha256 =
+        $script:SteinInstalledSourceBundle.SourceRootAnchorSha256
+    $packageProvenance.source_root_digest_sha256 =
+        $script:SteinInstalledSourceBundle.SourceRootDigestSha256
     $packageProvenance.installed_payload_file_count = @(
         $script:SteinInstalledSourceBundle.InstalledPayloadFiles).Count
-    $packageProvenance.cli_sha256 = $script:SteinInstalledSourceBundle.CliSha256
+    $packageProvenance.cli_executable_size = $script:SteinInstalledSourceBundle.CliSize
+    $packageProvenance.cli_executable_sha256 = $script:SteinInstalledSourceBundle.CliSha256
+    $packageProvenance.desktop_executable_size = $script:SteinInstalledSourceBundle.DesktopSize
+    $packageProvenance.desktop_executable_sha256 = $script:SteinInstalledSourceBundle.DesktopSha256
+    $packageProvenance.desktop_dist_file_count =
+        $script:SteinInstalledSourceBundle.DesktopDistFileCount
+    $packageProvenance.desktop_dist_manifest_sha256 =
+        $script:SteinInstalledSourceBundle.DesktopDistManifestSha256
 }
 $runtimeBuildId = $null
 $runtimeProtocolVersion = $null
@@ -1232,6 +1695,7 @@ foreach ($gateId in $script:SteinPhase2GateIds) {
     })
 }
 
+Assert-SteinInstalledExternalEvidenceFilesStable
 $completedAt = [DateTime]::UtcNow
 $checkFailures = @($script:SteinInstalledChecks | Where-Object { $_.status -ceq "fail" })
 $checkBlocked = @($script:SteinInstalledChecks | Where-Object { $_.status -ceq "blocked" })
@@ -1325,6 +1789,7 @@ $rootAnchor = [ordered]@{
 $rootAnchorArtifact = Write-SteinInstalledEvidenceJson `
     -RelativePath "root-anchor.json" `
     -Value $rootAnchor
+Assert-SteinInstalledExternalEvidenceFilesStable
 Protect-SteinPhase2OwnerOnlyTree -Root $script:SteinInstalledEvidencePath
 
 $evidenceDisplayPath = $script:SteinInstalledEvidencePath.Substring($repoRoot.Length + 1)

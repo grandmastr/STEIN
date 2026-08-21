@@ -3425,6 +3425,7 @@ dependencies = [
  "stein-protocol",
  "tokio",
  "tokio-util",
+ "windows",
 ]
 
 [[package]]
