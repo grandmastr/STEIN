@@ -722,12 +722,19 @@ function Get-SteinSourceFixtureHarnessDefinition {
         "boundary" { return $null }
         default { throw "source_fixture_harness_kind_invalid" }
     }
+    $compilerTargetKinds = if ($kind -ceq "desktop") {
+        @("staticlib", "cdylib", "rlib")
+    }
+    else {
+        @($targetKind)
+    }
     $harnessId = "cargo-harness-$package-$targetKind-$targetName" -replace '_', '-'
     return [pscustomobject]@{
         harness_id = $harnessId
         package = $package
         target_kind = $targetKind
         target_name = $targetName
+        compiler_target_kinds = $compilerTargetKinds
         manifest_path = $manifest
         compile_arguments = @(
             @(
@@ -766,8 +773,19 @@ function Resolve-SteinSourceFixtureCompilerArtifact {
             continue
         }
         $kinds = @($message.target.kind | ForEach-Object { [string]$_ })
+        $expectedKinds = @($Harness.compiler_target_kinds |
+            ForEach-Object { [string]$_ })
+        $kindsAreExact = $kinds.Count -eq $expectedKinds.Count
+        if ($kindsAreExact) {
+            for ($kindIndex = 0; $kindIndex -lt $expectedKinds.Count; $kindIndex++) {
+                if ($kinds[$kindIndex] -cne $expectedKinds[$kindIndex]) {
+                    $kindsAreExact = $false
+                    break
+                }
+            }
+        }
         if ([string]$message.target.name -cne [string]$Harness.target_name -or
-            $kinds.Count -ne 1 -or $kinds[0] -cne [string]$Harness.target_kind -or
+            -not $kindsAreExact -or
             $message.profile.test -isnot [bool] -or -not [bool]$message.profile.test) {
             continue
         }
@@ -1610,6 +1628,19 @@ function Resolve-SteinSourceFixtureRustTool {
     return (Get-SteinSourceEvidenceRegularFileItem -Path $path).FullName
 }
 
+function Get-SteinSourceFixtureRustupRecord {
+    param(
+        [Parameter(Mandatory = $true)][string] $Executable,
+        [Parameter(Mandatory = $true)][string] $WorkingDirectory
+    )
+
+    return Get-SteinSourceEvidenceToolRecord `
+        -Executable $Executable `
+        -VersionArguments @('--version') `
+        -WorkingDirectory $WorkingDirectory `
+        -AllowStandardError
+}
+
 function Get-SteinSourceFixtureTreeBinding {
     param([Parameter(Mandatory = $true)] $Snapshot)
 
@@ -2067,6 +2098,128 @@ function Resolve-SteinSourceFixtureOutputDirectory {
     return Assert-SteinPackageOwnerOnlyDirectory -Path $candidate
 }
 
+function Close-SteinSourceFixtureLockCollections {
+    param(
+        [Parameter(Mandatory = $true)]
+        [Collections.Generic.List[object]] $BinaryLocks,
+        [Parameter(Mandatory = $true)]
+        [Collections.Generic.List[object]] $ToolLocks,
+        [Parameter(Mandatory = $true)]
+        [Collections.Generic.List[object]] $CandidateGeneratorLocks,
+        [Parameter(Mandatory = $true)]
+        [Collections.Generic.List[object]] $CurrentLocks
+    )
+
+    foreach ($locked in $BinaryLocks) {
+        if ($null -ne $locked -and $null -ne $locked.Stream) {
+            $locked.Stream.Dispose()
+        }
+    }
+    foreach ($locked in $ToolLocks) {
+        if ($null -ne $locked -and $null -ne $locked.Stream) {
+            $locked.Stream.Dispose()
+        }
+    }
+    foreach ($locked in $CandidateGeneratorLocks) {
+        if ($null -ne $locked -and $null -ne $locked.Stream) {
+            $locked.Stream.Dispose()
+        }
+    }
+    foreach ($locked in $CurrentLocks) {
+        if ($null -ne $locked -and $null -ne $locked.Stream) {
+            $locked.Stream.Dispose()
+        }
+    }
+}
+
+function Remove-SteinSourceFixtureDesktopBuildSideEffects {
+    param([Parameter(Mandatory = $true)][string] $SnapshotRoot)
+
+    $snapshotPath = Resolve-SteinPackageRegularDirectoryWithAncestors `
+        -Path $SnapshotRoot
+    $generatedRoot = Join-Path $snapshotPath `
+        'apps\desktop\src-tauri\gen'
+    $schemasRoot = Join-Path $generatedRoot 'schemas'
+    $generatedItem = Get-Item `
+        -LiteralPath $generatedRoot `
+        -Force `
+        -ErrorAction Stop
+    $schemasItem = Get-Item `
+        -LiteralPath $schemasRoot `
+        -Force `
+        -ErrorAction Stop
+    if (-not $generatedItem.PSIsContainer -or
+        (($generatedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        -not $schemasItem.PSIsContainer -or
+        (($schemasItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw 'source_fixture_desktop_generated_set_invalid'
+    }
+    $generatedChildren = @(Get-ChildItem `
+            -LiteralPath $generatedRoot `
+            -Force `
+            -ErrorAction Stop)
+    if ($generatedChildren.Count -ne 1 -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$generatedChildren[0].FullName),
+            [IO.Path]::GetFullPath($schemasRoot),
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'source_fixture_desktop_generated_set_invalid'
+    }
+    $expectedNames = @(
+        'acl-manifests.json',
+        'capabilities.json',
+        'desktop-schema.json',
+        'windows-schema.json')
+    $actualFiles = @(Get-ChildItem `
+            -LiteralPath $schemasRoot `
+            -Force `
+            -ErrorAction Stop)
+    if ($actualFiles.Count -ne $expectedNames.Count) {
+        throw 'source_fixture_desktop_generated_set_invalid'
+    }
+    $actualNames = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    foreach ($file in $actualFiles) {
+        if ($file.PSIsContainer -or
+            (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            [long]$file.Length -lt 1 -or [long]$file.Length -gt 4194304 -or
+            -not $actualNames.Add([string]$file.Name)) {
+            throw 'source_fixture_desktop_generated_set_invalid'
+        }
+    }
+    foreach ($expectedName in $expectedNames) {
+        if (-not $actualNames.Contains($expectedName)) {
+            throw 'source_fixture_desktop_generated_set_invalid'
+        }
+    }
+    foreach ($expectedName in $expectedNames) {
+        $filePath = Resolve-SteinPackageRegularFileUnderRoot `
+            -Root $snapshotPath `
+            -Path (Join-Path $schemasRoot $expectedName)
+        [IO.File]::Delete($filePath)
+    }
+    $schemasItem = Get-Item -LiteralPath $schemasRoot -Force -ErrorAction Stop
+    if (-not $schemasItem.PSIsContainer -or
+        (($schemasItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        @(Get-ChildItem -LiteralPath $schemasRoot -Force -ErrorAction Stop).Count -ne 0) {
+        throw 'source_fixture_desktop_generated_cleanup_invalid'
+    }
+    [IO.Directory]::Delete($schemasRoot, $false)
+    $generatedItem = Get-Item `
+        -LiteralPath $generatedRoot `
+        -Force `
+        -ErrorAction Stop
+    if (-not $generatedItem.PSIsContainer -or
+        (($generatedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        @(Get-ChildItem -LiteralPath $generatedRoot -Force -ErrorAction Stop).Count -ne 0) {
+        throw 'source_fixture_desktop_generated_cleanup_invalid'
+    }
+    [IO.Directory]::Delete($generatedRoot, $false)
+    if (Test-Path -LiteralPath $generatedRoot) {
+        throw 'source_fixture_desktop_generated_cleanup_invalid'
+    }
+}
+
 function Invoke-SteinSourceFixtureSuite {
     param(
         [Parameter(Mandatory = $true)][string] $RepositoryRoot,
@@ -2276,9 +2429,8 @@ function Invoke-SteinSourceFixtureSuite {
             -Path $rustup `
             -ExpectedSha256 $rustupInitialSha256
         $toolLocks.Add($rustupLock)
-        $rustupRecord = Get-SteinSourceEvidenceToolRecord `
+        $rustupRecord = Get-SteinSourceFixtureRustupRecord `
             -Executable $rustup `
-            -VersionArguments @('--version') `
             -WorkingDirectory $snapshot.Root
         if ([string]$rustupRecord.executable_sha256 -cne
             [string]$rustupLock.Sha256) {
@@ -2482,6 +2634,10 @@ function Invoke-SteinSourceFixtureSuite {
                 Record = $harnessRecord
                 BinaryPath = [string]$binaryItem.FullName
                 Lock = $binaryLock
+            }
+            if ([string]$harness.package -ceq 'stein-desktop') {
+                Remove-SteinSourceFixtureDesktopBuildSideEffects `
+                    -SnapshotRoot $snapshot.Root
             }
         }
 
@@ -2788,8 +2944,25 @@ function Invoke-SteinSourceFixtureSuite {
                 $stream.Dispose()
             }
         }
-        foreach ($locked in @($currentLocks) + @($candidateGeneratorLocks) +
-                @($toolLocks) + @($binaryLocks)) {
+        foreach ($locked in $currentLocks) {
+            if ((Get-SteinPackageStreamSha256 -Stream $locked.Stream) -cne
+                [string]$locked.Sha256) {
+                throw "source_fixture_locked_input_changed"
+            }
+        }
+        foreach ($locked in $candidateGeneratorLocks) {
+            if ((Get-SteinPackageStreamSha256 -Stream $locked.Stream) -cne
+                [string]$locked.Sha256) {
+                throw "source_fixture_locked_input_changed"
+            }
+        }
+        foreach ($locked in $toolLocks) {
+            if ((Get-SteinPackageStreamSha256 -Stream $locked.Stream) -cne
+                [string]$locked.Sha256) {
+                throw "source_fixture_locked_input_changed"
+            }
+        }
+        foreach ($locked in $binaryLocks) {
             if ((Get-SteinPackageStreamSha256 -Stream $locked.Stream) -cne
                 [string]$locked.Sha256) {
                 throw "source_fixture_locked_input_changed"
@@ -2875,12 +3048,11 @@ function Invoke-SteinSourceFixtureSuite {
                 $originalEnvironment[$name],
                 [EnvironmentVariableTarget]::Process)
         }
-        foreach ($locked in @($binaryLocks) + @($toolLocks) +
-                @($candidateGeneratorLocks) + @($currentLocks)) {
-            if ($null -ne $locked -and $null -ne $locked.Stream) {
-                $locked.Stream.Dispose()
-            }
-        }
+        Close-SteinSourceFixtureLockCollections `
+            -BinaryLocks $binaryLocks `
+            -ToolLocks $toolLocks `
+            -CandidateGeneratorLocks $candidateGeneratorLocks `
+            -CurrentLocks $currentLocks
         if ($null -ne $snapshotLocks) {
             foreach ($stream in $snapshotLocks.Streams) {
                 $stream.Dispose()

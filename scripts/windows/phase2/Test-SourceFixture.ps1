@@ -383,6 +383,29 @@ if ($FixtureTestLibraryOnly) {
     return
 }
 
+function New-SteinSourceFixtureTestDesktopGeneratedSet {
+    param([Parameter(Mandatory = $true)][string] $SnapshotRoot)
+
+    $schemasRoot = Join-Path $SnapshotRoot `
+        'apps\desktop\src-tauri\gen\schemas'
+    $null = New-Item `
+        -ItemType Directory `
+        -Path $schemasRoot `
+        -Force `
+        -ErrorAction Stop
+    foreach ($name in @(
+            'acl-manifests.json',
+            'capabilities.json',
+            'desktop-schema.json',
+            'windows-schema.json')) {
+        [IO.File]::WriteAllText(
+            (Join-Path $schemasRoot $name),
+            '{}',
+            [Text.UTF8Encoding]::new($false))
+    }
+    return $schemasRoot
+}
+
 $bootstrapRecords = @(Assert-SteinSourceFixtureBootstrapSourcesStable)
 $bootstrapRoles = @($bootstrapRecords | ForEach-Object { [string]$_.role })
 $expectedBootstrapRoles = @(
@@ -405,6 +428,39 @@ finally {
     $script:SteinSourceFixtureBootstrapBindings[0].record.role = $originalBootstrapRole
 }
 $null = Assert-SteinSourceFixtureBootstrapSourcesStable
+
+$rustupExecutable = [string]@(Get-Command `
+        'rustup.exe' -CommandType Application -ErrorAction Stop)[0].Source
+$rustupRecord = Get-SteinSourceFixtureRustupRecord `
+    -Executable $rustupExecutable `
+    -WorkingDirectory $repoRoot
+if ([string]$rustupRecord.version -cnotmatch '^rustup [0-9]' -or
+    [string]$rustupRecord.executable_sha256 -cne
+        (Get-SteinSourceEvidenceSha256 -Path $rustupExecutable)) {
+    throw "The source fixture real rustup-version path is not closed."
+}
+
+$binaryCleanupLocks = New-Object Collections.Generic.List[object]
+$toolCleanupLocks = New-Object Collections.Generic.List[object]
+$candidateCleanupLocks = New-Object Collections.Generic.List[object]
+$currentCleanupLocks = New-Object Collections.Generic.List[object]
+$binaryCleanupStream = [IO.MemoryStream]::new([byte[]]@(1))
+$toolCleanupStream = [IO.MemoryStream]::new([byte[]]@(2))
+$candidateCleanupStream = [IO.MemoryStream]::new([byte[]]@(3))
+$currentCleanupStream = [IO.MemoryStream]::new([byte[]]@(4))
+$binaryCleanupLocks.Add([pscustomobject]@{ Stream = $binaryCleanupStream })
+$toolCleanupLocks.Add([pscustomobject]@{ Stream = $toolCleanupStream })
+$candidateCleanupLocks.Add([pscustomobject]@{ Stream = $candidateCleanupStream })
+$currentCleanupLocks.Add([pscustomobject]@{ Stream = $currentCleanupStream })
+Close-SteinSourceFixtureLockCollections `
+    -BinaryLocks $binaryCleanupLocks `
+    -ToolLocks $toolCleanupLocks `
+    -CandidateGeneratorLocks $candidateCleanupLocks `
+    -CurrentLocks $currentCleanupLocks
+if ($binaryCleanupStream.CanRead -or $toolCleanupStream.CanRead -or
+    $candidateCleanupStream.CanRead -or $currentCleanupStream.CanRead) {
+    throw "The source fixture generic lock cleanup path left a stream open."
+}
 
 $registryPath = Join-Path $PSScriptRoot "Source-Fixture-Registry.json"
 $registryRead = Read-SteinSourceFixtureLockedJson `
@@ -847,6 +903,150 @@ try {
         [int]$resolvedCompilerArtifact.MatchCount -ne 1) {
         throw "The closed compiler-artifact parser did not select one exact binary."
     }
+    $desktopInvocation = @($fixtures | ForEach-Object { $_.subchecks } |
+        ForEach-Object { $_.invocations } | Where-Object {
+            [string]$_.kind -ceq 'desktop'
+        } | Select-Object -First 1)
+    if ($desktopInvocation.Count -ne 1) {
+        throw "The desktop source-fixture compiler harness is unavailable."
+    }
+    $desktopHarness = Get-SteinSourceFixtureHarnessDefinition `
+        -Invocation $desktopInvocation[0]
+    $desktopManifest = Join-Path $compilerSnapshot `
+        "apps\desktop\src-tauri\Cargo.toml"
+    $null = New-Item `
+        -ItemType Directory `
+        -Path (Split-Path -Parent $desktopManifest) `
+        -Force `
+        -ErrorAction Stop
+    [IO.File]::WriteAllText(
+        $desktopManifest,
+        "[package]`nname='stein-desktop'`n",
+        [Text.UTF8Encoding]::new($false))
+    $desktopExecutable = Join-Path $compilerDeps `
+        "stein_desktop_lib-synthetic.exe"
+    [IO.File]::WriteAllBytes($desktopExecutable, [byte[]]@(5, 6, 7, 8))
+    $desktopCompilerMessage = [ordered]@{
+        reason = "compiler-artifact"
+        package_id = "path+file:///synthetic-desktop#0.1.0"
+        manifest_path = $desktopManifest
+        target = [ordered]@{
+            name = [string]$desktopHarness.target_name
+            kind = @($desktopHarness.compiler_target_kinds |
+                ForEach-Object { [string]$_ })
+        }
+        profile = [ordered]@{ test = $true }
+        executable = $desktopExecutable
+    } | ConvertTo-Json -Depth 8 -Compress
+    $resolvedDesktopArtifact = Resolve-SteinSourceFixtureCompilerArtifact `
+        -StandardOutput $desktopCompilerMessage `
+        -Harness $desktopHarness `
+        -SnapshotRoot $compilerSnapshot `
+        -TargetRoot $compilerTarget
+    if ([string]$resolvedDesktopArtifact.Path -cne $desktopExecutable -or
+        [int]$resolvedDesktopArtifact.MatchCount -ne 1) {
+        throw "The desktop compiler-artifact parser did not bind its exact crate types."
+    }
+    $hostileDesktopMessage = $desktopCompilerMessage | ConvertFrom-Json
+    $hostileDesktopMessage.target.kind = @('lib')
+    Assert-SteinSourceFixtureTestRejected `
+        -Description "a substituted desktop compiler target-kind set" `
+        -Action {
+            Resolve-SteinSourceFixtureCompilerArtifact `
+                -StandardOutput ($hostileDesktopMessage |
+                    ConvertTo-Json -Depth 8 -Compress) `
+                -Harness $desktopHarness `
+                -SnapshotRoot $compilerSnapshot `
+                -TargetRoot $compilerTarget
+        }
+
+    $validGeneratedSnapshot = Join-Path $scratch 'desktop-generated-valid'
+    $null = New-Item `
+        -ItemType Directory `
+        -Path $validGeneratedSnapshot `
+        -ErrorAction Stop
+    $validGeneratedSchemas = New-SteinSourceFixtureTestDesktopGeneratedSet `
+        -SnapshotRoot $validGeneratedSnapshot
+    Remove-SteinSourceFixtureDesktopBuildSideEffects `
+        -SnapshotRoot $validGeneratedSnapshot
+    if (Test-Path -LiteralPath (Split-Path -Parent $validGeneratedSchemas)) {
+        throw "The exact desktop generated-source cleanup left output behind."
+    }
+
+    $extraGeneratedSnapshot = Join-Path $scratch 'desktop-generated-extra'
+    $null = New-Item `
+        -ItemType Directory `
+        -Path $extraGeneratedSnapshot `
+        -ErrorAction Stop
+    $extraGeneratedSchemas = New-SteinSourceFixtureTestDesktopGeneratedSet `
+        -SnapshotRoot $extraGeneratedSnapshot
+    [IO.File]::WriteAllText(
+        (Join-Path $extraGeneratedSchemas 'unexpected.json'),
+        '{}',
+        [Text.UTF8Encoding]::new($false))
+    Assert-SteinSourceFixtureTestRejected `
+        -Description "an extra desktop generated source" `
+        -Action {
+            Remove-SteinSourceFixtureDesktopBuildSideEffects `
+                -SnapshotRoot $extraGeneratedSnapshot
+        }
+
+    $missingGeneratedSnapshot = Join-Path $scratch 'desktop-generated-missing'
+    $null = New-Item `
+        -ItemType Directory `
+        -Path $missingGeneratedSnapshot `
+        -ErrorAction Stop
+    $missingGeneratedSchemas = New-SteinSourceFixtureTestDesktopGeneratedSet `
+        -SnapshotRoot $missingGeneratedSnapshot
+    [IO.File]::Delete((Join-Path $missingGeneratedSchemas 'capabilities.json'))
+    Assert-SteinSourceFixtureTestRejected `
+        -Description "a missing desktop generated source" `
+        -Action {
+            Remove-SteinSourceFixtureDesktopBuildSideEffects `
+                -SnapshotRoot $missingGeneratedSnapshot
+        }
+
+    $reparseGeneratedSnapshot = Join-Path $scratch 'desktop-generated-reparse'
+    $null = New-Item `
+        -ItemType Directory `
+        -Path (Join-Path $reparseGeneratedSnapshot `
+            'apps\desktop\src-tauri\gen') `
+        -Force `
+        -ErrorAction Stop
+    $reparseGeneratedTarget = Join-Path $scratch `
+        'desktop-generated-reparse-target'
+    $null = New-Item `
+        -ItemType Directory `
+        -Path $reparseGeneratedTarget `
+        -ErrorAction Stop
+    $reparseGeneratedTargetSchemas =
+        New-SteinSourceFixtureTestDesktopGeneratedSet `
+            -SnapshotRoot $reparseGeneratedTarget
+    $reparseGeneratedPath = Join-Path $reparseGeneratedSnapshot `
+        'apps\desktop\src-tauri\gen\schemas'
+    $null = New-Item `
+        -ItemType Junction `
+        -Path $reparseGeneratedPath `
+        -Target $reparseGeneratedTargetSchemas `
+        -ErrorAction Stop
+    Assert-SteinSourceFixtureTestRejected `
+        -Description "a reparse-point desktop generated schema directory" `
+        -Action {
+            Remove-SteinSourceFixtureDesktopBuildSideEffects `
+                -SnapshotRoot $reparseGeneratedSnapshot
+        }
+    foreach ($expectedTargetName in @(
+            'acl-manifests.json',
+            'capabilities.json',
+            'desktop-schema.json',
+            'windows-schema.json')) {
+        if (-not (Test-Path `
+                -LiteralPath (Join-Path $reparseGeneratedTargetSchemas `
+                    $expectedTargetName) `
+                -PathType Leaf)) {
+            throw "The rejected desktop generated reparse set mutated its target."
+        }
+    }
     Assert-SteinSourceFixtureTestRejected `
         -Description "a missing compiler artifact" `
         -Action {
@@ -1024,4 +1224,8 @@ finally {
     receipt_mutation_rejected = $true
     bootstrap_source_swap_rejected = $true
     bootstrap_role_substitution_rejected = $true
+    real_rustup_version_path = $true
+    generic_lock_cleanup_path = $true
+    desktop_compiler_target_kinds_bound = $true
+    desktop_generated_set_cleanup_bound = $true
 }
