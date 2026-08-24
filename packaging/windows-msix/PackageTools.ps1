@@ -1589,6 +1589,191 @@ function Assert-SteinVerifiedBuildToolchainLocks {
     return $true
 }
 
+function ConvertTo-SteinPackageExtendedLengthPath {
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    if ($fullPath.StartsWith('\\?\', [StringComparison]::Ordinal)) {
+        return $fullPath
+    }
+    if ($fullPath.StartsWith('\\', [StringComparison]::Ordinal)) {
+        return '\\?\UNC\' + $fullPath.Substring(2)
+    }
+    return '\\?\' + $fullPath
+}
+
+function ConvertFrom-SteinPackageExtendedLengthPath {
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    if ($Path.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        return [IO.Path]::GetFullPath('\\' + $Path.Substring(8))
+    }
+    if ($Path.StartsWith('\\?\', [StringComparison]::Ordinal)) {
+        return [IO.Path]::GetFullPath($Path.Substring(4))
+    }
+    return [IO.Path]::GetFullPath($Path)
+}
+
+function Initialize-SteinPackagePrivateCleanupNativeApi {
+    if ($null -ne ('Stein.PackagePrivateCleanupNative' -as [type])) {
+        return
+    }
+    Add-Type -TypeDefinition @"
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace Stein {
+    public static class PackagePrivateCleanupNative {
+        private const UInt32 DeleteAccess = 0x00010000;
+        private const UInt32 ListDirectoryAccess = 0x00000001;
+        private const UInt32 ReadAttributesAccess = 0x00000080;
+        private const UInt32 ShareRead = 0x00000001;
+        private const UInt32 ShareReadWriteDelete = 0x00000007;
+        private const UInt32 OpenExisting = 3;
+        private const UInt32 BackupSemantics = 0x02000000;
+        private const UInt32 OpenReparsePoint = 0x00200000;
+        private const UInt32 DirectoryAttribute = 0x00000010;
+        private const UInt32 ReparsePointAttribute = 0x00000400;
+        private const Int32 FileAttributeTagInfo = 9;
+        private const Int32 FileDispositionInfoEx = 21;
+        private const UInt32 DispositionDelete = 0x00000001;
+        private const UInt32 DispositionIgnoreReadOnly = 0x00000010;
+        private const Int32 ErrorFileNotFound = 2;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileDispositionInfoExValue {
+            public UInt32 Flags;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileAttributeTagInfoValue {
+            public UInt32 FileAttributes;
+            public UInt32 ReparseTag;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(
+            string fileName,
+            UInt32 desiredAccess,
+            UInt32 shareMode,
+            IntPtr securityAttributes,
+            UInt32 creationDisposition,
+            UInt32 flagsAndAttributes,
+            IntPtr templateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetFileInformationByHandle(
+            SafeFileHandle file,
+            Int32 informationClass,
+            ref FileDispositionInfoExValue information,
+            UInt32 bufferSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetFileInformationByHandleEx(
+            SafeFileHandle file,
+            Int32 informationClass,
+            out FileAttributeTagInfoValue information,
+            UInt32 bufferSize);
+
+        private static void SetDeleteDisposition(SafeFileHandle file) {
+            if (file == null || file.IsInvalid || file.IsClosed) {
+                throw new ArgumentException("A private cleanup handle is invalid.");
+            }
+            FileDispositionInfoExValue disposition =
+                new FileDispositionInfoExValue();
+            disposition.Flags = DispositionDelete | DispositionIgnoreReadOnly;
+            if (!SetFileInformationByHandle(
+                    file,
+                    FileDispositionInfoEx,
+                    ref disposition,
+                    (UInt32)Marshal.SizeOf(disposition))) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+        }
+
+        private static SafeFileHandle OpenDirectory(
+                string path,
+                bool requireReparsePoint) {
+            SafeFileHandle directory = CreateFileW(
+                path,
+                DeleteAccess | ListDirectoryAccess | ReadAttributesAccess,
+                ShareRead,
+                IntPtr.Zero,
+                OpenExisting,
+                BackupSemantics | OpenReparsePoint,
+                IntPtr.Zero);
+            if (directory.IsInvalid) {
+                Int32 error = Marshal.GetLastWin32Error();
+                directory.Dispose();
+                throw new Win32Exception(error);
+            }
+            FileAttributeTagInfoValue attributes;
+            if (!GetFileInformationByHandleEx(
+                    directory,
+                    FileAttributeTagInfo,
+                    out attributes,
+                    (UInt32)Marshal.SizeOf(typeof(FileAttributeTagInfoValue)))) {
+                Int32 error = Marshal.GetLastWin32Error();
+                directory.Dispose();
+                throw new Win32Exception(error);
+            }
+            bool isDirectory =
+                (attributes.FileAttributes & DirectoryAttribute) != 0;
+            bool isReparsePoint =
+                (attributes.FileAttributes & ReparsePointAttribute) != 0;
+            if (!isDirectory || isReparsePoint != requireReparsePoint) {
+                directory.Dispose();
+                throw new IOException(
+                    "A private cleanup directory changed filesystem identity.");
+            }
+            return directory;
+        }
+
+        public static SafeFileHandle OpenRegularDirectory(string path) {
+            return OpenDirectory(path, false);
+        }
+
+        public static void DeleteDirectoryHandle(SafeFileHandle directory) {
+            SetDeleteDisposition(directory);
+        }
+
+        public static void DeleteDirectoryLink(string path) {
+            using (SafeFileHandle directory = OpenDirectory(path, true)) {
+                SetDeleteDisposition(directory);
+            }
+        }
+
+        public static void DeleteFileLink(string path) {
+            SafeFileHandle file = CreateFileW(
+                path,
+                DeleteAccess,
+                ShareReadWriteDelete,
+                IntPtr.Zero,
+                OpenExisting,
+                OpenReparsePoint,
+                IntPtr.Zero);
+            if (file.IsInvalid) {
+                Int32 error = Marshal.GetLastWin32Error();
+                file.Dispose();
+                if (error == ErrorFileNotFound) {
+                    return;
+                }
+                throw new Win32Exception(error);
+            }
+            using (file) {
+                SetDeleteDisposition(file);
+            }
+        }
+    }
+}
+"@
+}
+
 function Remove-SteinPackagePrivateTemporaryDirectory {
     param(
         [Parameter(Mandatory = $true)][string] $Path,
@@ -1603,55 +1788,131 @@ function Remove-SteinPackagePrivateTemporaryDirectory {
     $root = Assert-SteinPackagePrivateTemporaryDirectory `
         -Path $Path `
         -Purpose $Purpose
-    $pending = New-Object Collections.Generic.Stack[string]
-    $directories = New-Object Collections.Generic.List[string]
-    $pending.Push($root)
+    Initialize-SteinPackagePrivateCleanupNativeApi
+    $pending = New-Object Collections.Generic.Stack[object]
+    $directories = New-Object Collections.Generic.List[object]
+    $rootHandle = [Stein.PackagePrivateCleanupNative]::OpenRegularDirectory(
+        (ConvertTo-SteinPackageExtendedLengthPath -Path $root))
+    $rootRecord = [pscustomobject]@{
+        Path = $root
+        Handle = $rootHandle
+    }
+    $directories.Add($rootRecord)
+    $pending.Push($rootRecord)
+    $rootPrefix = "$root$([IO.Path]::DirectorySeparatorChar)"
     $entryCount = 0
-    while ($pending.Count -gt 0) {
-        $directoryPath = $pending.Pop()
-        $directoryItem = Get-Item `
-            -LiteralPath $directoryPath `
-            -Force `
-            -ErrorAction Stop
-        if (-not $directoryItem.PSIsContainer -or
-            (($directoryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
-            throw "The private packaging temporary tree changed during cleanup."
+    try {
+        $confirmedRoot = Assert-SteinPackagePrivateTemporaryDirectory `
+            -Path $root `
+            -Purpose $Purpose
+        if (-not [string]::Equals(
+                $confirmedRoot,
+                $root,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw "The private packaging temporary root changed during cleanup."
         }
-        $directories.Add($directoryItem.FullName)
-        foreach ($entry in @(Get-ChildItem `
-                    -LiteralPath $directoryPath `
-                    -Force `
-                    -ErrorAction Stop)) {
-            $entryCount++
-            if ($entryCount -gt 500000) {
-                throw "The private packaging temporary tree is unsafe to delete."
-            }
-            if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                # Delete the link itself and never traverse its target.
-                if ($entry.PSIsContainer) {
-                    [IO.Directory]::Delete($entry.FullName, $false)
+        while ($pending.Count -gt 0) {
+            $directory = $pending.Pop()
+            $directoryPath = [string]$directory.Path
+            foreach ($entry in @(Get-ChildItem `
+                        -LiteralPath (ConvertTo-SteinPackageExtendedLengthPath `
+                            -Path $directoryPath) `
+                        -Force `
+                        -ErrorAction Stop)) {
+                $entryPath = ConvertFrom-SteinPackageExtendedLengthPath `
+                    -Path ([string]$entry.FullName)
+                if (-not $entryPath.StartsWith(
+                        $rootPrefix,
+                        [StringComparison]::OrdinalIgnoreCase) -or
+                    -not [string]::Equals(
+                        (Split-Path -Parent $entryPath),
+                        $directoryPath,
+                        [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "The private packaging temporary tree escaped during cleanup."
+                }
+                $entryCount++
+                if ($entryCount -gt 500000) {
+                    throw "The private packaging temporary tree is unsafe to delete."
+                }
+                if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    # Delete the identity-bound link itself and never traverse its target.
+                    $entryDeletePath = ConvertTo-SteinPackageExtendedLengthPath `
+                        -Path $entryPath
+                    if ($entry.PSIsContainer) {
+                        [Stein.PackagePrivateCleanupNative]::DeleteDirectoryLink(
+                            $entryDeletePath)
+                    }
+                    else {
+                        [Stein.PackagePrivateCleanupNative]::DeleteFileLink(
+                            $entryDeletePath)
+                    }
+                }
+                elseif ($entry.PSIsContainer) {
+                    $childHandle = $null
+                    try {
+                        $childHandle = [Stein.PackagePrivateCleanupNative]::OpenRegularDirectory(
+                            (ConvertTo-SteinPackageExtendedLengthPath -Path $entryPath))
+                        $childRecord = [pscustomobject]@{
+                            Path = $entryPath
+                            Handle = $childHandle
+                        }
+                        $directories.Add($childRecord)
+                        $pending.Push($childRecord)
+                        $childHandle = $null
+                    }
+                    finally {
+                        if ($null -ne $childHandle) {
+                            $childHandle.Dispose()
+                        }
+                    }
                 }
                 else {
-                    [IO.File]::Delete($entry.FullName)
+                    # The handle is opened on the exact link without following a
+                    # reparse target. The disposition is long-path-safe, ignores
+                    # this link's ReadOnly deletion barrier without changing shared
+                    # hardlink metadata, and treats only a missing leaf as idempotent.
+                    [Stein.PackagePrivateCleanupNative]::DeleteFileLink(
+                        (ConvertTo-SteinPackageExtendedLengthPath -Path $entryPath))
                 }
             }
-            elseif ($entry.PSIsContainer) {
-                $pending.Push($entry.FullName)
-            }
-            else {
-                Remove-Item -LiteralPath $entry.FullName -Force -ErrorAction Stop
-            }
+        }
+        for ($index = $directories.Count - 1; $index -ge 0; $index--) {
+            $directory = $directories[$index]
+            [Stein.PackagePrivateCleanupNative]::DeleteDirectoryHandle(
+                $directory.Handle)
+            $directory.Handle.Dispose()
+            $directory.Handle = $null
         }
     }
-    for ($index = $directories.Count - 1; $index -ge 0; $index--) {
-        Remove-Item `
-            -LiteralPath $directories[$index] `
-            -Force `
-            -ErrorAction Stop
+    finally {
+        foreach ($directory in $directories) {
+            if ($null -ne $directory.Handle) {
+                $directory.Handle.Dispose()
+                $directory.Handle = $null
+            }
+        }
     }
     if (Test-Path -LiteralPath $root) {
         throw "The private packaging temporary directory was not deleted."
     }
+}
+
+function Resolve-SteinPackagePrimaryAndCleanupFailure {
+    param(
+        [AllowNull()][Management.Automation.ErrorRecord] $PrimaryFailure,
+        [AllowNull()][Management.Automation.ErrorRecord] $CleanupFailure
+    )
+
+    if ($null -eq $PrimaryFailure) {
+        return $CleanupFailure
+    }
+    if ($null -ne $CleanupFailure) {
+        $PrimaryFailure.Exception.Data['SteinPrivateTemporaryCleanupFailure'] =
+            [string]$CleanupFailure
+        $PrimaryFailure.Exception.Data['SteinPrivateTemporaryCleanupFailureId'] =
+            [string]$CleanupFailure.FullyQualifiedErrorId
+    }
+    return $PrimaryFailure
 }
 
 function Read-SteinPackageLockedJson {

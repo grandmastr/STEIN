@@ -2283,6 +2283,8 @@ function Invoke-SteinSourceFixtureSuite {
             $name,
             [EnvironmentVariableTarget]::Process)
     }
+    $fixtureOperationFailure = $null
+    $fixtureCleanupFailure = $null
     try {
         $null = Assert-SteinSourceFixtureCompilerOverridesAbsent `
             -Environment $originalEnvironment
@@ -3041,28 +3043,42 @@ function Invoke-SteinSourceFixtureSuite {
         Write-Output "source_fixture_suite=pass"
         Write-Output "receipt_count=$($receiptFiles.Count)"
     }
+    catch {
+        $fixtureOperationFailure = $_
+    }
     finally {
-        foreach ($name in $environmentNames) {
-            [Environment]::SetEnvironmentVariable(
-                $name,
-                $originalEnvironment[$name],
-                [EnvironmentVariableTarget]::Process)
-        }
-        Close-SteinSourceFixtureLockCollections `
-            -BinaryLocks $binaryLocks `
-            -ToolLocks $toolLocks `
-            -CandidateGeneratorLocks $candidateGeneratorLocks `
-            -CurrentLocks $currentLocks
-        if ($null -ne $snapshotLocks) {
-            foreach ($stream in $snapshotLocks.Streams) {
-                $stream.Dispose()
+        try {
+            foreach ($name in $environmentNames) {
+                [Environment]::SetEnvironmentVariable(
+                    $name,
+                    $originalEnvironment[$name],
+                    [EnvironmentVariableTarget]::Process)
+            }
+            Close-SteinSourceFixtureLockCollections `
+                -BinaryLocks $binaryLocks `
+                -ToolLocks $toolLocks `
+                -CandidateGeneratorLocks $candidateGeneratorLocks `
+                -CurrentLocks $currentLocks
+            if ($null -ne $snapshotLocks) {
+                foreach ($stream in $snapshotLocks.Streams) {
+                    $stream.Dispose()
+                }
+            }
+            if ($null -ne $buildRoot -and (Test-Path -LiteralPath $buildRoot)) {
+                Remove-SteinPackagePrivateTemporaryDirectory `
+                    -Path $buildRoot `
+                    -Purpose "build"
             }
         }
-        if ($null -ne $buildRoot -and (Test-Path -LiteralPath $buildRoot)) {
-            Remove-SteinPackagePrivateTemporaryDirectory `
-                -Path $buildRoot `
-                -Purpose "build"
+        catch {
+            $fixtureCleanupFailure = $_
         }
+    }
+    $fixtureResolvedFailure = Resolve-SteinPackagePrimaryAndCleanupFailure `
+        -PrimaryFailure $fixtureOperationFailure `
+        -CleanupFailure $fixtureCleanupFailure
+    if ($null -ne $fixtureResolvedFailure) {
+        throw $fixtureResolvedFailure
     }
 }
 

@@ -179,6 +179,8 @@ $normalizedThumbprint = ConvertTo-SteinCertificateThumbprint -Thumbprint $Certif
 $makeAppx = Resolve-WindowsSdkTool -Name "makeappx.exe"
 $unpackRoot = New-SteinPackagePrivateTemporaryDirectory -Purpose "verify"
 $packageReadLock = $null
+$verifyOperationFailure = $null
+$verifyCleanupFailure = $null
 
 try {
     $packageReadLock = [IO.FileStream]::new(
@@ -280,15 +282,29 @@ try {
         Sha256 = Get-SteinPackageFileSha256 -Path $resolvedPackage
     }
 }
+catch {
+    $verifyOperationFailure = $_
+}
 finally {
-    if ($null -ne $packageReadLock) {
-        $packageReadLock.Dispose()
+    try {
+        if ($null -ne $packageReadLock) {
+            $packageReadLock.Dispose()
+        }
+        if (Test-Path -LiteralPath $unpackRoot) {
+            Remove-SteinPackagePrivateTemporaryDirectory `
+                -Path $unpackRoot `
+                -Purpose "verify"
+        }
     }
-    if (Test-Path -LiteralPath $unpackRoot) {
-        Remove-SteinPackagePrivateTemporaryDirectory `
-            -Path $unpackRoot `
-            -Purpose "verify"
+    catch {
+        $verifyCleanupFailure = $_
     }
+}
+$verifyResolvedFailure = Resolve-SteinPackagePrimaryAndCleanupFailure `
+    -PrimaryFailure $verifyOperationFailure `
+    -CleanupFailure $verifyCleanupFailure
+if ($null -ne $verifyResolvedFailure) {
+    throw $verifyResolvedFailure
 }
 }
 catch {

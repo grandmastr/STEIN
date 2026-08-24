@@ -245,14 +245,25 @@ try {
     $candidatePackageToolsLock = $packageToolsBootstrapBinding
 }
 catch {
-    if ($null -ne $sourceLocks) {
-        foreach ($stream in $sourceLocks.Streams) { $stream.Dispose() }
+    $candidatePrimaryFailure = $_
+    $candidateCleanupFailure = $null
+    try {
+        if ($null -ne $sourceLocks) {
+            foreach ($stream in $sourceLocks.Streams) { $stream.Dispose() }
+        }
+        foreach ($lockedTool in $toolchain.Locks) { $lockedTool.Stream.Dispose() }
+        if (Test-Path -LiteralPath $buildRoot) {
+            Remove-SteinPackagePrivateTemporaryDirectory `
+                -Path $buildRoot `
+                -Purpose "build"
+        }
     }
-    foreach ($lockedTool in $toolchain.Locks) { $lockedTool.Stream.Dispose() }
-    if (Test-Path -LiteralPath $buildRoot) {
-        Remove-SteinPackagePrivateTemporaryDirectory -Path $buildRoot -Purpose "build"
+    catch {
+        $candidateCleanupFailure = $_
     }
-    throw
+    throw (Resolve-SteinPackagePrimaryAndCleanupFailure `
+        -PrimaryFailure $candidatePrimaryFailure `
+        -CleanupFailure $candidateCleanupFailure)
 }
 
 $packageTemporaryPath = $null
@@ -268,6 +279,8 @@ $brokerExecutableLock = $null
 $stagingLocks = $null
 $stagingMappingLock = $null
 $previousEnvironment = @{}
+$buildOperationFailure = $null
+$buildCleanupFailure = $null
 try {
 $candidateRoot = $snapshot.Root
 $templatePath = Join-Path $candidateRoot "packaging\windows-msix\AppxManifest.xml.in"
@@ -932,50 +945,64 @@ $rejectedOverrides = @(
     Write-Output "Recorded exact package identities: $identityPath"
     Write-Output "Recorded blocked browser producer identity: $browserIdentityPath"
 }
+catch {
+    $buildOperationFailure = $_
+}
 finally {
-    if ($null -ne $stagingMappingLock) {
-        $stagingMappingLock.Stream.Dispose()
-    }
-    if ($null -ne $stagingLocks) {
-        foreach ($stream in $stagingLocks.Streams) { $stream.Dispose() }
-    }
-    foreach ($lockedExecutable in @(
-            $desktopExecutableLock,
-            $coreExecutableLock,
-            $cliExecutableLock,
-            $hostExecutableLock,
-            $brokerExecutableLock)) {
-        if ($null -ne $lockedExecutable) { $lockedExecutable.Stream.Dispose() }
-    }
-    if ($null -ne $distLocks) {
-        foreach ($stream in $distLocks.Streams) { $stream.Dispose() }
-    }
-    if ($null -ne $sourceLocks) {
-        foreach ($stream in $sourceLocks.Streams) { $stream.Dispose() }
-    }
-    foreach ($lockedTool in $toolchain.Locks) { $lockedTool.Stream.Dispose() }
-    foreach ($environmentName in @($previousEnvironment.Keys)) {
-        [Environment]::SetEnvironmentVariable(
-            [string]$environmentName,
-            $previousEnvironment[$environmentName],
-            [EnvironmentVariableTarget]::Process)
-    }
-    foreach ($temporaryReleasePath in @(
-            $coreCompanionTemporaryPath,
-            $cliCompanionTemporaryPath,
-            $packageTemporaryPath,
-            $identityTemporaryPath,
-            $browserIdentityTemporaryPath)) {
-        if (-not [string]::IsNullOrWhiteSpace([string]$temporaryReleasePath) -and
-            (Test-Path -LiteralPath $temporaryReleasePath)) {
-            Remove-Item -LiteralPath $temporaryReleasePath -Force -ErrorAction Stop
+    try {
+        if ($null -ne $stagingMappingLock) {
+            $stagingMappingLock.Stream.Dispose()
+        }
+        if ($null -ne $stagingLocks) {
+            foreach ($stream in $stagingLocks.Streams) { $stream.Dispose() }
+        }
+        foreach ($lockedExecutable in @(
+                $desktopExecutableLock,
+                $coreExecutableLock,
+                $cliExecutableLock,
+                $hostExecutableLock,
+                $brokerExecutableLock)) {
+            if ($null -ne $lockedExecutable) { $lockedExecutable.Stream.Dispose() }
+        }
+        if ($null -ne $distLocks) {
+            foreach ($stream in $distLocks.Streams) { $stream.Dispose() }
+        }
+        if ($null -ne $sourceLocks) {
+            foreach ($stream in $sourceLocks.Streams) { $stream.Dispose() }
+        }
+        foreach ($lockedTool in $toolchain.Locks) { $lockedTool.Stream.Dispose() }
+        foreach ($environmentName in @($previousEnvironment.Keys)) {
+            [Environment]::SetEnvironmentVariable(
+                [string]$environmentName,
+                $previousEnvironment[$environmentName],
+                [EnvironmentVariableTarget]::Process)
+        }
+        foreach ($temporaryReleasePath in @(
+                $coreCompanionTemporaryPath,
+                $cliCompanionTemporaryPath,
+                $packageTemporaryPath,
+                $identityTemporaryPath,
+                $browserIdentityTemporaryPath)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$temporaryReleasePath) -and
+                (Test-Path -LiteralPath $temporaryReleasePath)) {
+                Remove-Item -LiteralPath $temporaryReleasePath -Force -ErrorAction Stop
+            }
+        }
+        if (Test-Path -LiteralPath $buildRoot) {
+            Remove-SteinPackagePrivateTemporaryDirectory `
+                -Path $buildRoot `
+                -Purpose "build"
         }
     }
-    if (Test-Path -LiteralPath $buildRoot) {
-        Remove-SteinPackagePrivateTemporaryDirectory `
-            -Path $buildRoot `
-            -Purpose "build"
+    catch {
+        $buildCleanupFailure = $_
     }
+}
+$buildResolvedFailure = Resolve-SteinPackagePrimaryAndCleanupFailure `
+    -PrimaryFailure $buildOperationFailure `
+    -CleanupFailure $buildCleanupFailure
+if ($null -ne $buildResolvedFailure) {
+    throw $buildResolvedFailure
 }
 }
 catch {

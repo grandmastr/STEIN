@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([switch] $CleanupTestsOnly)
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -109,6 +109,124 @@ function Remove-SteinStaticTemporaryLeaf {
     }
 }
 
+function Initialize-SteinCleanupMutationProbe {
+    if ($null -ne ('Stein.PackagePrivateCleanupMutationProbe' -as [type])) {
+        return
+    }
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+namespace Stein {
+    public static class PackagePrivateCleanupMutationProbe {
+        private const UInt32 GenericWrite = 0x40000000;
+        private const UInt32 ShareAll = 0x00000007;
+        private const UInt32 OpenExisting = 3;
+        private const UInt32 BackupSemantics = 0x02000000;
+        private const UInt32 OpenReparsePoint = 0x00200000;
+        private const UInt32 SetReparsePoint = 0x000900A4;
+        private const UInt32 MountPointTag = 0xA0000003;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(
+            string fileName,
+            UInt32 desiredAccess,
+            UInt32 shareMode,
+            IntPtr securityAttributes,
+            UInt32 creationDisposition,
+            UInt32 flagsAndAttributes,
+            IntPtr templateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DeviceIoControl(
+            SafeFileHandle device,
+            UInt32 controlCode,
+            byte[] input,
+            UInt32 inputSize,
+            IntPtr output,
+            UInt32 outputSize,
+            out UInt32 bytesReturned,
+            IntPtr overlapped);
+
+        private static void PutUInt16(byte[] buffer, int offset, UInt16 value) {
+            buffer[offset] = (byte)(value & 0xff);
+            buffer[offset + 1] = (byte)(value >> 8);
+        }
+
+        private static void PutUInt32(byte[] buffer, int offset, UInt32 value) {
+            buffer[offset] = (byte)(value & 0xff);
+            buffer[offset + 1] = (byte)((value >> 8) & 0xff);
+            buffer[offset + 2] = (byte)((value >> 16) & 0xff);
+            buffer[offset + 3] = (byte)((value >> 24) & 0xff);
+        }
+
+        public static bool TrySetMountPoint(
+                string directoryPath,
+                string targetPath,
+                out Int32 error) {
+            error = 0;
+            SafeFileHandle directory = CreateFileW(
+                directoryPath,
+                GenericWrite,
+                ShareAll,
+                IntPtr.Zero,
+                OpenExisting,
+                BackupSemantics | OpenReparsePoint,
+                IntPtr.Zero);
+            if (directory.IsInvalid) {
+                error = Marshal.GetLastWin32Error();
+                directory.Dispose();
+                return false;
+            }
+            using (directory) {
+                string normalTarget = targetPath.TrimEnd('\\');
+                string substituteName = "\\??\\" + normalTarget;
+                byte[] substitute = Encoding.Unicode.GetBytes(substituteName);
+                byte[] printName = Encoding.Unicode.GetBytes(normalTarget);
+                int pathBytes = substitute.Length + 2 + printName.Length + 2;
+                int reparseDataLength = 8 + pathBytes;
+                if (reparseDataLength > UInt16.MaxValue) {
+                    throw new ArgumentException("The mutation target is too long.");
+                }
+                byte[] buffer = new byte[8 + reparseDataLength];
+                PutUInt32(buffer, 0, MountPointTag);
+                PutUInt16(buffer, 4, (UInt16)reparseDataLength);
+                PutUInt16(buffer, 6, 0);
+                PutUInt16(buffer, 8, 0);
+                PutUInt16(buffer, 10, (UInt16)substitute.Length);
+                PutUInt16(buffer, 12, (UInt16)(substitute.Length + 2));
+                PutUInt16(buffer, 14, (UInt16)printName.Length);
+                Buffer.BlockCopy(substitute, 0, buffer, 16, substitute.Length);
+                Buffer.BlockCopy(
+                    printName,
+                    0,
+                    buffer,
+                    16 + substitute.Length + 2,
+                    printName.Length);
+                UInt32 returned;
+                if (!DeviceIoControl(
+                        directory,
+                        SetReparsePoint,
+                        buffer,
+                        (UInt32)buffer.Length,
+                        IntPtr.Zero,
+                        0,
+                        out returned,
+                        IntPtr.Zero)) {
+                    error = Marshal.GetLastWin32Error();
+                    return false;
+                }
+                return true;
+            }
+        }
+    }
+}
+"@
+}
+
 foreach ($unsafeSnapshotPath in @(
         "source/foo:bar.rs",
         "source/CON/file.rs",
@@ -174,6 +292,338 @@ finally {
     }
 }
 
+$hardlinkTargetRoot = Join-Path ([IO.Path]::GetTempPath()) (
+    "stein-hardlink-target-" + [Guid]::NewGuid().ToString("N"))
+$hardlinkCleanupRoot = $null
+$readOnlyHardlinkCleanupRoot = $null
+$missingHardlinkPath = $null
+$script:SteinMissingHardlinkRaceTriggered = $false
+try {
+    $null = New-Item `
+        -ItemType Directory `
+        -Path $hardlinkTargetRoot `
+        -ErrorAction Stop
+    $hardlinkTarget = Join-Path $hardlinkTargetRoot "survives.lib"
+    [IO.File]::WriteAllText(
+        $hardlinkTarget,
+        "synthetic external hardlink target",
+        [Text.UTF8Encoding]::new($false))
+    $hardlinkCleanupRoot = New-SteinPackagePrivateTemporaryDirectory `
+        -Purpose "build"
+    $missingHardlinkPath = Join-Path $hardlinkCleanupRoot "vanishes.lib"
+    $null = New-Item `
+        -ItemType HardLink `
+        -Path $missingHardlinkPath `
+        -Target $hardlinkTarget `
+        -ErrorAction Stop
+
+    function Get-ChildItem {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory = $true)][string] $LiteralPath,
+            [switch] $Force
+        )
+
+        $entries = @(Microsoft.PowerShell.Management\Get-ChildItem `
+                -LiteralPath $LiteralPath `
+                -Force:$Force `
+                -ErrorAction Stop)
+        if (-not $script:SteinMissingHardlinkRaceTriggered -and
+            [string]::Equals(
+                (ConvertFrom-SteinPackageExtendedLengthPath -Path $LiteralPath),
+                [IO.Path]::GetFullPath($hardlinkCleanupRoot),
+                [StringComparison]::OrdinalIgnoreCase)) {
+            $script:SteinMissingHardlinkRaceTriggered = $true
+            [IO.File]::Delete(
+                (ConvertTo-SteinPackageExtendedLengthPath `
+                    -Path $missingHardlinkPath))
+        }
+        return $entries
+    }
+
+    Remove-SteinPackagePrivateTemporaryDirectory `
+        -Path $hardlinkCleanupRoot `
+        -Purpose "build"
+    $hardlinkCleanupRoot = $null
+    if (-not $script:SteinMissingHardlinkRaceTriggered) {
+        throw "The private temporary cleanup did not exercise the missing-entry race."
+    }
+    if ([IO.File]::ReadAllText($hardlinkTarget) -cne
+        "synthetic external hardlink target") {
+        throw "Private temporary cleanup changed an external hardlink target."
+    }
+
+    Microsoft.PowerShell.Management\Remove-Item `
+        -LiteralPath Function:\Get-ChildItem `
+        -Force `
+        -ErrorAction Stop
+    [IO.File]::SetAttributes($hardlinkTarget, [IO.FileAttributes]::ReadOnly)
+    $readOnlyHardlinkCleanupRoot = New-SteinPackagePrivateTemporaryDirectory `
+        -Purpose "build"
+    $readOnlyHardlinkPath = Join-Path `
+        $readOnlyHardlinkCleanupRoot `
+        "readonly.lib"
+    $null = New-Item `
+        -ItemType HardLink `
+        -Path $readOnlyHardlinkPath `
+        -Target $hardlinkTarget `
+        -ErrorAction Stop
+    Remove-SteinPackagePrivateTemporaryDirectory `
+        -Path $readOnlyHardlinkCleanupRoot `
+        -Purpose "build"
+    $readOnlyHardlinkCleanupRoot = $null
+    $hardlinkTargetItem = Get-Item `
+        -LiteralPath $hardlinkTarget `
+        -Force `
+        -ErrorAction Stop
+    if (($hardlinkTargetItem.Attributes -band [IO.FileAttributes]::ReadOnly) -eq 0 -or
+        [IO.File]::ReadAllText($hardlinkTarget) -cne
+            "synthetic external hardlink target") {
+        throw "Private temporary cleanup mutated shared hardlink metadata or bytes."
+    }
+}
+finally {
+    Microsoft.PowerShell.Management\Remove-Item `
+        -LiteralPath Function:\Get-ChildItem `
+        -Force `
+        -ErrorAction SilentlyContinue
+    if ($null -ne $hardlinkCleanupRoot -and
+        (Test-Path -LiteralPath $hardlinkCleanupRoot)) {
+        Remove-SteinPackagePrivateTemporaryDirectory `
+            -Path $hardlinkCleanupRoot `
+            -Purpose "build"
+    }
+    if ($null -ne $readOnlyHardlinkCleanupRoot -and
+        (Test-Path -LiteralPath $readOnlyHardlinkCleanupRoot)) {
+        Remove-SteinPackagePrivateTemporaryDirectory `
+            -Path $readOnlyHardlinkCleanupRoot `
+            -Purpose "build"
+    }
+    if (Test-Path -LiteralPath $hardlinkTargetRoot) {
+        Remove-SteinStaticTemporaryLeaf -Path $hardlinkTargetRoot
+    }
+    $script:SteinMissingHardlinkRaceTriggered = $false
+}
+
+$longPathCleanupRoot = $null
+try {
+    $longPathCleanupRoot = New-SteinPackagePrivateTemporaryDirectory `
+        -Purpose "build"
+    $desiredParentLength = 264
+    $longDirectorySegmentLength = $desiredParentLength -
+        $longPathCleanupRoot.Length - 1
+    if ($longDirectorySegmentLength -lt 16 -or
+        $longDirectorySegmentLength -gt 200) {
+        throw "The long-path cleanup fixture cannot create its bounded parent."
+    }
+    $longParent = Join-Path `
+        $longPathCleanupRoot `
+        ("p" * $longDirectorySegmentLength)
+    $null = [IO.Directory]::CreateDirectory(
+        (ConvertTo-SteinPackageExtendedLengthPath -Path $longParent))
+    $longLeafLength = 274 - $longParent.Length - 1
+    $longLeaf = ("f" * ($longLeafLength - 4)) + ".lib"
+    $longFile = Join-Path $longParent $longLeaf
+    if ($longParent.Length -ne 264 -or $longFile.Length -ne 274) {
+        throw "The long-path cleanup fixture did not select its exact deep paths."
+    }
+    $longFileDeletePath = ConvertTo-SteinPackageExtendedLengthPath -Path $longFile
+    [IO.File]::WriteAllText(
+        $longFileDeletePath,
+        "synthetic file under a 264-character directory path",
+        [Text.UTF8Encoding]::new($false))
+    [IO.File]::SetAttributes(
+        $longFileDeletePath,
+        [IO.FileAttributes]::ReadOnly)
+    if (-not [IO.File]::Exists($longFileDeletePath)) {
+        throw "The long-path cleanup fixture was not created."
+    }
+    Remove-SteinPackagePrivateTemporaryDirectory `
+        -Path $longPathCleanupRoot `
+        -Purpose "build"
+    $longPathCleanupRoot = $null
+    if ([IO.File]::Exists($longFileDeletePath)) {
+        throw "Private temporary cleanup retained a deep extended-length path."
+    }
+}
+finally {
+    if ($null -ne $longPathCleanupRoot -and
+        (Test-Path -LiteralPath $longPathCleanupRoot)) {
+        Remove-SteinPackagePrivateTemporaryDirectory `
+            -Path $longPathCleanupRoot `
+            -Purpose "build"
+    }
+}
+
+$ancestorSwapTargetRoot = Join-Path ([IO.Path]::GetTempPath()) (
+    "stein-ancestor-swap-target-" + [Guid]::NewGuid().ToString("N"))
+$ancestorSwapCleanupRoot = $null
+$script:SteinAncestorSwapAttempted = $false
+$script:SteinAncestorSwapRejected = $false
+$script:SteinAncestorWriteRejected = $false
+try {
+    Initialize-SteinCleanupMutationProbe
+    $null = New-Item `
+        -ItemType Directory `
+        -Path $ancestorSwapTargetRoot `
+        -ErrorAction Stop
+    $externalVictim = Join-Path $ancestorSwapTargetRoot "survives.txt"
+    [IO.File]::WriteAllText(
+        $externalVictim,
+        "synthetic external ancestor-swap victim",
+        [Text.UTF8Encoding]::new($false))
+    $ancestorSwapCleanupRoot = New-SteinPackagePrivateTemporaryDirectory `
+        -Purpose "build"
+    $ancestorSwapChild = Join-Path $ancestorSwapCleanupRoot "subdirectory"
+    $ancestorSwapBackup = Join-Path $ancestorSwapCleanupRoot "moved-subdirectory"
+    $null = New-Item `
+        -ItemType Directory `
+        -Path $ancestorSwapChild `
+        -ErrorAction Stop
+
+    function Get-ChildItem {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory = $true)][string] $LiteralPath,
+            [switch] $Force
+        )
+
+        if (-not $script:SteinAncestorSwapAttempted -and
+            [string]::Equals(
+                (ConvertFrom-SteinPackageExtendedLengthPath -Path $LiteralPath),
+                [IO.Path]::GetFullPath($ancestorSwapChild),
+                [StringComparison]::OrdinalIgnoreCase)) {
+            $script:SteinAncestorSwapAttempted = $true
+            $mutationError = 0
+            $mutated = [Stein.PackagePrivateCleanupMutationProbe]::TrySetMountPoint(
+                (ConvertTo-SteinPackageExtendedLengthPath -Path $ancestorSwapChild),
+                $ancestorSwapTargetRoot,
+                [ref]$mutationError)
+            if (-not $mutated) {
+                if ($mutationError -ne 32) {
+                    throw "The in-place reparse mutation failed unexpectedly: $mutationError."
+                }
+                $script:SteinAncestorWriteRejected = $true
+            }
+            try {
+                [IO.Directory]::Move($ancestorSwapChild, $ancestorSwapBackup)
+                $null = New-Item `
+                    -ItemType Junction `
+                    -Path $ancestorSwapChild `
+                    -Target $ancestorSwapTargetRoot `
+                    -ErrorAction Stop
+            }
+            catch {
+                $script:SteinAncestorSwapRejected = $true
+            }
+        }
+        $entries = @(Microsoft.PowerShell.Management\Get-ChildItem `
+                -LiteralPath $LiteralPath `
+                -Force:$Force `
+                -ErrorAction Stop)
+        return $entries
+    }
+
+    Remove-SteinPackagePrivateTemporaryDirectory `
+        -Path $ancestorSwapCleanupRoot `
+        -Purpose "build"
+    $ancestorSwapCleanupRoot = $null
+    if (-not $script:SteinAncestorSwapAttempted -or
+        -not $script:SteinAncestorSwapRejected -or
+        -not $script:SteinAncestorWriteRejected) {
+        throw "Private temporary cleanup did not reject an ancestor replacement."
+    }
+    if ([IO.File]::ReadAllText($externalVictim) -cne
+        "synthetic external ancestor-swap victim") {
+        throw "Private temporary cleanup followed a replaced ancestor."
+    }
+}
+finally {
+    Microsoft.PowerShell.Management\Remove-Item `
+        -LiteralPath Function:\Get-ChildItem `
+        -Force `
+        -ErrorAction SilentlyContinue
+    if ($null -ne $ancestorSwapCleanupRoot -and
+        (Test-Path -LiteralPath $ancestorSwapCleanupRoot)) {
+        Remove-SteinPackagePrivateTemporaryDirectory `
+            -Path $ancestorSwapCleanupRoot `
+            -Purpose "build"
+    }
+    if (Test-Path -LiteralPath $ancestorSwapTargetRoot) {
+        Remove-SteinStaticTemporaryLeaf -Path $ancestorSwapTargetRoot
+    }
+    $script:SteinAncestorSwapAttempted = $false
+    $script:SteinAncestorSwapRejected = $false
+    $script:SteinAncestorWriteRejected = $false
+}
+
+$primaryFailureCleanupRoot = $null
+$primaryFailureLock = $null
+try {
+    $primaryFailureCleanupRoot = New-SteinPackagePrivateTemporaryDirectory `
+        -Purpose "build"
+    $primaryFailureLockedPath = Join-Path `
+        $primaryFailureCleanupRoot `
+        "locked.tmp"
+    [IO.File]::WriteAllText(
+        $primaryFailureLockedPath,
+        "synthetic locked cleanup leaf",
+        [Text.UTF8Encoding]::new($false))
+    $primaryFailureLock = [IO.FileStream]::new(
+        $primaryFailureLockedPath,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read)
+    $syntheticPrimary = $null
+    try {
+        throw "STEIN_SYNTHETIC_PRIMARY_FAILURE"
+    }
+    catch {
+        $syntheticPrimary = $_
+    }
+    $syntheticCleanup = $null
+    try {
+        Remove-SteinPackagePrivateTemporaryDirectory `
+            -Path $primaryFailureCleanupRoot `
+            -Purpose "build"
+    }
+    catch {
+        $syntheticCleanup = $_
+    }
+    if ($null -eq $syntheticCleanup) {
+        throw "The primary-error regression did not force cleanup failure."
+    }
+    $resolvedPrimary = Resolve-SteinPackagePrimaryAndCleanupFailure `
+        -PrimaryFailure $syntheticPrimary `
+        -CleanupFailure $syntheticCleanup
+    if (-not [object]::ReferenceEquals($resolvedPrimary, $syntheticPrimary) -or
+        $resolvedPrimary.Exception.Message -cne
+            "STEIN_SYNTHETIC_PRIMARY_FAILURE" -or
+        [string]::IsNullOrWhiteSpace([string]$resolvedPrimary.Exception.Data[
+                'SteinPrivateTemporaryCleanupFailure']) -or
+        [string]::IsNullOrWhiteSpace([string]$resolvedPrimary.Exception.Data[
+                'SteinPrivateTemporaryCleanupFailureId'])) {
+        throw "Private temporary cleanup replaced or failed to attach to the primary error."
+    }
+    $resolvedCleanupOnly = Resolve-SteinPackagePrimaryAndCleanupFailure `
+        -PrimaryFailure $null `
+        -CleanupFailure $syntheticCleanup
+    if (-not [object]::ReferenceEquals($resolvedCleanupOnly, $syntheticCleanup)) {
+        throw "A cleanup-only failure was not retained as authoritative."
+    }
+}
+finally {
+    if ($null -ne $primaryFailureLock) {
+        $primaryFailureLock.Dispose()
+    }
+    if ($null -ne $primaryFailureCleanupRoot -and
+        (Test-Path -LiteralPath $primaryFailureCleanupRoot)) {
+        Remove-SteinPackagePrivateTemporaryDirectory `
+            -Path $primaryFailureCleanupRoot `
+            -Purpose "build"
+    }
+}
+
 $junctionTargetRoot = Join-Path ([IO.Path]::GetTempPath()) (
     "stein-junction-target-" + [Guid]::NewGuid().ToString("N"))
 $privateCleanupRoot = $null
@@ -212,6 +662,11 @@ finally {
     if (Test-Path -LiteralPath $junctionTargetRoot) {
         Remove-SteinStaticTemporaryLeaf -Path $junctionTargetRoot
     }
+}
+
+if ($CleanupTestsOnly) {
+    Write-Output "Windows MSIX private temporary cleanup tests are valid."
+    return
 }
 
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
@@ -390,6 +845,32 @@ if ($buildIdentityProperties.Count -ne $identityProperties.Count -or
 }
 
 $verifyScript = Get-Content -LiteralPath (Join-Path $PSScriptRoot "Verify-Msix.ps1") -Raw
+$sourceFixtureRunnerScript = Get-Content `
+    -LiteralPath (Join-Path $repoRoot "scripts\windows\phase2\Run-Source-Fixture.ps1") `
+    -Raw
+foreach ($cleanupFailureContract in @(
+        [pscustomobject]@{
+            Name = "Build-Msix.ps1"
+            Source = $buildScript
+            MinimumCount = 2
+        },
+        [pscustomobject]@{
+            Name = "Verify-Msix.ps1"
+            Source = $verifyScript
+            MinimumCount = 1
+        },
+        [pscustomobject]@{
+            Name = "Run-Source-Fixture.ps1"
+            Source = $sourceFixtureRunnerScript
+            MinimumCount = 1
+        })) {
+    if ([regex]::Matches(
+            [string]$cleanupFailureContract.Source,
+            'Resolve-SteinPackagePrimaryAndCleanupFailure').Count -lt
+        [int]$cleanupFailureContract.MinimumCount) {
+        throw "$($cleanupFailureContract.Name) does not preserve primary cleanup errors."
+    }
+}
 $bootstrapScriptContracts = @(
     [pscustomobject]@{
         Path = Join-Path $PSScriptRoot "Build-Msix.ps1"
