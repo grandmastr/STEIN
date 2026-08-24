@@ -546,6 +546,7 @@ foreach ($required in @(
         'source_command_security_module_binding_invalid',
         'Assert-SteinSourceCommandRegistry',
         'ConvertTo-SteinSourceCommandArgumentVector',
+        '$expectedArguments = @(ConvertTo-SteinSourceCommandArgumentVector',
         'Get-SteinSourceCommandReceiptCoverage',
         'Open-SteinSourceCommandGitBinding',
         'git_launcher_sha256',

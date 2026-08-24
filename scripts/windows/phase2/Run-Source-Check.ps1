@@ -1721,9 +1721,9 @@ function Get-SteinSourceCommandReceiptCoverage {
                     -Expected @('path', 'size', 'sha256') `
                     -FailureCode 'source_command_receipt_coverage_invalid'
             }
-            $expectedArguments = ConvertTo-SteinSourceCommandArgumentVector `
-                -Check $check `
-                -ResolvedEvidenceRoot $evidencePath
+            $expectedArguments = @(ConvertTo-SteinSourceCommandArgumentVector `
+                    -Check $check `
+                    -ResolvedEvidenceRoot $evidencePath)
             $actualArguments = @($receipt.command.arguments | ForEach-Object {
                     [string]$_
                 })

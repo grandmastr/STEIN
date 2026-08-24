@@ -488,6 +488,19 @@ if ($checks.Count -ne 44 -or
     throw 'The source-command registry coverage counts are invalid.'
 }
 
+$singleArgumentCheck = @($checks | Where-Object {
+        [string]$_.id -ceq 'desktop-typecheck'
+    })
+$singleArgumentVector = @(ConvertTo-SteinSourceCommandArgumentVector `
+        -Check $singleArgumentCheck[0] `
+        -ResolvedEvidenceRoot (Join-Path $repoRoot `
+            'artifacts\evidence\phase-2\source-command-vector-contract'))
+if ($singleArgumentCheck.Count -ne 1 -or
+    $singleArgumentVector.Count -ne 1 -or
+    [string]$singleArgumentVector[0] -cne 'typecheck') {
+    throw 'A one-element source-command argument vector was not retained as an array.'
+}
+
 foreach ($mutation in @(
         [pscustomobject]@{ Value = 'contains space'; Description = 'a whitespace token' },
         [pscustomobject]@{ Value = '"quoted"'; Description = 'a quoted token' },
