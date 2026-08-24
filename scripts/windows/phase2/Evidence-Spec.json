@@ -10,6 +10,7 @@
   ],
   "source_report_contract": {
     "source_fixture_registry_sha256": "d2414e552dfbc00b3ecf5837cfc431c64f670508ae4e8696b9fce4f85a75c5c5",
+    "source_command_registry_sha256": "9a1bb265a11a3b7ca18d1e8b67a2b1c47f9cb090910a458ca3d41fb221b50cbc",
     "required_pass_check_ids": [
       "boundary-contract",
       "desktop-build",
@@ -48,6 +49,7 @@
       "rust-format",
       "rust-tests",
       "source-evidence-contract",
+      "source-report-command-provenance",
       "source-provenance-stability"
     ],
     "allowed_not_run_check_ids": [
@@ -55,13 +57,15 @@
       "no-leaks-producer-workflow",
       "pinned-clean-build-environment",
       "portable-runner-attestation",
-      "source-report-command-provenance",
       "windows-native-ignored-fixtures"
     ],
     "required_generator_paths": [
       "scripts/windows/phase2/Verify-Source.ps1",
       "scripts/windows/phase2/Verify-Source.cmd",
       "scripts/windows/phase2/Source-Evidence.ps1",
+      "scripts/windows/phase2/Source-Command-Registry.json",
+      "scripts/windows/phase2/Run-Source-Check.ps1",
+      "scripts/windows/phase2/Test-SourceCommand.ps1",
       "scripts/windows/phase2/Source-Fixture-Registry.json",
       "scripts/windows/phase2/Run-Source-Fixture.ps1",
       "scripts/windows/phase2/Test-SourceFixture.ps1",

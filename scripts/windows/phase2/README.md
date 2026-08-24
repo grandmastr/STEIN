@@ -216,17 +216,37 @@ to 117 per-fixture execution records (107 globally unique test identities), and
 each content-free receipt binds the candidate tree, semantic source files,
 compiler environment, harness binary, exact command, result, and suite index.
 
-Every `source_verification` subcheck additionally depends on all three frozen
-checks: `native-toolchain-provenance`, `pinned-clean-build-environment`, and
-`source-report-command-provenance`. They remain exact `not_run` rows because
-the full authenticated Rust/Git/native dependency closure, immutable isolated
-execution for every non-fixture source check, and independently attested
-commands are not implemented. Consequently the new fixture passes cannot by
-themselves promote a source-backed gate. Native-only rows remain independently
-reviewable.
+Every `source_verification` subcheck additionally depends on all three
+prerequisite checks: `native-toolchain-provenance`,
+`pinned-clean-build-environment`, and
+`source-report-command-provenance`. The command-provenance row now passes from
+the exact registered-command receipt set. The authenticated Rust/Git/native
+dependency closure and immutable isolated execution obligations remain exact
+`not_run` rows, so the fixture passes still cannot by themselves promote a
+source-backed gate. Native-only rows remain independently reviewable.
 
-The source-report contract fixes 44 exact checks—38 required `pass` rows and six
-exact frozen `not_run` rows—and seventeen generator files.
+The source-report contract fixes 44 exact checks—39 required `pass` rows and five
+exact frozen `not_run` rows—and twenty generator files. The frozen
+source-command registry (`SHA-256
+9a1bb265a11a3b7ca18d1e8b67a2b1c47f9cb090910a458ca3d41fb221b50cbc`)
+defines every row category and, for the 37 executed rows, the executable role,
+ordered argument vector, working directory, environment profile, timeout, and
+execution group. Its 24 direct executions plus one shared fixture-suite launch
+produce 37 per-check receipts across 25 groups and 50 unique bounded logs. The
+receipt candidate manifest is the canonical Git tree record set
+(`UTF-8 path length:path|mode|blob object ID`). The runner holds every tracked
+worktree file open and accepts its raw stream only when it is the exact blob or
+when bytewise CRLF-to-LF conversion is the sole difference. It rejects hidden
+index flags and active `filter`, `ident`, or `working-tree-encoding` attributes,
+so a clean `core.autocrlf=true` checkout is supported without trusting a custom
+clean filter or claiming literal raw-byte identity. Each receipt and the suite
+index bind the exact Git launcher and resolved payload hashes from source
+provenance; the runner locks both files through its final candidate-stability
+check. The
+verifier reopens the complete closed set
+before deriving `source-report-command-provenance=pass`; downstream signing
+rehashes the artifact set, while installed review validates the embedded exact
+contract through the signed source report and root anchor.
 Source provenance schema 2 binds launcher and rustup-selected Cargo/rustc
 payloads, the pnpm JavaScript entrypoint, and both the Git-for-Windows launcher
 and resolved `mingw64\bin\git.exe` payload without retaining local paths.
@@ -398,9 +418,10 @@ non-reparse file with a valid Authenticode signature whose exact signer Subject
 is Microsoft Corporation; an unsigned earlier PATH entry is rejected. Its
 validated signer Subject, signature status, version, and executable hash are
 retained in the bounded provenance. The verifier samples provenance before and
-after the suite and fails the run if it changes. Its seventeen-file generator
-also binds the frozen source-fixture registry, runner, and contract test along
-with the source verifier, installed reviewer, fail-closed evidence
+after the suite and fails the run if it changes. Its twenty-file generator also
+binds the frozen source-command registry, runner, and contract test, plus the
+source-fixture registry, runner, and contract test, along with the source
+verifier, installed reviewer, fail-closed evidence
 specification/contract, no-leaks scanner/launcher/test, and their runtime
 dependencies. The separate passing `no-leaks-scanner-static` source check
 exercises the scanner contract without claiming that the absent real sentinel

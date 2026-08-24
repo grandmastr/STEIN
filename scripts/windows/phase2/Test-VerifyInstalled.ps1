@@ -108,8 +108,11 @@ $harnessPath = Join-Path $PSScriptRoot "Verify-Installed.ps1"
 $launcherPath = Join-Path $PSScriptRoot "Verify-Installed.cmd"
 $evidenceContractPath = Join-Path $PSScriptRoot "Evidence-Contract.ps1"
 $evidenceSpecificationPath = Join-Path $PSScriptRoot "Evidence-Spec.json"
+$sourceCommandRegistryPath = Join-Path $PSScriptRoot "Source-Command-Registry.json"
+$sourceCommandRunnerPath = Join-Path $PSScriptRoot "Run-Source-Check.ps1"
 foreach ($path in @(
-        $harnessPath, $launcherPath, $evidenceContractPath, $evidenceSpecificationPath)) {
+        $harnessPath, $launcherPath, $evidenceContractPath, $evidenceSpecificationPath,
+        $sourceCommandRegistryPath, $sourceCommandRunnerPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "The installed evidence harness is incomplete."
     }
@@ -210,6 +213,25 @@ if ($evidenceSpecification.gates_by_id.Count -ne 32 -or
     [string]$evidenceSpecification.specification.contract_id -cne
         "stein-phase2-gate-evidence-v1") {
     throw "The checked-in gate evidence specification is invalid."
+}
+$sourceCommandRegistry = Read-SteinPhase2SourceCommandRegistry `
+    -Path $sourceCommandRegistryPath `
+    -ExpectedSha256 (Get-SteinPhase2Sha256 -Path $sourceCommandRegistryPath)
+if (@($sourceCommandRegistry.value.checks).Count -ne 44) {
+    throw "The checked-in source command registry is incomplete."
+}
+$productionCommand = @($sourceCommandRegistry.value.checks | Where-Object {
+        [string]$_.id -ceq "release-production-core"
+    })
+if ($productionCommand.Count -ne 1 -or
+    [string]$productionCommand[0].executable_role -cne "cargo" -or
+    [string]$productionCommand[0].environment_profile -cne
+        "phase2_synthetic_compile_v1" -or
+    @($productionCommand[0].arguments).Count -ne 6 -or
+    [string]$productionCommand[0].arguments[5].kind -cne "literal" -or
+    [string]$productionCommand[0].arguments[5].value -cne
+        "production-private-endpoint,production-edge-producer") {
+    throw "The release production feature command is not exact."
 }
 $genericZeroExitRejected = $false
 try {
@@ -455,14 +477,15 @@ foreach ($forbiddenAclCommand in @("Get-Acl", "Set-Acl")) {
 
 $verifySourcePath = Join-Path $PSScriptRoot "Verify-Source.ps1"
 $verifySource = Get-Content -LiteralPath $verifySourcePath -Raw
-if ($verifySource.IndexOf(
-        '"--features", "production-private-endpoint,production-edge-producer"',
-        [StringComparison]::Ordinal) -lt 0 -or
-    $verifySource.IndexOf("STEIN_EDGE_EXTENSION_VERSION", [StringComparison]::Ordinal) -lt 0 -or
-    $verifySource.IndexOf("Resolve-SteinSourceWindowsPowerShell", [StringComparison]::Ordinal) -lt 0 -or
-    $verifySource.IndexOf("[Environment+SpecialFolder]::System", [StringComparison]::Ordinal) -lt 0 -or
-    $verifySource.IndexOf('Get-Command "powershell.exe"', [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-    throw "Verify-Source.ps1 is missing an exact production feature or trusted-host invariant."
+$sourceCommandRunner = Get-Content -LiteralPath $sourceCommandRunnerPath -Raw
+if ($verifySource.IndexOf("Source-Command-Registry.json", [StringComparison]::Ordinal) -lt 0 -or
+    $verifySource.IndexOf("Run-Source-Check.ps1", [StringComparison]::Ordinal) -lt 0 -or
+    $verifySource.IndexOf("Assert-SteinSourceEvidenceCommandReceiptIndex", [StringComparison]::Ordinal) -lt 0 -or
+    $sourceCommandRunner.IndexOf("STEIN_EDGE_EXTENSION_VERSION", [StringComparison]::Ordinal) -lt 0 -or
+    $sourceCommandRunner.IndexOf("Resolve-SteinSourceCommandExecutable", [StringComparison]::Ordinal) -lt 0 -or
+    $sourceCommandRunner.IndexOf("[Environment+SpecialFolder]::System", [StringComparison]::Ordinal) -lt 0 -or
+    $sourceCommandRunner.IndexOf('Get-Command "powershell.exe"', [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+    throw "The registered source command path is missing an exact production or trusted-host invariant."
 }
 
 $windowsPowerShellRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)

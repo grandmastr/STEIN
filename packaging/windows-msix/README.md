@@ -151,22 +151,40 @@ all 13 receipts/71 ordered subchecks, their exact commands and locked binaries,
 the suite index, and all 140 invocation mappings. It grounds every semantic
 source size/SHA-256/Git blob plus the receipt's tree count/manifest against the
 locked candidate snapshot. The installed reviewer then rehashes the signed
-schema-3 package's bound source report and receipts; it does not substitute the
-operator's mutable checkout for that signer-grounded candidate.
+schema-3 package's bound source report and validates its embedded receipts; it
+does not substitute the operator's mutable checkout for that signer-grounded
+candidate.
 
-The source contract has 44 checks: 38 required `pass` and six exact frozen
-`not_run`, with seventeen generator files. This is deliberately not a hermetic
+The frozen source-command registry (`SHA-256
+9a1bb265a11a3b7ca18d1e8b67a2b1c47f9cb090910a458ca3d41fb221b50cbc`)
+also fixes every row category and, for the 37 executed rows, the executable
+role, ordered argument vector, working directory, environment profile, timeout,
+and execution group. Packaging independently
+validates and rehashes the resulting 37 per-check receipts, 25 execution groups,
+and 50 unique bounded logs before the signed binding can select the report. It
+also recomputes the receipt candidate manifest from the locked candidate's
+canonical Git tree records (`UTF-8 path length:path|mode|blob object ID`). The
+runner separately locks every worktree file and permits only exact blob bytes or
+a bytewise CRLF-to-LF checkout difference while rejecting hidden index flags and
+active content-transform attributes. This keeps clean `core.autocrlf=true`
+Windows checkouts compatible without weakening the signed candidate identity.
+The command index and every receipt bind the source report's exact
+Git-for-Windows launcher and resolved payload SHA-256 values; packaging rejects
+any divergent Git identity before signing.
+
+The source contract has 44 checks: 39 required `pass` and five exact frozen
+`not_run`, with twenty generator files. This is deliberately not a hermetic
 native-toolchain claim. The selected
 VS/MSVC compiler, linker, assembler, librarian and library catalogs, Windows
 SDK resource/libraries, and MakeAppx/SignTool payloads are not yet represented
 by a closed signer-attested toolchain manifest. Packaging also validates the
 source report's exact check catalog, shapes, statuses, log bytes, generator
-files and integrity digests. Non-fixture checks still do not have independently
-attested executable/argument/working-directory semantics. Therefore
-`native-toolchain-provenance`, `source-report-command-provenance`, and the
-independent `pinned-clean-build-environment` receipt remain explicit P2-BUILD
-NOT RUN obligations. This slice cannot promote P2-BUILD until dedicated closed
-receipts satisfy those obligations. The source contract can also carry other
+files and integrity digests. `source-report-command-provenance` is now a required
+pass derived from the closed registry and receipt set. The independent
+`native-toolchain-provenance` and `pinned-clean-build-environment` receipts
+remain explicit P2-BUILD NOT RUN obligations. This slice cannot promote
+P2-BUILD until dedicated closed receipts satisfy those obligations. The source
+contract can also carry other
 named NOT RUN rows, including `portable-runner-attestation`; accepting their
 exact presence for signing never promotes the gate to which they belong.
 

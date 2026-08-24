@@ -164,6 +164,10 @@ $script:SteinReviewRuntimeSourceDefinitions = @(
         path = (Join-Path $PSScriptRoot "Source-Fixture-Registry.json")
     },
     [pscustomobject]@{
+        role = "source-command-registry"
+        path = (Join-Path $PSScriptRoot "Source-Command-Registry.json")
+    },
+    [pscustomobject]@{
         role = "package-tools"
         path = (Join-Path $repoRoot "packaging\windows-msix\PackageTools.ps1")
     }
@@ -265,6 +269,17 @@ $script:SteinPhase2ReviewSourceFixtureRegistry =
     Read-SteinPhase2SourceFixtureRegistry `
         -Path (Join-Path $PSScriptRoot 'Source-Fixture-Registry.json') `
         -ExpectedSha256 ([string]$initialSourceFixtureRegistry[0].sha256)
+$initialSourceCommandRegistry = @(
+    $script:SteinReviewInitialRuntimeSources | Where-Object {
+        [string]$_.role -ceq 'source-command-registry'
+    })
+if ($initialSourceCommandRegistry.Count -ne 1) {
+    throw 'source_command_registry_runtime_source_missing'
+}
+$script:SteinPhase2ReviewSourceCommandRegistry =
+    Read-SteinPhase2SourceCommandRegistry `
+        -Path (Join-Path $PSScriptRoot 'Source-Command-Registry.json') `
+        -ExpectedSha256 ([string]$initialSourceCommandRegistry[0].sha256)
 $script:SteinReviewArtifactCache = @{}
 $script:SteinReviewAttachmentFiles = @{}
 $script:SteinReviewCollectorRuntimeSourceFiles = @{}
@@ -924,6 +939,10 @@ function Assert-SteinReviewGenerator {
             path = "scripts/windows/phase2/Source-Fixture-Registry.json"
         },
         [pscustomobject]@{
+            role = "source-command-registry"
+            path = "scripts/windows/phase2/Source-Command-Registry.json"
+        },
+        [pscustomobject]@{
             role = "phase2-status"
             path = "scripts/windows/phase2/Status.ps1"
         }
@@ -1468,7 +1487,10 @@ function Read-SteinReviewNativeFixture {
         -EvidenceSpecification $script:SteinPhase2ReviewEvidenceSpecification.specification `
         -SourceFixtureRegistry $script:SteinPhase2ReviewSourceFixtureRegistry.value `
         -SourceFixtureRegistrySha256 `
-            ([string]$script:SteinPhase2ReviewSourceFixtureRegistry.sha256)
+            ([string]$script:SteinPhase2ReviewSourceFixtureRegistry.sha256) `
+        -SourceCommandRegistry $script:SteinPhase2ReviewSourceCommandRegistry.value `
+        -SourceCommandRegistrySha256 `
+            ([string]$script:SteinPhase2ReviewSourceCommandRegistry.sha256)
     if ([string]$Metadata.gate_id -ceq "P2-PORTABLE-FIXTURE") {
         $linuxPath = $UnderlyingPaths[[string]$fixture.bindings.linux_artifact.artifact_id]
         if ([string]::IsNullOrWhiteSpace($linuxPath)) {

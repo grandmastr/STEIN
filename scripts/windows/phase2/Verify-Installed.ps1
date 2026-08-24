@@ -157,6 +157,10 @@ $script:SteinInstalledRuntimeSourceDefinitions = @(
         role = "source-fixture-registry"
         path = (Join-Path $PSScriptRoot "Source-Fixture-Registry.json")
     },
+    [pscustomobject]@{
+        role = "source-command-registry"
+        path = (Join-Path $PSScriptRoot "Source-Command-Registry.json")
+    },
     [pscustomobject]@{ role = "phase2-status"; path = (Join-Path $PSScriptRoot "Status.ps1") },
     [pscustomobject]@{
         role = "package-tools"
@@ -269,6 +273,16 @@ if ($initialSourceFixtureRegistry.Count -ne 1) {
 $script:SteinPhase2SourceFixtureRegistry = Read-SteinPhase2SourceFixtureRegistry `
     -Path (Join-Path $PSScriptRoot 'Source-Fixture-Registry.json') `
     -ExpectedSha256 ([string]$initialSourceFixtureRegistry[0].sha256)
+$initialSourceCommandRegistry = @(
+    $script:SteinInstalledInitialRuntimeSources | Where-Object {
+        [string]$_.role -ceq 'source-command-registry'
+    })
+if ($initialSourceCommandRegistry.Count -ne 1) {
+    throw 'source_command_registry_runtime_source_missing'
+}
+$script:SteinPhase2SourceCommandRegistry = Read-SteinPhase2SourceCommandRegistry `
+    -Path (Join-Path $PSScriptRoot 'Source-Command-Registry.json') `
+    -ExpectedSha256 ([string]$initialSourceCommandRegistry[0].sha256)
 $script:SteinInstalledChecks = New-Object Collections.Generic.List[object]
 $script:SteinInstalledAttachments = @()
 $script:SteinInstalledExternalEvidenceFiles = @{}
@@ -975,7 +989,10 @@ function Read-SteinInstalledAttachments {
                 -EvidenceSpecification $script:SteinPhase2EvidenceSpecification.specification `
                 -SourceFixtureRegistry $script:SteinPhase2SourceFixtureRegistry.value `
                 -SourceFixtureRegistrySha256 `
-                    ([string]$script:SteinPhase2SourceFixtureRegistry.sha256)
+                    ([string]$script:SteinPhase2SourceFixtureRegistry.sha256) `
+                -SourceCommandRegistry $script:SteinPhase2SourceCommandRegistry.value `
+                -SourceCommandRegistrySha256 `
+                    ([string]$script:SteinPhase2SourceCommandRegistry.sha256)
             if ($gateId -ceq "P2-PORTABLE-FIXTURE") {
                 $linuxPath = $underlyingArtifactPaths[
                     [string]$nativeResult.bindings.linux_artifact.artifact_id]

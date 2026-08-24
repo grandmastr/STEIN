@@ -1047,6 +1047,15 @@ function Get-SteinPackageSourceFixtureTreeBinding {
     }
 }
 
+function Get-SteinPackageSourceCommandCandidateBinding {
+    param([Parameter(Mandatory = $true)] $Snapshot)
+
+    # Command execution is bound to the canonical Git tree. The source runner
+    # separately locks every worktree file and proves that each raw stream is
+    # either the exact blob or differs only by CRLF-to-LF checkout conversion.
+    return Get-SteinPackageSourceFixtureTreeBinding -Snapshot $Snapshot
+}
+
 function Open-SteinExactCandidateSnapshotLocks {
     param(
         [Parameter(Mandatory = $true)] $Snapshot,
@@ -1915,10 +1924,207 @@ function Resolve-SteinPackagePrimaryAndCleanupFailure {
     return $PrimaryFailure
 }
 
+function Test-SteinPackageJsonWhitespace {
+    param([Parameter(Mandatory = $true)][char] $Value)
+
+    return $Value -eq [char]0x20 -or
+        $Value -eq [char]0x09 -or
+        $Value -eq [char]0x0A -or
+        $Value -eq [char]0x0D
+}
+
+function MoveTo-SteinPackageJsonToken {
+    param(
+        [Parameter(Mandatory = $true)][string] $Text,
+        [Parameter(Mandatory = $true)][ref] $Position
+    )
+
+    while ($Position.Value -lt $Text.Length -and
+        (Test-SteinPackageJsonWhitespace -Value $Text[$Position.Value])) {
+        $Position.Value++
+    }
+}
+
+function Read-SteinPackageJsonStringToken {
+    param(
+        [Parameter(Mandatory = $true)][string] $Text,
+        [Parameter(Mandatory = $true)][ref] $Position
+    )
+
+    if ($Position.Value -ge $Text.Length -or
+        $Text[$Position.Value] -cne '"') {
+        throw "A build evidence JSON string is invalid."
+    }
+    $start = [int]$Position.Value
+    $Position.Value++
+    $closed = $false
+    while ($Position.Value -lt $Text.Length) {
+        $character = $Text[$Position.Value]
+        if ([int][char]$character -lt 0x20) {
+            throw "A build evidence JSON string contains a control character."
+        }
+        if ($character -ceq '"') {
+            $Position.Value++
+            $closed = $true
+            break
+        }
+        if ($character -ceq '\') {
+            $Position.Value++
+            if ($Position.Value -ge $Text.Length) {
+                throw "A build evidence JSON escape is incomplete."
+            }
+            $escape = $Text[$Position.Value]
+            if ($escape -ceq 'u') {
+                if ($Position.Value + 4 -ge $Text.Length -or
+                    $Text.Substring($Position.Value + 1, 4) -cnotmatch
+                        '^[0-9a-fA-F]{4}$') {
+                    throw "A build evidence JSON Unicode escape is invalid."
+                }
+                $Position.Value += 5
+                continue
+            }
+            if ($escape -cnotin @('"', '\', '/', 'b', 'f', 'n', 'r', 't')) {
+                throw "A build evidence JSON escape is invalid."
+            }
+            $Position.Value++
+            continue
+        }
+        $Position.Value++
+    }
+    if (-not $closed) {
+        throw "A build evidence JSON string is unterminated."
+    }
+    $raw = $Text.Substring($start, $Position.Value - $start)
+    if ($raw.IndexOf('\') -lt 0) {
+        return $raw.Substring(1, $raw.Length - 2)
+    }
+    $value = $raw | ConvertFrom-Json -ErrorAction Stop
+    if ($value -isnot [string]) {
+        throw "A build evidence JSON string is invalid."
+    }
+    return [string]$value
+}
+
+function Assert-SteinPackageJsonValue {
+    param(
+        [Parameter(Mandatory = $true)][string] $Text,
+        [Parameter(Mandatory = $true)][ref] $Position,
+        [int] $Depth = 0
+    )
+
+    if ($Depth -gt 64) {
+        throw "A build evidence JSON document is nested too deeply."
+    }
+    MoveTo-SteinPackageJsonToken -Text $Text -Position $Position
+    if ($Position.Value -ge $Text.Length) {
+        throw "A build evidence JSON value is missing."
+    }
+    $character = $Text[$Position.Value]
+    if ($character -ceq '"') {
+        $null = Read-SteinPackageJsonStringToken `
+            -Text $Text `
+            -Position $Position
+        return
+    }
+    if ($character -ceq '{') {
+        $Position.Value++
+        $keys = [Collections.Generic.HashSet[string]]::new(
+            [StringComparer]::Ordinal)
+        MoveTo-SteinPackageJsonToken -Text $Text -Position $Position
+        if ($Position.Value -lt $Text.Length -and
+            $Text[$Position.Value] -ceq '}') {
+            $Position.Value++
+            return
+        }
+        while ($true) {
+            MoveTo-SteinPackageJsonToken -Text $Text -Position $Position
+            $key = Read-SteinPackageJsonStringToken `
+                -Text $Text `
+                -Position $Position
+            if (-not $keys.Add($key)) {
+                throw "A build evidence JSON object contains a duplicate key."
+            }
+            MoveTo-SteinPackageJsonToken -Text $Text -Position $Position
+            if ($Position.Value -ge $Text.Length -or
+                $Text[$Position.Value] -cne ':') {
+                throw "A build evidence JSON object is missing a colon."
+            }
+            $Position.Value++
+            Assert-SteinPackageJsonValue `
+                -Text $Text `
+                -Position $Position `
+                -Depth ($Depth + 1)
+            MoveTo-SteinPackageJsonToken -Text $Text -Position $Position
+            if ($Position.Value -ge $Text.Length) {
+                throw "A build evidence JSON object is unterminated."
+            }
+            if ($Text[$Position.Value] -ceq '}') {
+                $Position.Value++
+                return
+            }
+            if ($Text[$Position.Value] -cne ',') {
+                throw "A build evidence JSON object delimiter is invalid."
+            }
+            $Position.Value++
+        }
+    }
+    if ($character -ceq '[') {
+        $Position.Value++
+        MoveTo-SteinPackageJsonToken -Text $Text -Position $Position
+        if ($Position.Value -lt $Text.Length -and
+            $Text[$Position.Value] -ceq ']') {
+            $Position.Value++
+            return
+        }
+        while ($true) {
+            Assert-SteinPackageJsonValue `
+                -Text $Text `
+                -Position $Position `
+                -Depth ($Depth + 1)
+            MoveTo-SteinPackageJsonToken -Text $Text -Position $Position
+            if ($Position.Value -ge $Text.Length) {
+                throw "A build evidence JSON array is unterminated."
+            }
+            if ($Text[$Position.Value] -ceq ']') {
+                $Position.Value++
+                return
+            }
+            if ($Text[$Position.Value] -cne ',') {
+                throw "A build evidence JSON array delimiter is invalid."
+            }
+            $Position.Value++
+        }
+    }
+    $start = [int]$Position.Value
+    while ($Position.Value -lt $Text.Length -and
+        $Text[$Position.Value] -cnotin @(',', '}', ']') -and
+        -not (Test-SteinPackageJsonWhitespace -Value $Text[$Position.Value])) {
+        $Position.Value++
+    }
+    if ($Position.Value -le $start -or
+        $Text.Substring($start, $Position.Value - $start) -cnotmatch
+            '^(?:true|false|null|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)$') {
+        throw "A build evidence JSON primitive is invalid."
+    }
+}
+
+function Assert-SteinPackageJsonUniqueObjectKeys {
+    param([Parameter(Mandatory = $true)][string] $Text)
+
+    $position = 0
+    Assert-SteinPackageJsonValue -Text $Text -Position ([ref]$position)
+    MoveTo-SteinPackageJsonToken -Text $Text -Position ([ref]$position)
+    if ($position -ne $Text.Length) {
+        throw "A build evidence JSON document has trailing content."
+    }
+}
+
 function Read-SteinPackageLockedJson {
     param(
         [Parameter(Mandatory = $true)][string] $Path,
-        [Parameter(Mandatory = $true)][long] $MaximumBytes
+        [Parameter(Mandatory = $true)][long] $MaximumBytes,
+        [switch] $RejectDuplicateKeys,
+        [switch] $PreserveDateStrings
     )
 
     $stream = [IO.FileStream]::new(
@@ -1952,8 +2158,24 @@ function Read-SteinPackageLockedJson {
             $sha256.Dispose()
         }
         $json = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+        if ($RejectDuplicateKeys) {
+            Assert-SteinPackageJsonUniqueObjectKeys -Text $json
+        }
         try {
-            $value = $json | ConvertFrom-Json -ErrorAction Stop
+            $converter = Get-Command ConvertFrom-Json -CommandType Cmdlet `
+                -ErrorAction Stop
+            if ($PreserveDateStrings -and
+                $converter.Parameters.ContainsKey('DateKind')) {
+                $value = $json | ConvertFrom-Json -DateKind String `
+                    -ErrorAction Stop
+            }
+            elseif ($PreserveDateStrings -and
+                $PSVersionTable.PSEdition -ceq 'Core') {
+                throw "PowerShell Core 7.5 or newer is required for stable evidence dates."
+            }
+            else {
+                $value = $json | ConvertFrom-Json -ErrorAction Stop
+            }
         }
         catch {
             throw "A build evidence input is not valid strict UTF-8 JSON."
@@ -1970,6 +2192,54 @@ function Read-SteinPackageLockedJson {
         if ($null -ne $bytes) {
             [Array]::Clear($bytes, 0, $bytes.Length)
         }
+    }
+}
+
+function Read-SteinPackageLockedArtifact {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [long] $MinimumBytes = 0,
+        [Parameter(Mandatory = $true)][long] $MaximumBytes
+    )
+
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        [long]$item.Length -lt $MinimumBytes -or
+        [long]$item.Length -gt $MaximumBytes) {
+        throw "A build evidence artifact is outside its closed file contract."
+    }
+    $stream = [IO.FileStream]::new(
+        $item.FullName,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read)
+    try {
+        if ([long]$stream.Length -ne [long]$item.Length -or
+            [long]$stream.Length -lt $MinimumBytes -or
+            [long]$stream.Length -gt $MaximumBytes) {
+            throw "A build evidence artifact changed during capture."
+        }
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $digest = [BitConverter]::ToString(
+                $sha256.ComputeHash($stream)).Replace(
+                '-', '').ToLowerInvariant()
+        }
+        finally {
+            $sha256.Dispose()
+        }
+        if ([long]$stream.Length -ne [long]$item.Length) {
+            throw "A build evidence artifact changed during capture."
+        }
+        return [pscustomobject]@{
+            Path = $item.FullName
+            Size = [long]$stream.Length
+            Sha256 = $digest
+        }
+    }
+    finally {
+        $stream.Dispose()
     }
 }
 
@@ -2093,6 +2363,76 @@ function Get-SteinPackageSourceFixtureRegistryContract {
     }
 }
 
+function Get-SteinPackageSourceCommandRegistryContract {
+    param(
+        [Parameter(Mandatory = $true)][string] $CandidateRoot,
+        [Parameter(Mandatory = $true)] $EvidenceSpecification
+    )
+
+    $candidatePath = Resolve-SteinPackageRegularDirectoryWithAncestors `
+        -Path $CandidateRoot
+    $registryPath = Resolve-SteinPackageRegularFileUnderRoot `
+        -Root $candidatePath `
+        -Path (Join-Path $candidatePath `
+            "scripts\windows\phase2\Source-Command-Registry.json")
+    $registryFile = Read-SteinPackageLockedJson `
+        -Path $registryPath `
+        -MaximumBytes 1048576 `
+        -RejectDuplicateKeys
+    $expectedRegistrySha256 =
+        '9a1bb265a11a3b7ca18d1e8b67a2b1c47f9cb090910a458ca3d41fb221b50cbc'
+    if ([string]$registryFile.Sha256 -cne $expectedRegistrySha256 -or
+        [string]$EvidenceSpecification.source_report_contract.source_command_registry_sha256 `
+            -cne $expectedRegistrySha256) {
+        throw "The signer source-command registry differs from the frozen contract."
+    }
+    try {
+        $validated = Assert-SteinPhase2SourceCommandRegistry `
+            -Registry $registryFile.Value
+    }
+    catch {
+        throw "The signer source-command registry is invalid."
+    }
+    $catalog = $validated.catalog
+    if (@($catalog.Direct).Count -ne 24 -or
+        @($catalog.Grouped).Count -ne 13 -or
+        @($catalog.Derived).Count -ne 2 -or
+        @($catalog.Retained).Count -ne 5 -or
+        @($catalog.Ordered).Count -ne 44 -or
+        [long]$validated.execution_group_count -ne 25) {
+        throw "The signer source-command registry coverage is invalid."
+    }
+    $expectedPass = @(
+        @($catalog.Direct) + @($catalog.Grouped) + @($catalog.Derived))
+    $expectedNotRun = @($catalog.Retained)
+    $contractPass = @(
+        $EvidenceSpecification.source_report_contract.required_pass_check_ids)
+    $contractNotRun = @(
+        $EvidenceSpecification.source_report_contract.allowed_not_run_check_ids)
+    [Array]::Sort($expectedPass, [StringComparer]::Ordinal)
+    [Array]::Sort($expectedNotRun, [StringComparer]::Ordinal)
+    [Array]::Sort($contractPass, [StringComparer]::Ordinal)
+    [Array]::Sort($contractNotRun, [StringComparer]::Ordinal)
+    if ($contractPass.Count -ne 39 -or $contractNotRun.Count -ne 5 -or
+        @(Compare-Object -ReferenceObject $expectedPass `
+                -DifferenceObject $contractPass -CaseSensitive).Count -ne 0 -or
+        @(Compare-Object -ReferenceObject $expectedNotRun `
+                -DifferenceObject $contractNotRun -CaseSensitive).Count -ne 0) {
+        throw "The signer source-command registry and source-report contract disagree."
+    }
+    return [pscustomobject]@{
+        Registry = $registryFile.Value
+        RegistrySha256 = [string]$registryFile.Sha256
+        Catalog = $catalog
+        Checks = @($validated.checks)
+        ExecutedChecks = @($validated.checks | Where-Object {
+                [string]$_.category -cin @(
+                    'direct_execution', 'grouped_fixture_execution')
+            })
+        ExecutionGroupCount = 25
+    }
+}
+
 function Get-SteinPackageCanonicalSourceChecksDigest {
     param(
         [Parameter(Mandatory = $true)][object[]] $Checks,
@@ -2114,6 +2454,26 @@ function Get-SteinPackageCanonicalSourceChecksDigest {
                     status = [string]$check.status
                     initial_provenance_sha256 = [string]$check.initial_provenance_sha256
                     completed_provenance_sha256 = [string]$check.completed_provenance_sha256
+                    failure_summary = $check.failure_summary
+            })
+            continue
+        }
+        if ([string]$check.id -ceq "source-report-command-provenance") {
+            $canonical.Add([ordered]@{
+                    id = [string]$check.id
+                    status = [string]$check.status
+                    derivation = [string]$check.derivation
+                    registry_sha256 = [string]$check.registry_sha256
+                    runner_sha256 = [string]$check.runner_sha256
+                    executed_check_count = $check.executed_check_count
+                    execution_group_count = $check.execution_group_count
+                    source_command_receipt_index =
+                        $check.source_command_receipt_index
+                    source_command_receipt_index_artifact = [ordered]@{
+                        path = [string]$check.source_command_receipt_index_artifact.path
+                        size = $check.source_command_receipt_index_artifact.size
+                        sha256 = [string]$check.source_command_receipt_index_artifact.sha256
+                    }
                     failure_summary = $check.failure_summary
                 })
             continue
@@ -2150,6 +2510,12 @@ function Get-SteinPackageCanonicalSourceChecksDigest {
                     sha256 = [string]$check.stderr.sha256
                 }
             }
+        $canonicalCheck.source_command_receipt = $check.source_command_receipt
+        $canonicalCheck.source_command_receipt_artifact = [ordered]@{
+            path = [string]$check.source_command_receipt_artifact.path
+            size = $check.source_command_receipt_artifact.size
+            sha256 = [string]$check.source_command_receipt_artifact.sha256
+        }
         if ($fixtureSet.Contains([string]$check.id)) {
             $canonicalCheck.source_fixture_receipt = $check.source_fixture_receipt
             $canonicalCheck.source_fixture_receipt_artifact = [ordered]@{
@@ -2344,7 +2710,9 @@ function Assert-SteinPackageSourceFixtureCheckContract {
             -Path $artifactPath
         $artifactRead = Read-SteinPackageLockedJson `
             -Path $artifactPath `
-            -MaximumBytes ([int]$descriptorCase.MaximumBytes)
+            -MaximumBytes ([int]$descriptorCase.MaximumBytes) `
+            -RejectDuplicateKeys `
+            -PreserveDateStrings
         if ([long]$artifactRead.Size -ne [long]$descriptor.size -or
             [string]$artifactRead.Sha256 -cne [string]$descriptor.sha256) {
             throw "A signer source-fixture artifact differs from its descriptor."
@@ -2436,6 +2804,7 @@ function Assert-SteinPackageSourceReportCheckContract {
         [Parameter(Mandatory = $true)] $Checks,
         [Parameter(Mandatory = $true)] $Contract,
         [Parameter(Mandatory = $true)] $FixtureContract,
+        [Parameter(Mandatory = $true)] $CommandContract,
         [Parameter(Mandatory = $true)] $SourceReport,
         [Parameter(Mandatory = $true)] $EvidenceSpecification,
         [string] $CandidateRoot,
@@ -2451,11 +2820,14 @@ function Assert-SteinPackageSourceReportCheckContract {
     Assert-SteinPackageJsonShape -Value $Contract `
         -Description "The signer source-report check contract" `
         -ExpectedProperties @(
-            "source_fixture_registry_sha256", "required_pass_check_ids",
-            "allowed_not_run_check_ids", "required_generator_paths")
+            "source_fixture_registry_sha256", "source_command_registry_sha256",
+            "required_pass_check_ids", "allowed_not_run_check_ids",
+            "required_generator_paths")
     if ([string]$Contract.source_fixture_registry_sha256 -cne
-        [string]$FixtureContract.RegistrySha256) {
-        throw "The signer source-report contract has an invalid fixture-registry binding."
+            [string]$FixtureContract.RegistrySha256 -or
+        [string]$Contract.source_command_registry_sha256 -cne
+            [string]$CommandContract.RegistrySha256) {
+        throw "The signer source-report contract has an invalid registry binding."
     }
     $requiredIds = @($Contract.required_pass_check_ids)
     $allowedNotRunIds = @($Contract.allowed_not_run_check_ids)
@@ -2530,6 +2902,32 @@ function Assert-SteinPackageSourceReportCheckContract {
             }
             continue
         }
+        if ($id -ceq "source-report-command-provenance") {
+            Assert-SteinPackageJsonShape -Value $check `
+                -Description "The source-command provenance check" `
+                -ExpectedProperties @(
+                    "id", "status", "derivation", "registry_sha256",
+                    "runner_sha256", "executed_check_count",
+                    "execution_group_count", "source_command_receipt_index",
+                    "source_command_receipt_index_artifact", "failure_summary")
+            if ([string]$check.status -cne "pass" -or
+                [string]$check.derivation -cne
+                    "exact_registry_and_receipt_coverage" -or
+                [string]$check.registry_sha256 -cne
+                    [string]$CommandContract.RegistrySha256 -or
+                -not (Test-SteinPackageSha256Value `
+                    -Value ([string]$check.runner_sha256)) -or
+                ($check.executed_check_count -isnot [int] -and
+                    $check.executed_check_count -isnot [long]) -or
+                [long]$check.executed_check_count -ne 37 -or
+                ($check.execution_group_count -isnot [int] -and
+                    $check.execution_group_count -isnot [long]) -or
+                [long]$check.execution_group_count -ne 25 -or
+                $null -ne $check.failure_summary) {
+                throw "The source-command provenance check is invalid."
+            }
+            continue
+        }
         if ($status -ceq "not_run") {
             Assert-SteinPackageJsonShape -Value $check `
                 -Description "A source-verification not-run check" `
@@ -2539,7 +2937,6 @@ function Assert-SteinPackageSourceReportCheckContract {
                 "no-leaks-producer-workflow" = "Candidate-owned installed artifact producer is not implemented."
                 "pinned-clean-build-environment" = "Authenticated immutable candidate input and fresh dependency, build, and output isolation are not implemented for every source check."
                 "portable-runner-attestation" = "Authenticated GitHub artifact attestation tied to repository, workflow, commit, and artifact digest is not implemented."
-                "source-report-command-provenance" = "Independent closed command/argument/working-directory provenance for every source-report check is not implemented."
                 "windows-native-ignored-fixtures" = "Requires explicit native-fixture workflow support; interactive native fixtures remain unimplemented source evidence."
             }
             $reason = [string]$check.reason
@@ -2553,7 +2950,8 @@ function Assert-SteinPackageSourceReportCheckContract {
         $expectedPassingProperties = @(
             "id", "status", "executable", "arguments", "working_directory",
             "started_at", "completed_at", "duration_ms", "exit_code",
-            "failure_summary", "stdout", "stderr")
+            "failure_summary", "stdout", "stderr", "source_command_receipt",
+            "source_command_receipt_artifact")
         $isFixtureCheck = $fixtureSet.Contains($id)
         if ($isFixtureCheck) {
             $expectedPassingProperties += @(
@@ -2603,9 +3001,12 @@ function Assert-SteinPackageSourceReportCheckContract {
                         $logRelativePath.Replace(
                             '/',
                             [IO.Path]::DirectorySeparatorChar))))
+            $expectedLogDirectory = [IO.Path]::GetFullPath((Join-Path `
+                    $ReportDirectory `
+                    'source-command-logs'))
             if (-not [string]::Equals(
                     (Split-Path -Parent $logPath),
-                    $ReportDirectory,
+                    $expectedLogDirectory,
                     [StringComparison]::OrdinalIgnoreCase)) {
                 throw "A source-verification process log escaped its report directory."
             }
@@ -2641,6 +3042,315 @@ function Assert-SteinPackageSourceReportCheckContract {
         AllowedNotRunCount = $allowedNotRunSet.Count
         ExactCheckCount = $seen.Count
     }
+}
+
+function Assert-SteinPackageSourceCommandEvidenceFiles {
+    param(
+        [Parameter(Mandatory = $true)] $SourceReport,
+        [Parameter(Mandatory = $true)] $EvidenceSpecification,
+        [Parameter(Mandatory = $true)] $CommandContract,
+        [Parameter(Mandatory = $true)] $SourceGeneratorByPath,
+        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
+        [Parameter(Mandatory = $true)][string] $ReportDirectory,
+        [Parameter(Mandatory = $true)][string] $ExpectedCandidateGitCommit,
+        [Parameter(Mandatory = $true)][string] $ExpectedCandidateGitTree,
+        $CandidateCommandBinding,
+        [Parameter(Mandatory = $true)][bool] $RequireCandidateGrounding
+    )
+
+    $repositoryPath = Resolve-SteinPackageRegularDirectoryWithAncestors `
+        -Path $RepositoryRoot
+    $reportPath = Resolve-SteinPackageRegularDirectoryWithAncestors `
+        -Path $ReportDirectory
+    $repositoryPrefix =
+        "$repositoryPath$([IO.Path]::DirectorySeparatorChar)"
+    if (-not $reportPath.StartsWith(
+            $repositoryPrefix,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The signer source-command evidence directory escaped the repository."
+    }
+    $evidenceRootRelative = $reportPath.Substring(
+        $repositoryPrefix.Length).Replace('\', '/')
+    if ($evidenceRootRelative -cnotmatch
+        '^artifacts/evidence/phase-2/source-[A-Za-z0-9._-]{1,96}$') {
+        throw "The signer source-command evidence root is invalid."
+    }
+
+    $binding = [pscustomobject]@{
+        bindings = [pscustomobject]@{
+            commit = [pscustomobject]@{
+                object_id = $ExpectedCandidateGitCommit
+                tree_id = $ExpectedCandidateGitTree
+            }
+        }
+    }
+    try {
+        $null = Assert-SteinPhase2SourceCommandEvidence `
+            -EvidenceResult $binding `
+            -SourceReport $SourceReport `
+            -EvidenceSpecification $EvidenceSpecification `
+            -SourceCommandRegistry $CommandContract.Registry `
+            -SourceCommandRegistrySha256 `
+                ([string]$CommandContract.RegistrySha256) `
+            -SourceGeneratorByPath $SourceGeneratorByPath
+    }
+    catch {
+        throw "The signer source-command receipt contract is invalid."
+    }
+
+    $reportById = @{}
+    foreach ($row in @($SourceReport.checks)) {
+        $reportById[[string]$row.id] = $row
+    }
+    $provenanceRow = $reportById['source-report-command-provenance']
+    $indexDescriptor = $provenanceRow.source_command_receipt_index_artifact
+    $indexPath = Resolve-SteinPackageRegularFileUnderRoot `
+        -Root $reportPath `
+        -Path (Join-Path $reportPath 'source-command-receipts\index.json')
+    $indexFile = Read-SteinPackageLockedJson `
+        -Path $indexPath `
+        -MaximumBytes 1048576 `
+        -RejectDuplicateKeys `
+        -PreserveDateStrings
+    if ([long]$indexFile.Size -ne [long]$indexDescriptor.size -or
+        [string]$indexFile.Sha256 -cne [string]$indexDescriptor.sha256 -or
+        ($indexFile.Value | ConvertTo-Json -Depth 40 -Compress) -cne
+            ($provenanceRow.source_command_receipt_index |
+                ConvertTo-Json -Depth 40 -Compress)) {
+        throw "The signer source-command receipt index differs from its report binding."
+    }
+    $common = $indexFile.Value.bindings
+    Assert-SteinPackageJsonShape `
+        -Value $common `
+        -Description "The signer source-command index binding" `
+        -ExpectedProperties @(
+            'candidate_commit', 'candidate_tree', 'candidate_file_count',
+            'candidate_manifest_sha256', 'registry_sha256', 'runner_sha256',
+            'evidence_root_sha256', 'git_launcher_sha256',
+            'git_resolved_sha256')
+    $gitLauncherSha256 = [string](
+        $SourceReport.provenance.toolchain.git.executable_sha256)
+    $gitResolvedSha256 = [string](
+        $SourceReport.provenance.toolchain.git.resolved_executable_sha256)
+    if ([string]$common.candidate_commit -cne $ExpectedCandidateGitCommit -or
+        [string]$common.candidate_tree -cne $ExpectedCandidateGitTree -or
+        (Get-SteinPackageTextSha256 -Value $evidenceRootRelative) -cne
+            [string]$common.evidence_root_sha256 -or
+        -not (Test-SteinPackageSha256Value -Value $gitLauncherSha256) -or
+        -not (Test-SteinPackageSha256Value -Value $gitResolvedSha256) -or
+        [string]$common.git_launcher_sha256 -cne $gitLauncherSha256 -or
+        [string]$common.git_resolved_sha256 -cne $gitResolvedSha256) {
+        throw "The signer source-command evidence root or candidate binding is invalid."
+    }
+    if ($RequireCandidateGrounding) {
+        if ($null -eq $CandidateCommandBinding -or
+            [long]$common.candidate_file_count -ne
+                [long]$CandidateCommandBinding.FileCount -or
+            [string]$common.candidate_manifest_sha256 -cne
+                [string]$CandidateCommandBinding.ManifestSha256) {
+            throw "The signer source-command evidence is not grounded in the locked candidate tree."
+        }
+    }
+
+    $receiptDirectory = Resolve-SteinPackageRegularDirectoryWithAncestors `
+        -Path (Join-Path $reportPath 'source-command-receipts')
+    $logDirectory = Resolve-SteinPackageRegularDirectoryWithAncestors `
+        -Path (Join-Path $reportPath 'source-command-logs')
+    $fixtureDirectory = Resolve-SteinPackageRegularDirectoryWithAncestors `
+        -Path (Join-Path $reportPath 'source-fixtures')
+    if (-not [string]::Equals(
+            (Split-Path -Parent $receiptDirectory),
+            $reportPath,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals(
+            (Split-Path -Parent $logDirectory),
+            $reportPath,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals(
+            (Split-Path -Parent $fixtureDirectory),
+            $reportPath,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "A signer source-command evidence directory escaped its report root."
+    }
+
+    $expectedReceiptNames = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    $null = $expectedReceiptNames.Add('index.json')
+    $expectedLogNames = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    $expectedFixturePaths = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    $validatedFixtureArtifacts = @{}
+    $executedChecks = @($CommandContract.ExecutedChecks)
+    $indexReceipts = @($indexFile.Value.receipts)
+    if ($executedChecks.Count -ne 37 -or $indexReceipts.Count -ne 37) {
+        throw "The signer source-command receipt coverage is incomplete."
+    }
+    for ($position = 0; $position -lt $executedChecks.Count; $position++) {
+        $definition = $executedChecks[$position]
+        $id = [string]$definition.id
+        $row = $reportById[$id]
+        $receiptDescriptor = $row.source_command_receipt_artifact
+        $receiptName = "$id.receipt.json"
+        if (-not $expectedReceiptNames.Add($receiptName) -or
+            [string]$receiptDescriptor.path -cne
+                "source-command-receipts/$receiptName") {
+            throw "A signer source-command receipt path is invalid."
+        }
+        $receiptPath = Resolve-SteinPackageRegularFileUnderRoot `
+            -Root $receiptDirectory `
+            -Path (Join-Path $receiptDirectory $receiptName)
+        $receiptFile = Read-SteinPackageLockedJson `
+            -Path $receiptPath `
+            -MaximumBytes 1048576 `
+            -RejectDuplicateKeys `
+            -PreserveDateStrings
+        if ([long]$receiptFile.Size -ne [long]$receiptDescriptor.size -or
+            [string]$receiptFile.Sha256 -cne [string]$receiptDescriptor.sha256 -or
+            [string]$receiptFile.Sha256 -cne
+                [string]$indexReceipts[$position].sha256 -or
+            [long]$receiptFile.Size -ne
+                [long]$indexReceipts[$position].size -or
+            ($receiptFile.Value | ConvertTo-Json -Depth 40 -Compress) -cne
+                ($row.source_command_receipt |
+                    ConvertTo-Json -Depth 40 -Compress)) {
+            throw "A signer source-command receipt differs from its report binding."
+        }
+
+        $receipt = $receiptFile.Value
+        Assert-SteinPackageJsonShape `
+            -Value $receipt.bindings `
+            -Description "A signer source-command receipt binding" `
+            -ExpectedProperties @(
+                'candidate_commit', 'candidate_tree', 'candidate_file_count',
+                'candidate_manifest_sha256', 'registry_sha256', 'runner_sha256',
+                'evidence_root_sha256', 'git_launcher_sha256',
+                'git_resolved_sha256', 'check_definition_sha256',
+                'execution_group_count')
+        if ([string]$receipt.bindings.git_launcher_sha256 -cne
+                [string]$common.git_launcher_sha256 -or
+            [string]$receipt.bindings.git_resolved_sha256 -cne
+                [string]$common.git_resolved_sha256) {
+            throw "A signer source-command receipt has a divergent Git binding."
+        }
+        $logLeaf = if ([string]$definition.category -ceq
+                'grouped_fixture_execution') {
+            'closed-source-fixture-suite'
+        }
+        else {
+            $id
+        }
+        foreach ($streamName in @('stdout', 'stderr')) {
+            $logName = "$logLeaf.$streamName.txt"
+            $null = $expectedLogNames.Add($logName)
+            $logDescriptor = $receipt.execution.$streamName
+            if ([string]$logDescriptor.path -cne
+                "source-command-logs/$logName") {
+                throw "A signer source-command log path is invalid."
+            }
+            $logPath = Resolve-SteinPackageRegularFileUnderRoot `
+                -Root $logDirectory `
+                -Path (Join-Path $logDirectory $logName) `
+                -AllowEmpty
+            $logFile = Read-SteinPackageLockedArtifact `
+                -Path $logPath `
+                -MinimumBytes 0 `
+                -MaximumBytes 16777216
+            if ([long]$logFile.Size -ne [long]$logDescriptor.size -or
+                [string]$logFile.Sha256 -cne [string]$logDescriptor.sha256) {
+                throw "A signer source-command log differs from its receipt binding."
+            }
+        }
+
+        if ([string]$definition.category -ceq
+            'grouped_fixture_execution') {
+            $fixtureDescriptors = @(
+                [pscustomobject]@{
+                    Path = 'source-fixtures/index.json'
+                    Descriptor = $row.source_fixture_suite_index
+                },
+                [pscustomobject]@{
+                    Path = [string]$definition.fixture_receipt_path
+                    Descriptor = $row.source_fixture_receipt_artifact
+                })
+            foreach ($fixtureDescriptor in $fixtureDescriptors) {
+                $relative = [string]$fixtureDescriptor.Path
+                if (-not $relative.StartsWith(
+                        'source-fixtures/',
+                        [StringComparison]::Ordinal) -or
+                    $relative.Substring('source-fixtures/'.Length).IndexOf(
+                        '/') -ge 0 -or
+                    $relative.IndexOf('\') -ge 0) {
+                    throw "A grouped signer source-command artifact path is invalid."
+                }
+                $null = $expectedFixturePaths.Add($relative)
+                if ($validatedFixtureArtifacts.ContainsKey($relative)) {
+                    continue
+                }
+                $artifactPath = Resolve-SteinPackageRegularFileUnderRoot `
+                    -Root $reportPath `
+                    -Path (Join-Path $reportPath (
+                            $relative.Replace(
+                                '/', [IO.Path]::DirectorySeparatorChar)))
+                $artifactFile = Read-SteinPackageLockedArtifact `
+                    -Path $artifactPath `
+                    -MinimumBytes 1 `
+                    -MaximumBytes 4194304
+                if ([long]$artifactFile.Size -ne
+                        [long]$fixtureDescriptor.Descriptor.size -or
+                    [string]$artifactFile.Sha256 -cne
+                        [string]$fixtureDescriptor.Descriptor.sha256) {
+                    throw "A grouped signer source-command artifact differs from its receipt binding."
+                }
+                $validatedFixtureArtifacts[$relative] = $true
+            }
+        }
+    }
+
+    $actualReceiptEntries = @(Get-ChildItem `
+            -LiteralPath $receiptDirectory -Force -ErrorAction Stop)
+    if ($expectedReceiptNames.Count -ne 38 -or
+        $actualReceiptEntries.Count -ne $expectedReceiptNames.Count) {
+        throw "The signer source-command receipt directory is not closed."
+    }
+    foreach ($entry in $actualReceiptEntries) {
+        if ($entry.PSIsContainer -or
+            (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            -not $expectedReceiptNames.Contains([string]$entry.Name)) {
+            throw "The signer source-command receipt directory is not closed."
+        }
+    }
+    $actualLogEntries = @(Get-ChildItem `
+            -LiteralPath $logDirectory -Force -ErrorAction Stop)
+    if ($expectedLogNames.Count -ne 50 -or
+        $actualLogEntries.Count -ne $expectedLogNames.Count) {
+        throw "The signer source-command log directory is not closed."
+    }
+    foreach ($entry in $actualLogEntries) {
+        if ($entry.PSIsContainer -or
+            (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            -not $expectedLogNames.Contains([string]$entry.Name)) {
+            throw "The signer source-command log directory is not closed."
+        }
+    }
+    $actualFixtureEntries = @(Get-ChildItem `
+            -LiteralPath $fixtureDirectory -Force -ErrorAction Stop)
+    if ($expectedFixturePaths.Count -ne 14 -or
+        $validatedFixtureArtifacts.Count -ne $expectedFixturePaths.Count) {
+        throw "The grouped signer source-command artifact coverage is incomplete."
+    }
+    if ($actualFixtureEntries.Count -ne $expectedFixturePaths.Count) {
+        throw "The signer source-fixture directory is not closed."
+    }
+    foreach ($entry in $actualFixtureEntries) {
+        $relative = "source-fixtures/$([string]$entry.Name)"
+        if ($entry.PSIsContainer -or
+            (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            -not $expectedFixturePaths.Contains($relative)) {
+            throw "The signer source-fixture directory is not closed."
+        }
+    }
+    return $true
 }
 
 function Get-SteinVerifiedSourceBuildBinding {
@@ -2682,6 +3392,7 @@ function Get-SteinVerifiedSourceBuildBinding {
     $candidatePath = Resolve-SteinPackageRegularDirectoryWithAncestors `
         -Path $CandidateRoot
     $candidateTreeBinding = $null
+    $candidateCommandBinding = $null
     if ($requireCandidateGrounding) {
         $snapshotPath = Resolve-SteinPackageRegularDirectoryWithAncestors `
             -Path ([string]$CandidateSnapshot.Root)
@@ -2694,6 +3405,8 @@ function Get-SteinVerifiedSourceBuildBinding {
             throw "The authoritative candidate snapshot identity is invalid."
         }
         $candidateTreeBinding = Get-SteinPackageSourceFixtureTreeBinding `
+            -Snapshot $CandidateSnapshot
+        $candidateCommandBinding = Get-SteinPackageSourceCommandCandidateBinding `
             -Snapshot $CandidateSnapshot
     }
     $evidenceRoot = Join-Path $repositoryPath "artifacts\evidence\phase-2"
@@ -2736,8 +3449,15 @@ function Get-SteinVerifiedSourceBuildBinding {
         throw "The source report and root anchor are not one exact evidence pair."
     }
 
-    $reportFile = Read-SteinPackageLockedJson -Path $reportPath -MaximumBytes 16777216
-    $anchorFile = Read-SteinPackageLockedJson -Path $anchorPath -MaximumBytes 65536
+    $reportFile = Read-SteinPackageLockedJson `
+        -Path $reportPath `
+        -MaximumBytes 16777216 `
+        -RejectDuplicateKeys `
+        -PreserveDateStrings
+    $anchorFile = Read-SteinPackageLockedJson `
+        -Path $anchorPath `
+        -MaximumBytes 65536 `
+        -RejectDuplicateKeys
     if ($reportFile.Sha256 -cne $ExpectedSourceVerificationSha256 -or
         $anchorFile.Sha256 -cne $ExpectedSourceRootAnchorSha256) {
         throw "A source-evidence file differs from its operator-pinned digest."
@@ -2748,7 +3468,8 @@ function Get-SteinVerifiedSourceBuildBinding {
         -Path (Join-Path $candidatePath "scripts\windows\phase2\Evidence-Spec.json")
     $evidenceSpecFile = Read-SteinPackageLockedJson `
         -Path $evidenceSpecPath `
-        -MaximumBytes 1048576
+        -MaximumBytes 1048576 `
+        -RejectDuplicateKeys
     $evidenceSpec = $evidenceSpecFile.Value
     if (($evidenceSpec.schema_version -isnot [int] -and
             $evidenceSpec.schema_version -isnot [long]) -or
@@ -2794,14 +3515,40 @@ function Get-SteinVerifiedSourceBuildBinding {
     $requiredGeneratorPaths = @(
         $evidenceSpec.source_report_contract.required_generator_paths)
     $generatorFiles = @($report.integrity.generator.files)
-    if ($requiredGeneratorPaths.Count -le 0 -or
-        $requiredGeneratorPaths.Count -gt 64 -or
+    $expectedGeneratorPaths = @(
+        'scripts/windows/phase2/Verify-Source.ps1',
+        'scripts/windows/phase2/Verify-Source.cmd',
+        'scripts/windows/phase2/Source-Evidence.ps1',
+        'scripts/windows/phase2/Source-Command-Registry.json',
+        'scripts/windows/phase2/Run-Source-Check.ps1',
+        'scripts/windows/phase2/Test-SourceCommand.ps1',
+        'scripts/windows/phase2/Source-Fixture-Registry.json',
+        'scripts/windows/phase2/Run-Source-Fixture.ps1',
+        'scripts/windows/phase2/Test-SourceFixture.ps1',
+        'scripts/windows/phase2/Test-VerifySource.ps1',
+        'scripts/windows/phase2/Review-Installed.ps1',
+        'scripts/windows/phase2/Review-Installed.cmd',
+        'scripts/windows/phase2/Test-ReviewInstalled.ps1',
+        'scripts/windows/phase2/Common.ps1',
+        'scripts/windows/phase2/Evidence-Spec.json',
+        'scripts/windows/phase2/Evidence-Contract.ps1',
+        'scripts/windows/phase2/Scan-NoLeaks.ps1',
+        'scripts/windows/phase2/Scan-NoLeaks.cmd',
+        'scripts/windows/phase2/Test-ScanNoLeaks.ps1',
+        'packaging/windows-msix/PackageTools.ps1')
+    if ($requiredGeneratorPaths.Count -ne $expectedGeneratorPaths.Count -or
+        @(Compare-Object `
+                -ReferenceObject $expectedGeneratorPaths `
+                -DifferenceObject $requiredGeneratorPaths `
+                -CaseSensitive `
+                -SyncWindow 0).Count -ne 0 -or
         $generatorFiles.Count -ne $requiredGeneratorPaths.Count) {
         throw "The source-verification generator set is incomplete."
     }
     $generatorPathSet = [Collections.Generic.HashSet[string]]::new(
         [StringComparer]::Ordinal)
     $normalizedGeneratorFiles = New-Object Collections.Generic.List[object]
+    $generatorByPath = @{}
     for ($generatorIndex = 0;
         $generatorIndex -lt $requiredGeneratorPaths.Count;
         $generatorIndex++) {
@@ -2845,6 +3592,7 @@ function Get-SteinVerifiedSourceBuildBinding {
                 size = [long]$generatorFile.size
                 sha256 = [string]$generatorFile.sha256
             })
+        $generatorByPath[$requiredGeneratorPath] = $generatorFile
     }
     $computedGeneratorDigest = Get-SteinPackageTextSha256 `
         -Value ($normalizedGeneratorFiles.ToArray() |
@@ -2854,6 +3602,9 @@ function Get-SteinVerifiedSourceBuildBinding {
         throw "The source-verification generator digest is invalid."
     }
     $fixtureContract = Get-SteinPackageSourceFixtureRegistryContract `
+        -CandidateRoot $candidatePath `
+        -EvidenceSpecification $evidenceSpec
+    $commandContract = Get-SteinPackageSourceCommandRegistryContract `
         -CandidateRoot $candidatePath `
         -EvidenceSpecification $evidenceSpec
 
@@ -2945,6 +3696,7 @@ function Get-SteinVerifiedSourceBuildBinding {
         -Checks $checks `
         -Contract $evidenceSpec.source_report_contract `
         -FixtureContract $fixtureContract `
+        -CommandContract $commandContract `
         -SourceReport $report `
         -EvidenceSpecification $evidenceSpec `
         -CandidateRoot $candidatePath `
@@ -2955,6 +3707,17 @@ function Get-SteinVerifiedSourceBuildBinding {
         -ReportDirectory (Split-Path -Parent $reportPath) `
         -ExpectedCandidateGitCommit $ExpectedCandidateGitCommit `
         -ExpectedCandidateGitTree $ExpectedCandidateGitTree
+    $null = Assert-SteinPackageSourceCommandEvidenceFiles `
+        -SourceReport $report `
+        -EvidenceSpecification $evidenceSpec `
+        -CommandContract $commandContract `
+        -SourceGeneratorByPath $generatorByPath `
+        -RepositoryRoot $repositoryPath `
+        -ReportDirectory (Split-Path -Parent $reportPath) `
+        -ExpectedCandidateGitCommit $ExpectedCandidateGitCommit `
+        -ExpectedCandidateGitTree $ExpectedCandidateGitTree `
+        -CandidateCommandBinding $candidateCommandBinding `
+        -RequireCandidateGrounding $requireCandidateGrounding
     $computedProvenanceDigest = Get-SteinPackageTextSha256 `
         -Value ($report.provenance | ConvertTo-Json -Depth 16 -Compress)
     $computedChecksDigest = Get-SteinPackageCanonicalSourceChecksDigest `
@@ -2973,8 +3736,10 @@ function Get-SteinVerifiedSourceBuildBinding {
     $stability = @($checks | Where-Object {
             [string]$_.id -ceq "source-provenance-stability"
         })
-    if ($checks.Count -le 0 -or
+    if ($checks.Count -ne 44 -or
         $failCount -ne 0 -or
+        $passCount -ne 39 -or
+        $notRunCount -ne 5 -or
         $passCount -ne [int]$report.summary.pass -or
         $failCount -ne [int]$report.summary.fail -or
         $notRunCount -ne [int]$report.summary.not_run -or

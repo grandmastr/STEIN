@@ -151,8 +151,8 @@ not the required `no-leaks-producer-workflow` check and cannot promote
 `not_run` evidence with the bounded reason that the candidate-owned installed
 artifact producer is not implemented.
 
-The same checked-in contract fixes the full 44-row source-report check set (38
-required `pass`; six exact frozen `not_run`) and the exact seventeen generator
+The same checked-in contract fixes the full 44-row source-report check set (39
+required `pass`; five exact frozen `not_run`) and the exact twenty generator
 paths. Source provenance schema 2 records both the
 launcher shims and the rustup-selected Cargo/rustc payload hashes/toolchain ID,
 the pnpm JavaScript entrypoint hash, and both the Git-for-Windows launcher and
@@ -171,21 +171,44 @@ globally unique identities); each receipt binds the candidate tree, semantic
 source bytes/Git blobs, environment, harness binary, exact command, result, and
 suite index.
 
+The frozen source-command registry (`SHA-256
+9a1bb265a11a3b7ca18d1e8b67a2b1c47f9cb090910a458ca3d41fb221b50cbc`)
+defines the category of all 44 report rows and, for the 37 executed rows, the
+exact executable role, ordered argument vector, working directory, environment
+profile, timeout, and execution grouping.
+Twenty-four direct commands and one shared source-fixture suite execution emit
+37 per-check receipts across 25 execution groups and 50 unique bounded logs.
+Their candidate manifest is the canonical Git tree record set
+(`UTF-8 path length:path|mode|blob object ID`). The runner holds every tracked
+worktree file open and proves its raw stream is either the exact blob or differs
+only by bytewise CRLF-to-LF checkout conversion; it rejects non-ordinary index
+flags and active `filter`, `ident`, or `working-tree-encoding` attributes. This
+permits a clean `core.autocrlf=true` Windows checkout without trusting custom
+clean filters or claiming literal raw-byte identity. Every command receipt and
+the suite index also bind the exact Git-for-Windows launcher and resolved payload
+SHA-256 values recorded by source provenance, and both files remain locked while
+candidate stability is checked.
+The verifier independently reopens that closed receipt/index set before deriving
+`source-report-command-provenance=pass`; the package signer rehashes the artifact
+set again, and the installed reviewer validates the embedded exact contract
+through the signed source-report/root chain.
+
 Every source-origin subcheck also requires
 `native-toolchain-provenance=pass`, `pinned-clean-build-environment=pass`, and
-`source-report-command-provenance=pass`. All three remain exact `not_run`
-because authenticated Rust/Git/native dependency closure, immutable isolated
-execution for every non-fixture source check, and independently attested
-commands are not implemented. This blocks all source-backed promotion while
-leaving native-only gates independently reviewable.
+`source-report-command-provenance=pass`. Command provenance now passes through
+the closed registry and receipt set. The other two remain exact `not_run`
+because authenticated Rust/Git/native dependency closure and immutable isolated
+execution for every source check are not implemented. They continue to block
+source-backed promotion while leaving native-only gates independently
+reviewable.
 
 The signed schema-3 build exports and locks the selected Git tree, uses private
 Cargo targets/home and fresh frozen-lockfile renderer output, and signer-binds
 the CLI, desktop executable, and desktop distribution. It remains explicitly
 non-hermetic: `native-toolchain-provenance` and
-`source-report-command-provenance` are `not_run`, so `P2-BUILD` cannot promote
-until the exact native payload/library set and independently closed per-check
-command/argument/working-directory provenance are implemented.
+`pinned-clean-build-environment` are `not_run`, so `P2-BUILD` cannot promote
+until the exact native payload/library set and immutable isolated build
+environment are implemented.
 
 ## Completion ledger
 

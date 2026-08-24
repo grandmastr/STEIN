@@ -120,7 +120,7 @@ function Open-SteinSourceBootstrapBinding {
 function Assert-SteinSourceBootstrapSourcesStable {
     $bindings = @($script:SteinSourceBootstrapBindings)
     $definitions = @($script:SteinSourceBootstrapDefinitions)
-    if ($bindings.Count -ne 4 -or $definitions.Count -ne 4) {
+    if ($bindings.Count -ne 6 -or $definitions.Count -ne 6) {
         throw 'source_bootstrap_source_changed'
     }
     for ($index = 0; $index -lt $bindings.Count; $index++) {
@@ -160,6 +160,14 @@ $script:SteinSourceBootstrapDefinitions = @(
             path = (Join-Path $PSScriptRoot 'Source-Evidence.ps1')
         },
         [pscustomobject]@{
+            role = 'source-command-registry'
+            path = (Join-Path $PSScriptRoot 'Source-Command-Registry.json')
+        },
+        [pscustomobject]@{
+            role = 'source-command-runner'
+            path = (Join-Path $PSScriptRoot 'Run-Source-Check.ps1')
+        },
+        [pscustomobject]@{
             role = 'source-fixture-runner'
             path = (Join-Path $PSScriptRoot 'Run-Source-Fixture.ps1')
         }
@@ -175,8 +183,14 @@ $sourceEvidenceBootstrapBinding = @($script:SteinSourceBootstrapBindings |
     Where-Object { [string]$_.record.role -ceq 'source-evidence' })
 $sourceFixtureRunnerBootstrapBinding = @($script:SteinSourceBootstrapBindings |
     Where-Object { [string]$_.record.role -ceq 'source-fixture-runner' })
+$sourceCommandRegistryBootstrapBinding = @($script:SteinSourceBootstrapBindings |
+    Where-Object { [string]$_.record.role -ceq 'source-command-registry' })
+$sourceCommandRunnerBootstrapBinding = @($script:SteinSourceBootstrapBindings |
+    Where-Object { [string]$_.record.role -ceq 'source-command-runner' })
 if ($sourceEvidenceBootstrapBinding.Count -ne 1 -or
-    $sourceFixtureRunnerBootstrapBinding.Count -ne 1) {
+    $sourceFixtureRunnerBootstrapBinding.Count -ne 1 -or
+    $sourceCommandRegistryBootstrapBinding.Count -ne 1 -or
+    $sourceCommandRunnerBootstrapBinding.Count -ne 1) {
     throw 'source_bootstrap_source_invalid'
 }
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
@@ -193,6 +207,16 @@ if ((Get-SteinSourceBootstrapStreamSha256 `
             -FailureCode 'source_bootstrap_source_changed') -cne
         [string]$sourceFixtureRunnerBootstrapBinding[0].record.sha256) {
     throw 'source_bootstrap_source_changed'
+}
+$sourceCommandRegistryRead = Read-SteinSourceEvidenceCommandRegistry `
+    -RepositoryRoot $repoRoot `
+    -RegistryPath ([string]$sourceCommandRegistryBootstrapBinding[0].full_path)
+if ([long]$sourceCommandRegistryRead.Size -ne
+        [long]$sourceCommandRegistryBootstrapBinding[0].record.size -or
+    [string]$sourceCommandRegistryRead.Sha256 -cne
+        [string]$sourceCommandRegistryBootstrapBinding[0].record.sha256) {
+    $sourceCommandRegistryRead.Stream.Dispose()
+    throw 'source_command_registry_bootstrap_mismatch'
 }
 
 function Resolve-SteinSourceWindowsPowerShell {
@@ -309,145 +333,130 @@ $initialProvenance = Get-SteinSourceEvidenceProvenance `
     -RepositoryRoot $repoRoot `
     -ToolExecutables $toolExecutables
 $initialProvenanceDigest = Get-SteinSourceEvidenceObjectDigest -Value $initialProvenance
-
-function ConvertTo-SteinSafeLeaf {
-    param([Parameter(Mandatory = $true)][string] $Value)
-
-    return ($Value.ToLowerInvariant() -replace "[^a-z0-9._-]", "-")
+$gitLauncherPath = [IO.Path]::GetFullPath([string]$toolExecutables['git'])
+$gitInstallationRoot = [IO.Path]::GetFullPath((Split-Path -Parent (
+            Split-Path -Parent $gitLauncherPath)))
+$gitResolvedPath = [IO.Path]::GetFullPath((Join-Path `
+            $gitInstallationRoot 'mingw64\bin\git.exe'))
+if ([IO.Path]::GetFileName($gitLauncherPath) -cne 'git.exe' -or
+    [IO.Path]::GetFileName((Split-Path -Parent $gitLauncherPath)) -cne 'cmd' -or
+    -not $gitResolvedPath.StartsWith(
+        "$gitInstallationRoot$([IO.Path]::DirectorySeparatorChar)",
+        [StringComparison]::OrdinalIgnoreCase) -or
+    (Get-SteinSourceEvidenceSha256 -Path $gitLauncherPath) -cne
+        [string]$initialProvenance.toolchain.git.executable_sha256 -or
+    (Get-SteinSourceEvidenceSha256 -Path $gitResolvedPath) -cne
+        [string]$initialProvenance.toolchain.git.resolved_executable_sha256) {
+    throw 'source_command_git_provenance_mismatch'
 }
-
-function Get-SteinSha256 {
-    param([Parameter(Mandatory = $true)][string] $Path)
-
-    $stream = [IO.FileStream]::new(
-        $Path,
-        [IO.FileMode]::Open,
-        [IO.FileAccess]::Read,
-        [IO.FileShare]::ReadWrite)
-    try {
-        $sha256 = [Security.Cryptography.SHA256]::Create()
-        try {
-            $digest = $sha256.ComputeHash($stream)
-            return [BitConverter]::ToString($digest).Replace("-", "").ToLowerInvariant()
-        }
-        finally {
-            $sha256.Dispose()
-        }
-    }
-    finally {
-        $stream.Dispose()
-    }
+$candidateTreeResult = Invoke-SteinSourceEvidenceProcess `
+    -Executable ([string]$toolExecutables['git']) `
+    -Arguments @('rev-parse', '--verify', 'HEAD^{tree}') `
+    -WorkingDirectory $repoRoot `
+    -MaximumStandardOutputCharacters 256 `
+    -MaximumStandardErrorCharacters 1024
+$candidateTree = $candidateTreeResult.stdout.Trim()
+if ($candidateTree -cnotmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$' -or
+    $candidateTree.Length -ne
+        ([string]$initialProvenance.repository.head_commit).Length) {
+    throw 'source_command_candidate_tree_invalid'
 }
-
-function Get-SteinLogRecord {
-    param([Parameter(Mandatory = $true)][string] $Path)
-
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        return $null
-    }
-    $item = Get-Item -LiteralPath $Path -Force
-    return [ordered]@{
-        path = $item.FullName.Substring($repositoryPath.Length + 1).Replace("\", "/")
-        size = $item.Length
-        sha256 = Get-SteinSha256 -Path $item.FullName
-    }
+$sourceCommandToolExecutables = [ordered]@{
+    cargo = [string]$toolExecutables['cargo']
+    pnpm = [string]$toolExecutables['pnpm']
+    windows_powershell = $powershell
+    pwsh = $pwsh
+    git_launcher = $gitLauncherPath
+    git_resolved = $gitResolvedPath
 }
+$evidenceRelativePath = $evidencePath.Substring(
+    $repositoryPath.Length + 1).Replace('\', '/')
 
-function Invoke-SteinSourceCheck {
-    param(
-        [Parameter(Mandatory = $true)][string] $Id,
-        [Parameter(Mandatory = $true)][string] $Executable,
-        [Parameter(Mandatory = $true)][string[]] $Arguments,
-        [Parameter(Mandatory = $true)][string] $WorkingDirectory
-    )
+function Invoke-SteinRegisteredSourceCommand {
+    param([Parameter(Mandatory = $true)][string] $Id)
 
-    $leaf = ConvertTo-SteinSafeLeaf -Value $Id
-    $stdoutPath = Join-Path $evidencePath "$leaf.stdout.txt"
-    $stderrPath = Join-Path $evidencePath "$leaf.stderr.txt"
-    $begin = (Get-Date).ToUniversalTime()
-    $exitCode = -1
-    $launchError = $null
     Write-Host "[RUN ] $Id"
-    $process = $null
-    try {
-        $process = Start-Process `
-            -FilePath $Executable `
-            -ArgumentList $Arguments `
-            -WorkingDirectory $WorkingDirectory `
-            -NoNewWindow `
-            -PassThru `
-            -RedirectStandardOutput $stdoutPath `
-            -RedirectStandardError $stderrPath
-        # Windows PowerShell releases Start-Process's native process handle
-        # when -Wait is absent unless it is materialized by the caller. Keep
-        # that handle so ExitCode remains available after the direct process
-        # exits.
-        $null = $process.Handle
-        # Start-Process -Wait waits for the entire descendant process tree on
-        # Windows. Toolchains can leave a helper alive after the command has
-        # already returned, which would prevent the remaining checks and final
-        # report from being collected. WaitForExit observes the launched check
-        # itself; its exit code remains the authoritative gate result.
-        $process.WaitForExit()
-        $exitCode = $process.ExitCode
+    $result = Invoke-SteinSourceEvidenceProcess `
+        -Executable $powershell `
+        -Arguments @(
+            '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+            [string]$sourceCommandRunnerBootstrapBinding[0].record.path,
+            '-CheckId', $Id,
+            '-CandidateCommit', [string]$initialProvenance.repository.head_commit,
+            '-CandidateTree', $candidateTree,
+            '-ExpectedRegistrySha256', [string]$sourceCommandRegistryRead.Sha256,
+            '-ExpectedGitLauncherPath', $gitLauncherPath,
+            '-ExpectedGitLauncherSha256',
+                [string]$initialProvenance.toolchain.git.executable_sha256,
+            '-ExpectedGitResolvedSha256',
+                [string]$initialProvenance.toolchain.git.resolved_executable_sha256,
+            '-EvidenceRoot', $evidenceRelativePath) `
+        -WorkingDirectory $repoRoot `
+        -AllowedExitCodes @(0, 1) `
+        -MaximumStandardOutputCharacters 1048576 `
+        -MaximumStandardErrorCharacters 1048576
+    $marker = if ([int]$result.exit_code -eq 0) { 'PASS' } else { 'FAIL' }
+    Write-Host "[$marker] $Id"
+    return [int]$result.exit_code
+}
+
+function New-SteinRegisteredSourceCheckRecord {
+    param([Parameter(Mandatory = $true)] $ValidatedReceipt)
+
+    $receipt = $ValidatedReceipt.receipt
+    $descriptor = $ValidatedReceipt.descriptor
+    $execution = $receipt.execution
+    $command = $receipt.command
+    $status = [string]$receipt.status
+    $failureSummary = if ($status -ceq 'pass') {
+        $null
     }
-    catch {
-        $launchError = "The check could not be launched."
-        $launchError | Set-Content -LiteralPath $stderrPath -Encoding UTF8
+    else {
+        "The registered source check failed: $([string]$execution.failure_code)."
     }
-    finally {
-        if ($null -ne $process) {
-            $process.Dispose()
+    return [ordered]@{
+        id = [string]$receipt.check_id
+        status = $status
+        executable = [string]$command.executable_name
+        arguments = @($command.arguments | ForEach-Object { [string]$_ })
+        working_directory = [string]$command.working_directory
+        started_at = [string]$execution.started_at
+        completed_at = [string]$execution.completed_at
+        duration_ms = [long]$execution.duration_ms
+        exit_code = [long]$execution.exit_code
+        failure_summary = $failureSummary
+        stdout = [ordered]@{
+            path = "$evidenceRelativePath/$([string]$execution.stdout.path)"
+            size = [long]$execution.stdout.size
+            sha256 = [string]$execution.stdout.sha256
+        }
+        stderr = [ordered]@{
+            path = "$evidenceRelativePath/$([string]$execution.stderr.path)"
+            size = [long]$execution.stderr.size
+            sha256 = [string]$execution.stderr.sha256
+        }
+        source_command_receipt = $receipt
+        source_command_receipt_artifact = [ordered]@{
+            path = "source-command-receipts/$([string]$descriptor.path)"
+            size = [long]$descriptor.size
+            sha256 = [string]$descriptor.sha256
         }
     }
-    $finish = (Get-Date).ToUniversalTime()
-    $passed = $exitCode -eq 0
-    $marker = if ($passed) { "PASS" } else { "FAIL" }
-    Write-Host "[$marker] $Id"
-    $checks.Add([ordered]@{
-        id = $Id
-        status = if ($passed) { "pass" } else { "fail" }
-        executable = (Split-Path -Leaf $Executable)
-        arguments = @($Arguments)
-        working_directory = $WorkingDirectory.Substring($repositoryPath.Length).TrimStart("\").Replace("\", "/")
-        started_at = $begin.ToString("o")
-        completed_at = $finish.ToString("o")
-        duration_ms = [long]($finish - $begin).TotalMilliseconds
-        exit_code = $exitCode
-        failure_summary = $launchError
-        stdout = Get-SteinLogRecord -Path $stdoutPath
-        stderr = Get-SteinLogRecord -Path $stderrPath
-    })
 }
 
-function Add-SteinNotRunCheck {
+function Add-SteinRegisteredSourceFixtureEvidence {
     param(
-        [Parameter(Mandatory = $true)][string] $Id,
-        [Parameter(Mandatory = $true)][string] $Reason
-    )
-
-    Write-Host "[NOT RUN] $Id"
-    $checks.Add([ordered]@{
-        id = $Id
-        status = "not_run"
-        reason = $Reason
-    })
-}
-
-function Invoke-SteinSourceFixtureChecks {
-    param(
-        [Parameter(Mandatory = $true)][string] $PowerShellExecutable,
-        [Parameter(Mandatory = $true)][string] $GitExecutable,
+        [Parameter(Mandatory = $true)][Collections.IDictionary] $RecordsById,
         [Parameter(Mandatory = $true)] $Provenance
     )
 
-    $registryPath = Join-Path $PSScriptRoot "Source-Fixture-Registry.json"
+    $registryPath = Join-Path $PSScriptRoot 'Source-Fixture-Registry.json'
     $registryRead = Read-SteinSourceFixtureLockedJson `
         -Path $registryPath `
         -MaximumBytes 1048576
     $null = Assert-SteinSourceFixtureRegistry -Registry $registryRead.value
     $fixtureGitBinding = Get-SteinSourceFixtureGitBinding `
-        -LauncherExecutable $GitExecutable `
+        -LauncherExecutable ([string]$toolExecutables['git']) `
         -WorkingDirectory $repoRoot
     if ([string]$fixtureGitBinding.Record.executable_sha256 -cne
             [string]$Provenance.toolchain.git.executable_sha256 -or
@@ -457,361 +466,169 @@ function Invoke-SteinSourceFixtureChecks {
             [string]$Provenance.toolchain.git.version -or
         [string]$fixtureGitBinding.Record.resolved_version -cne
             [string]$Provenance.toolchain.git.resolved_version) {
-        throw "source_fixture_git_provenance_mismatch"
+        throw 'source_fixture_git_provenance_mismatch'
     }
     $compilerEnvironment = Get-SteinSourceFixtureCompilerEnvironmentRecord `
         -RustupToolchain ([string]$Provenance.toolchain.cargo.rustup_toolchain) `
         -PathSha256 (Get-SteinSourceFixturePathSha256)
     $compilerEnvironmentSha256 = Get-SteinSourceEvidenceObjectDigest `
         -Value $compilerEnvironment
-    $fixtureDirectory = Join-Path $evidencePath "source-fixtures"
-    $fixtureRelativeDirectory = $fixtureDirectory.Substring(
-        $repositoryPath.Length + 1).Replace("\", "/")
-    $arguments = @(
-        "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-        "scripts/windows/phase2/Run-Source-Fixture.ps1", "-OutputDirectory",
-        $fixtureRelativeDirectory)
-    $launchArguments = @($arguments)
-    $launchArguments[5] = [string]$sourceFixtureRunnerBootstrapBinding[0].full_path
-    $stdoutPath = Join-Path $evidencePath "source-fixture-suite.stdout.txt"
-    $stderrPath = Join-Path $evidencePath "source-fixture-suite.stderr.txt"
-    $begin = (Get-Date).ToUniversalTime()
-    $exitCode = -1
-    $failureSummary = $null
-    Write-Host "[RUN ] closed-source-fixture-suite"
-    $process = $null
-    try {
-        $process = Start-Process `
-            -FilePath $PowerShellExecutable `
-            -ArgumentList $launchArguments `
-            -WorkingDirectory $repoRoot `
-            -NoNewWindow `
-            -PassThru `
-            -RedirectStandardOutput $stdoutPath `
-            -RedirectStandardError $stderrPath
-        $null = $process.Handle
-        $process.WaitForExit()
-        $exitCode = [int]$process.ExitCode
-    }
-    catch {
-        $failureSummary = "The closed source-fixture suite could not be launched."
-        $failureSummary | Set-Content -LiteralPath $stderrPath -Encoding UTF8
-    }
-    finally {
-        if ($null -ne $process) {
-            $process.Dispose()
-        }
-    }
+    $fixtureDirectory = Join-Path $evidencePath 'source-fixtures'
+    $indexRead = Read-SteinSourceFixtureLockedJson `
+        -Path (Join-Path $fixtureDirectory 'index.json') `
+        -MaximumBytes 1048576
+    $null = Assert-SteinSourceFixtureIndex `
+        -Index $indexRead.value `
+        -Registry $registryRead.value `
+        -ExpectedRegistrySha256 ([string]$registryRead.sha256) `
+        -ExpectedCommit ([string]$Provenance.repository.head_commit) `
+        -ExpectedTree $candidateTree `
+        -ExpectedGitLauncherVersion ([string]$Provenance.toolchain.git.version) `
+        -ExpectedGitLauncherSha256 ([string]$Provenance.toolchain.git.executable_sha256) `
+        -ExpectedGitResolvedVersion ([string]$Provenance.toolchain.git.resolved_version) `
+        -ExpectedGitResolvedSha256 ([string]$Provenance.toolchain.git.resolved_executable_sha256)
 
-    $finish = (Get-Date).ToUniversalTime()
-    $stdoutRecord = Get-SteinLogRecord -Path $stdoutPath
-    $stderrRecord = Get-SteinLogRecord -Path $stderrPath
-    $receiptReads = @{}
-    $indexRead = $null
-    if ($exitCode -eq 0) {
-        try {
-            $treeResult = Invoke-SteinSourceEvidenceProcess `
-                -Executable ([string]$fixtureGitBinding.ResolvedPath) `
-                -Arguments @("rev-parse", "--verify", "HEAD^{tree}") `
-                -WorkingDirectory $repoRoot `
-                -MaximumStandardOutputCharacters 256 `
-                -MaximumStandardErrorCharacters 512
-            $candidateTree = $treeResult.stdout.Trim()
-            $candidateCommit = [string]$Provenance.repository.head_commit
-            if ($candidateTree -cnotmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$' -or
-                $candidateTree.Length -ne $candidateCommit.Length) {
-                throw "source_fixture_candidate_tree_invalid"
-            }
-            $indexPath = Join-Path $fixtureDirectory "index.json"
-            $indexRead = Read-SteinSourceFixtureLockedJson `
-                -Path $indexPath `
-                -MaximumBytes 1048576
-            $null = Assert-SteinSourceFixtureIndex `
-                -Index $indexRead.value `
-                -Registry $registryRead.value `
-                -ExpectedRegistrySha256 ([string]$registryRead.sha256) `
-                -ExpectedCommit $candidateCommit `
-                -ExpectedTree $candidateTree `
-                -ExpectedGitLauncherVersion `
-                    ([string]$Provenance.toolchain.git.version) `
-                -ExpectedGitLauncherSha256 `
-                    ([string]$Provenance.toolchain.git.executable_sha256) `
-                -ExpectedGitResolvedVersion `
-                    ([string]$Provenance.toolchain.git.resolved_version) `
-                -ExpectedGitResolvedSha256 `
-                    ([string]$Provenance.toolchain.git.resolved_executable_sha256)
-            $indexByCheck = @{}
-            foreach ($descriptor in @($indexRead.value.receipts)) {
-                $indexByCheck[[string]$descriptor.source_check_id] = $descriptor
-            }
-            foreach ($fixture in @($registryRead.value.fixtures)) {
-                $sourceCheckId = [string]$fixture.source_check_id
-                if (-not $indexByCheck.ContainsKey($sourceCheckId)) {
-                    throw "source_fixture_index_missing_receipt"
-                }
-                $descriptor = $indexByCheck[$sourceCheckId]
-                $receiptPath = Join-Path $fixtureDirectory ([string]$descriptor.path)
-                $receiptRead = Read-SteinSourceFixtureLockedJson `
-                    -Path $receiptPath `
-                    -MaximumBytes 4194304
-                if ([long]$receiptRead.size -ne [long]$descriptor.size -or
-                    [string]$receiptRead.sha256 -cne [string]$descriptor.sha256) {
-                    throw "source_fixture_receipt_descriptor_mismatch"
-                }
-                $null = Assert-SteinSourceFixtureReceipt `
-                    -Receipt $receiptRead.value `
-                    -Fixture $fixture `
-                    -ExpectedRegistrySha256 ([string]$registryRead.sha256) `
-                    -ExpectedCommit $candidateCommit `
-                    -ExpectedTree $candidateTree `
-                    -ExpectedCargoLauncherSha256 `
-                        ([string]$Provenance.toolchain.cargo.executable_sha256) `
-                    -ExpectedCargoResolvedSha256 `
-                        ([string]$Provenance.toolchain.cargo.resolved_executable_sha256) `
-                    -ExpectedRustcLauncherSha256 `
-                        ([string]$Provenance.toolchain.rustc.executable_sha256) `
-                    -ExpectedRustcResolvedSha256 `
-                        ([string]$Provenance.toolchain.rustc.resolved_executable_sha256) `
-                    -ExpectedRustupToolchain `
-                        ([string]$Provenance.toolchain.cargo.rustup_toolchain) `
-                    -ExpectedGitLauncherVersion `
-                        ([string]$Provenance.toolchain.git.version) `
-                    -ExpectedGitLauncherSha256 `
-                        ([string]$Provenance.toolchain.git.executable_sha256) `
-                    -ExpectedGitResolvedVersion `
-                        ([string]$Provenance.toolchain.git.resolved_version) `
-                    -ExpectedGitResolvedSha256 `
-                        ([string]$Provenance.toolchain.git.resolved_executable_sha256) `
-                    -ExpectedCompilerEnvironmentSha256 $compilerEnvironmentSha256
-                $receiptReads[$sourceCheckId] = [pscustomobject]@{
-                    Read = $receiptRead
-                    Descriptor = $descriptor
-                    Path = $receiptPath
-                }
-            }
-            $actualFixtureFiles = @(Get-ChildItem -LiteralPath $fixtureDirectory -Force)
-            if ($actualFixtureFiles.Count -ne (@($registryRead.value.fixtures).Count + 1) -or
-                @($actualFixtureFiles | Where-Object {
-                        $_.PSIsContainer -or
-                        (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
-                    }).Count -ne 0) {
-                throw "source_fixture_output_set_invalid"
-            }
-        }
-        catch {
-            $exitCode = 1
-            $failureSummary = "The closed source-fixture receipt set is invalid."
-        }
+    $indexByCheck = @{}
+    foreach ($descriptor in @($indexRead.value.receipts)) {
+        $indexByCheck[[string]$descriptor.source_check_id] = $descriptor
     }
-    elseif ($null -eq $failureSummary) {
-        $failureSummary = "The closed source-fixture suite failed."
-    }
-
     foreach ($fixture in @($registryRead.value.fixtures)) {
         $sourceCheckId = [string]$fixture.source_check_id
-        $passed = $exitCode -eq 0 -and $receiptReads.ContainsKey($sourceCheckId)
-        $marker = if ($passed) { "PASS" } else { "FAIL" }
-        Write-Host "[$marker] $sourceCheckId"
-        $record = [ordered]@{
-            id = $sourceCheckId
-            status = if ($passed) { "pass" } else { "fail" }
-            executable = "powershell.exe"
-            arguments = $arguments
-            working_directory = "."
-            started_at = $begin.ToString("o")
-            completed_at = $finish.ToString("o")
-            duration_ms = [long]($finish - $begin).TotalMilliseconds
-            exit_code = $exitCode
-            failure_summary = if ($passed) { $null } else { $failureSummary }
-            stdout = $stdoutRecord
-            stderr = $stderrRecord
+        if (-not $RecordsById.Contains($sourceCheckId) -or
+            [string]$RecordsById[$sourceCheckId].status -cne 'pass' -or
+            -not $indexByCheck.ContainsKey($sourceCheckId)) {
+            throw 'source_fixture_command_receipt_missing'
         }
-        if ($passed) {
-            $receipt = $receiptReads[$sourceCheckId]
-            $record.source_fixture_receipt = $receipt.Read.value
-            $record.source_fixture_receipt_artifact = [ordered]@{
-                path = "source-fixtures/$([string]$receipt.Descriptor.path)"
-                size = [long]$receipt.Read.size
-                sha256 = [string]$receipt.Read.sha256
-            }
-            $record.source_fixture_suite_index = [ordered]@{
-                path = "source-fixtures/index.json"
-                size = [long]$indexRead.size
-                sha256 = [string]$indexRead.sha256
-            }
+        $descriptor = $indexByCheck[$sourceCheckId]
+        $receiptPath = Join-Path $fixtureDirectory ([string]$descriptor.path)
+        $receiptRead = Read-SteinSourceFixtureLockedJson `
+            -Path $receiptPath `
+            -MaximumBytes 4194304
+        if ([long]$receiptRead.size -ne [long]$descriptor.size -or
+            [string]$receiptRead.sha256 -cne [string]$descriptor.sha256) {
+            throw 'source_fixture_receipt_descriptor_mismatch'
         }
-        $checks.Add($record)
+        $null = Assert-SteinSourceFixtureReceipt `
+            -Receipt $receiptRead.value `
+            -Fixture $fixture `
+            -ExpectedRegistrySha256 ([string]$registryRead.sha256) `
+            -ExpectedCommit ([string]$Provenance.repository.head_commit) `
+            -ExpectedTree $candidateTree `
+            -ExpectedCargoLauncherSha256 ([string]$Provenance.toolchain.cargo.executable_sha256) `
+            -ExpectedCargoResolvedSha256 ([string]$Provenance.toolchain.cargo.resolved_executable_sha256) `
+            -ExpectedRustcLauncherSha256 ([string]$Provenance.toolchain.rustc.executable_sha256) `
+            -ExpectedRustcResolvedSha256 ([string]$Provenance.toolchain.rustc.resolved_executable_sha256) `
+            -ExpectedRustupToolchain ([string]$Provenance.toolchain.cargo.rustup_toolchain) `
+            -ExpectedGitLauncherVersion ([string]$Provenance.toolchain.git.version) `
+            -ExpectedGitLauncherSha256 ([string]$Provenance.toolchain.git.executable_sha256) `
+            -ExpectedGitResolvedVersion ([string]$Provenance.toolchain.git.resolved_version) `
+            -ExpectedGitResolvedSha256 ([string]$Provenance.toolchain.git.resolved_executable_sha256) `
+            -ExpectedCompilerEnvironmentSha256 $compilerEnvironmentSha256
+        $record = $RecordsById[$sourceCheckId]
+        $record.source_fixture_receipt = $receiptRead.value
+        $record.source_fixture_receipt_artifact = [ordered]@{
+            path = "source-fixtures/$([string]$descriptor.path)"
+            size = [long]$receiptRead.size
+            sha256 = [string]$receiptRead.sha256
+        }
+        $record.source_fixture_suite_index = [ordered]@{
+            path = 'source-fixtures/index.json'
+            size = [long]$indexRead.size
+            sha256 = [string]$indexRead.sha256
+        }
+    }
+    $actualFixtureFiles = @(Get-ChildItem -LiteralPath $fixtureDirectory -Force)
+    if ($actualFixtureFiles.Count -ne (@($registryRead.value.fixtures).Count + 1) -or
+        @($actualFixtureFiles | Where-Object {
+                $_.PSIsContainer -or
+                (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+            }).Count -ne 0) {
+        throw 'source_fixture_output_set_invalid'
     }
 }
 
-$originalCoreHash = $env:STEIN_CORE_EXECUTABLE_SHA256
-$originalFamily = $env:STEIN_PRODUCTION_PACKAGE_FAMILY_NAME
-$originalBrokerAumid = $env:STEIN_PRODUCTION_BROKER_AUMID
-$originalEdgeExtensionId = $env:STEIN_EDGE_EXTENSION_ID
-$originalEdgeExtensionVersion = $env:STEIN_EDGE_EXTENSION_VERSION
-$originalEdgePublisher = $env:STEIN_EDGE_PUBLISHER_SHA256
-$originalEdgeHostPublisher = $env:STEIN_EDGE_HOST_PUBLISHER_SHA256
-try {
-    # These are compile-only, production-shaped synthetic values. They are not
-    # an installed identity and cannot satisfy the private-client gate.
-    $env:STEIN_CORE_EXECUTABLE_SHA256 = "1111111111111111111111111111111111111111111111111111111111111111"
-    $env:STEIN_PRODUCTION_PACKAGE_FAMILY_NAME = "STEIN.PersonalIntelligence_123456789abcd"
-    $env:STEIN_PRODUCTION_BROKER_AUMID = "$($env:STEIN_PRODUCTION_PACKAGE_FAMILY_NAME)!PrivateBroker"
-    $env:STEIN_EDGE_EXTENSION_ID = "abcdefghijklmnopabcdefghijklmnop"
-    $syntheticEdgeExtensionVersion = "0.1.0"
-    if ($syntheticEdgeExtensionVersion.Length -gt 32 -or
-        $syntheticEdgeExtensionVersion -notmatch `
-            "^(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){0,3}$") {
-        throw "The synthetic Edge extension version is outside the production build contract."
+$groupExecutionStarted = $false
+foreach ($definition in @($sourceCommandRegistryRead.Registry.checks)) {
+    $category = [string]$definition.category
+    if ($category -ceq 'direct_execution') {
+        $null = Invoke-SteinRegisteredSourceCommand -Id ([string]$definition.id)
     }
-    $env:STEIN_EDGE_EXTENSION_VERSION = $syntheticEdgeExtensionVersion
-    $env:STEIN_EDGE_PUBLISHER_SHA256 = "2222222222222222222222222222222222222222222222222222222222222222"
-    $env:STEIN_EDGE_HOST_PUBLISHER_SHA256 = "3333333333333333333333333333333333333333333333333333333333333333"
+    elseif ($category -ceq 'grouped_fixture_execution' -and
+        -not $groupExecutionStarted) {
+        $groupExecutionStarted = $true
+        $null = Invoke-SteinRegisteredSourceCommand -Id ([string]$definition.id)
+    }
+}
+if (-not $groupExecutionStarted) {
+    throw 'source_command_group_execution_missing'
+}
+$null = Invoke-SteinRegisteredSourceCommand `
+    -Id 'source-report-command-provenance'
 
-    $cargo = [string]$toolExecutables["cargo"]
-    $pnpm = [string]$toolExecutables["pnpm"]
-    Invoke-SteinSourceCheck -Id "rust-format" -Executable $cargo `
-        -Arguments @("fmt", "--all", "--", "--check") -WorkingDirectory $repoRoot
-    Invoke-SteinSourceCheck -Id "rust-check" -Executable $cargo `
-        -Arguments @("check", "--workspace", "--all-targets", "--all-features") `
-        -WorkingDirectory $repoRoot
-    Invoke-SteinSourceCheck -Id "rust-clippy" -Executable $cargo `
-        -Arguments @("clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings") `
-        -WorkingDirectory $repoRoot
-    Invoke-SteinSourceCheck -Id "rust-tests" -Executable $cargo `
-        -Arguments @("test", "--workspace", "--all-targets", "--all-features") `
-        -WorkingDirectory $repoRoot
+$sourceCommandEvidence = Assert-SteinSourceEvidenceCommandReceiptIndex `
+    -RegistryRead $sourceCommandRegistryRead `
+    -RepositoryRoot $repoRoot `
+    -EvidenceRoot $evidencePath `
+    -CandidateCommit ([string]$initialProvenance.repository.head_commit) `
+    -CandidateTree $candidateTree `
+    -RunnerPath ([string]$sourceCommandRunnerBootstrapBinding[0].full_path) `
+    -ToolExecutables $sourceCommandToolExecutables
 
-    Invoke-SteinSourceCheck -Id "desktop-typecheck" -Executable $pnpm `
-        -Arguments @("typecheck") -WorkingDirectory $desktopRoot
-    Invoke-SteinSourceCheck -Id "desktop-lint" -Executable $pnpm `
-        -Arguments @("lint") -WorkingDirectory $desktopRoot
-    Invoke-SteinSourceCheck -Id "desktop-tests" -Executable $pnpm `
-        -Arguments @("test") -WorkingDirectory $desktopRoot
-    Invoke-SteinSourceCheck -Id "desktop-build" -Executable $pnpm `
-        -Arguments @("build") -WorkingDirectory $desktopRoot
-
-    Invoke-SteinSourceCheck -Id "edge-extension-tests" -Executable $pnpm `
-        -Arguments @("test") -WorkingDirectory $edgeExtensionRoot
-    Invoke-SteinSourceCheck -Id "edge-host-format" -Executable $cargo `
-        -Arguments @("fmt", "--manifest-path", $edgeHostManifest, "--", "--check") `
-        -WorkingDirectory $repoRoot
-    Invoke-SteinSourceCheck -Id "edge-host-check" -Executable $cargo `
-        -Arguments @(
-            "check", "--manifest-path", $edgeHostManifest,
-            "--all-targets", "--all-features"
-        ) -WorkingDirectory $repoRoot
-    Invoke-SteinSourceCheck -Id "edge-host-clippy" -Executable $cargo `
-        -Arguments @(
-            "clippy", "--manifest-path", $edgeHostManifest,
-            "--all-targets", "--all-features", "--", "-D", "warnings"
-        ) -WorkingDirectory $repoRoot
-    Invoke-SteinSourceCheck -Id "edge-host-tests" -Executable $cargo `
-        -Arguments @(
-            "test", "--manifest-path", $edgeHostManifest,
-            "--all-targets", "--all-features"
-        ) -WorkingDirectory $repoRoot
-
-    Invoke-SteinSourceCheck -Id "boundary-contract" -Executable $powershell `
-        -Arguments @(
-            "-NoProfile",
-            "-ExecutionPolicy", "Bypass",
-            "-File", (Join-Path $repoRoot "scripts\windows\check-boundaries.ps1"),
-            "-Json"
-        ) -WorkingDirectory $repoRoot
-    Invoke-SteinSourceCheck -Id "source-evidence-contract" -Executable $powershell `
-        -Arguments @(
-            "-NoLogo",
-            "-NoProfile",
-            "-ExecutionPolicy", "Bypass",
-            "-File", (Join-Path $repoRoot "scripts\windows\phase2\Test-VerifySource.ps1")
-        ) -WorkingDirectory $repoRoot
-    Invoke-SteinSourceCheck -Id "installed-evidence-harness-static" -Executable $powershell `
-        -Arguments @(
-            "-NoLogo",
-            "-NoProfile",
-            "-ExecutionPolicy", "Bypass",
-            "-File", (Join-Path $repoRoot "scripts\windows\phase2\Test-VerifyInstalled.ps1")
-        ) -WorkingDirectory $repoRoot
-    Invoke-SteinSourceCheck -Id "no-leaks-scanner-static" -Executable $powershell `
-        -Arguments @(
-            "-NoLogo",
-            "-NoProfile",
-            "-ExecutionPolicy", "Bypass",
-            "-File", (Join-Path $repoRoot "scripts\windows\phase2\Test-ScanNoLeaks.ps1")
-        ) -WorkingDirectory $repoRoot
-    Add-SteinNotRunCheck `
-        -Id "no-leaks-producer-workflow" `
-        -Reason "Candidate-owned installed artifact producer is not implemented."
-    Add-SteinNotRunCheck `
-        -Id "native-toolchain-provenance" `
-        -Reason "Authenticated Rust/rustup/Git/VS/MSVC/Windows SDK/package-tool payload, runtime, sysroot, library, and linker provenance is not implemented."
-    Add-SteinNotRunCheck `
-        -Id "pinned-clean-build-environment" `
-        -Reason "Authenticated immutable candidate input and fresh dependency, build, and output isolation are not implemented for every source check."
-    Add-SteinNotRunCheck `
-        -Id "portable-runner-attestation" `
-        -Reason "Authenticated GitHub artifact attestation tied to repository, workflow, commit, and artifact digest is not implemented."
-    Add-SteinNotRunCheck `
-        -Id "source-report-command-provenance" `
-        -Reason "Independent closed command/argument/working-directory provenance for every source-report check is not implemented."
-    Invoke-SteinSourceFixtureChecks `
-        -PowerShellExecutable $powershell `
-        -GitExecutable ([string]$toolExecutables["git"]) `
+$recordsById = @{}
+foreach ($validatedReceipt in @($sourceCommandEvidence.Receipts)) {
+    $record = New-SteinRegisteredSourceCheckRecord `
+        -ValidatedReceipt $validatedReceipt
+    $recordsById[[string]$record.id] = $record
+}
+$groupedRecords = @($sourceCommandRegistryRead.Contract.GroupedIds |
+    ForEach-Object { $recordsById[[string]$_] })
+if (@($groupedRecords | Where-Object {
+            $null -eq $_ -or [string]$_.status -cne 'pass'
+        }).Count -eq 0) {
+    Add-SteinRegisteredSourceFixtureEvidence `
+        -RecordsById $recordsById `
         -Provenance $initialProvenance
-    Invoke-SteinSourceCheck `
-        -Id "installed-reviewer-windows-powershell-contract" `
-        -Executable $powershell `
-        -Arguments @(
-            "-NoLogo",
-            "-NoProfile",
-            "-ExecutionPolicy", "Bypass",
-            "-File", (Join-Path $repoRoot "scripts\windows\phase2\Test-ReviewInstalled.ps1")
-        ) `
-        -WorkingDirectory $repoRoot
-    Invoke-SteinSourceCheck `
-        -Id "installed-reviewer-pwsh-contract" `
-        -Executable $pwsh `
-        -Arguments @(
-            "-NoLogo",
-            "-NoProfile",
-            "-File", (Join-Path $repoRoot "scripts\windows\phase2\Test-ReviewInstalled.ps1")
-        ) `
-        -WorkingDirectory $repoRoot
-    Invoke-SteinSourceCheck -Id "msix-static-contract" -Executable $powershell `
-        -Arguments @(
-            "-NoProfile",
-            "-ExecutionPolicy", "Bypass",
-            "-File", (Join-Path $repoRoot "packaging\windows-msix\Test-Static.ps1")
-        ) -WorkingDirectory $repoRoot
-
-    Invoke-SteinSourceCheck -Id "release-workspace" -Executable $cargo `
-        -Arguments @("build", "--workspace", "--release") -WorkingDirectory $repoRoot
-    Invoke-SteinSourceCheck -Id "release-production-core" -Executable $cargo `
-        -Arguments @(
-            "build", "--release", "-p", "stein-core-daemon",
-            "--features", "production-private-endpoint,production-edge-producer"
-        ) -WorkingDirectory $repoRoot
-    Invoke-SteinSourceCheck -Id "release-edge-host" -Executable $cargo `
-        -Arguments @(
-            "build", "--release", "--manifest-path", $edgeHostManifest,
-            "--features", "production-edge-host"
-        ) -WorkingDirectory $repoRoot
-    Invoke-SteinSourceCheck -Id "release-tauri-no-bundle" -Executable $pnpm `
-        -Arguments @("exec", "tauri", "build", "--no-bundle") -WorkingDirectory $desktopRoot
-
-    Add-SteinNotRunCheck `
-        -Id "windows-native-ignored-fixtures" `
-        -Reason "Requires explicit native-fixture workflow support; interactive native fixtures remain unimplemented source evidence."
 }
-finally {
-    $env:STEIN_CORE_EXECUTABLE_SHA256 = $originalCoreHash
-    $env:STEIN_PRODUCTION_PACKAGE_FAMILY_NAME = $originalFamily
-    $env:STEIN_PRODUCTION_BROKER_AUMID = $originalBrokerAumid
-    $env:STEIN_EDGE_EXTENSION_ID = $originalEdgeExtensionId
-    $env:STEIN_EDGE_EXTENSION_VERSION = $originalEdgeExtensionVersion
-    $env:STEIN_EDGE_PUBLISHER_SHA256 = $originalEdgePublisher
-    $env:STEIN_EDGE_HOST_PUBLISHER_SHA256 = $originalEdgeHostPublisher
+
+$notRunReasons = [ordered]@{
+    'native-toolchain-provenance' = 'Authenticated Rust/rustup/Git/VS/MSVC/Windows SDK/package-tool payload, runtime, sysroot, library, and linker provenance is not implemented.'
+    'no-leaks-producer-workflow' = 'Candidate-owned installed artifact producer is not implemented.'
+    'pinned-clean-build-environment' = 'Authenticated immutable candidate input and fresh dependency, build, and output isolation are not implemented for every source check.'
+    'portable-runner-attestation' = 'Authenticated GitHub artifact attestation tied to repository, workflow, commit, and artifact digest is not implemented.'
+    'windows-native-ignored-fixtures' = 'Requires explicit native-fixture workflow support; interactive native fixtures remain unimplemented source evidence.'
+}
+foreach ($id in $notRunReasons.Keys) {
+    Write-Host "[NOT RUN] $id"
+    $recordsById[$id] = [ordered]@{
+        id = $id
+        status = 'not_run'
+        reason = [string]$notRunReasons[$id]
+    }
+}
+$recordsById['source-report-command-provenance'] = [ordered]@{
+    id = 'source-report-command-provenance'
+    status = 'pass'
+    derivation = 'exact_registry_and_receipt_coverage'
+    registry_sha256 = [string]$sourceCommandEvidence.RegistrySha256
+    runner_sha256 = [string]$sourceCommandEvidence.RunnerSha256
+    executed_check_count = [long]$sourceCommandEvidence.ExecutedCheckCount
+    execution_group_count = [long]$sourceCommandEvidence.ExecutionGroupCount
+    source_command_receipt_index = $sourceCommandEvidence.Index
+    source_command_receipt_index_artifact = [ordered]@{
+        path = 'source-command-receipts/index.json'
+        size = [long]$sourceCommandEvidence.IndexSize
+        sha256 = [string]$sourceCommandEvidence.IndexSha256
+    }
+    failure_summary = $null
+}
+foreach ($definition in @($sourceCommandRegistryRead.Registry.checks | Where-Object {
+            [string]$_.id -cne 'source-provenance-stability'
+        })) {
+    $id = [string]$definition.id
+    if (-not $recordsById.ContainsKey($id)) {
+        throw 'source_command_report_record_missing'
+    }
+    $checks.Add($recordsById[$id])
 }
 
 $completedProvenance = Get-SteinSourceEvidenceProvenance `
@@ -837,6 +654,9 @@ $generator = Get-SteinSourceEvidenceGenerator `
         (Join-Path $PSScriptRoot "Verify-Source.ps1"),
         (Join-Path $PSScriptRoot "Verify-Source.cmd"),
         (Join-Path $PSScriptRoot "Source-Evidence.ps1"),
+        (Join-Path $PSScriptRoot "Source-Command-Registry.json"),
+        (Join-Path $PSScriptRoot "Run-Source-Check.ps1"),
+        (Join-Path $PSScriptRoot "Test-SourceCommand.ps1"),
         (Join-Path $PSScriptRoot "Source-Fixture-Registry.json"),
         (Join-Path $PSScriptRoot "Run-Source-Fixture.ps1"),
         (Join-Path $PSScriptRoot "Test-SourceFixture.ps1"),
@@ -864,6 +684,8 @@ foreach ($binding in $script:SteinSourceBootstrapBindings) {
 }
 $null = Assert-SteinSourceBootstrapSourcesStable
 $null = Assert-SteinSourceFixtureBootstrapSourcesStable
+$null = Assert-SteinSourceEvidenceCommandEvidenceStable `
+    -Evidence $sourceCommandEvidence
 $checksDigest = Get-SteinSourceEvidenceObjectDigest -Value @($checks | ForEach-Object { $_ })
 $completedAt = (Get-Date).ToUniversalTime()
 $failed = @($checks | Where-Object { $_.status -eq "fail" })
@@ -911,6 +733,10 @@ $rootAnchorPath = Join-Path $evidencePath "root-anchor.json"
 Write-SteinSourceEvidenceJson -Path $rootAnchorPath -Value $rootAnchor -Depth 8
 $null = Assert-SteinSourceBootstrapSourcesStable
 $null = Assert-SteinSourceFixtureBootstrapSourcesStable
+$null = Assert-SteinSourceEvidenceCommandEvidenceStable `
+    -Evidence $sourceCommandEvidence
+Close-SteinSourceEvidenceCommandEvidence -Evidence $sourceCommandEvidence
+$sourceCommandRegistryRead.Stream.Dispose()
 $sourceBootstrapStreams = @(
     @($script:SteinSourceBootstrapBindings) +
     @($script:SteinSourceFixtureBootstrapBindings) |
