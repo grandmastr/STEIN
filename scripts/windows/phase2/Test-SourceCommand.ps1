@@ -555,21 +555,134 @@ $powershell = Join-Path ([Environment]::GetFolderPath(
         [Environment+SpecialFolder]::System)) `
     'WindowsPowerShell\v1.0\powershell.exe'
 
-& $powershell `
-    -NoLogo `
-    -NoProfile `
-    -ExecutionPolicy Bypass `
-    -File $runnerPath `
-    -CheckId rust-format `
-    -CandidateCommit $commit `
-    -CandidateTree $tree `
-    -ExpectedRegistrySha256 $registrySha256 `
-    -ExpectedGitLauncherPath $gitExecutable `
-    -ExpectedGitLauncherSha256 $gitLauncherSha256 `
-    -ExpectedGitResolvedSha256 $gitResolvedSha256 `
-    -EvidenceRoot $evidenceRelative
-if ($LASTEXITCODE -ne 0) {
-    throw 'The direct source-command smoke check failed.'
+$pwshExecutable = [string](@(Get-Command pwsh.exe -CommandType Application `
+            -ErrorAction Stop)[0].Source)
+$poisonedModuleRoot = Join-Path (Split-Path -Parent $pwshExecutable) 'Modules'
+$poisonedSecurityManifest = Join-Path $poisonedModuleRoot `
+    'Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'
+if (-not (Test-Path -LiteralPath $poisonedSecurityManifest -PathType Leaf)) {
+    throw 'The source-command module-path regression fixture is unavailable.'
+}
+$escapedRunnerPath = $runnerPath.Replace("'", "''")
+$escapedGitExecutable = $gitExecutable.Replace("'", "''")
+$escapedEvidenceRelative = $evidenceRelative.Replace("'", "''")
+$moduleBindingProbeTemplate = @'
+$autoloadFailed = $false
+try {
+    Get-AuthenticodeSignature -LiteralPath (Join-Path $PSHOME 'powershell.exe') -ErrorAction Stop | Out-Null
+}
+catch {
+    $autoloadFailed = [string]$_.FullyQualifiedErrorId -like '*CouldNotAutoloadMatchingModule*'
+}
+if (-not $autoloadFailed) {
+    throw 'source_command_security_module_poison_fixture_invalid'
+}
+. '__STEIN_RUNNER_PATH__' -LibraryOnly
+function global:Get-AuthenticodeSignature {
+    [CmdletBinding()]
+    param([string] $LiteralPath)
+    return [pscustomobject]@{
+        Status = 'Valid'
+        SignerCertificate = [pscustomobject]@{
+            Subject = 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US'
+        }
+    }
+}
+$shadowRejected = $false
+try {
+    Initialize-SteinSourceCommandSecurityModule
+}
+catch {
+    $shadowRejected = [string]$_.Exception.Message -ceq
+        'source_command_security_module_binding_invalid'
+}
+finally {
+    Remove-Item -LiteralPath Function:\Get-AuthenticodeSignature `
+        -Force -ErrorAction SilentlyContinue
+}
+if (-not $shadowRejected) {
+    throw 'source_command_security_module_shadow_not_rejected'
+}
+Remove-Module -Name 'Microsoft.PowerShell.Security' `
+    -Force -ErrorAction Stop
+$env:PSModulePath = '__STEIN_POISONED_MODULE_ROOT__'
+& '__STEIN_RUNNER_PATH__' `
+    -CheckId 'rust-format' `
+    -CandidateCommit '__STEIN_CANDIDATE_COMMIT__' `
+    -CandidateTree '__STEIN_CANDIDATE_TREE__' `
+    -ExpectedRegistrySha256 '__STEIN_REGISTRY_SHA256__' `
+    -ExpectedGitLauncherPath '__STEIN_GIT_EXECUTABLE__' `
+    -ExpectedGitLauncherSha256 '__STEIN_GIT_LAUNCHER_SHA256__' `
+    -ExpectedGitResolvedSha256 '__STEIN_GIT_RESOLVED_SHA256__' `
+    -EvidenceRoot '__STEIN_EVIDENCE_ROOT__'
+'@
+$moduleBindingProbe = $moduleBindingProbeTemplate.Replace(
+    '__STEIN_RUNNER_PATH__',
+    $escapedRunnerPath).Replace(
+    '__STEIN_POISONED_MODULE_ROOT__',
+    $poisonedModuleRoot.Replace("'", "''")).Replace(
+    '__STEIN_CANDIDATE_COMMIT__',
+    $commit).Replace(
+    '__STEIN_CANDIDATE_TREE__',
+    $tree).Replace(
+    '__STEIN_REGISTRY_SHA256__',
+    $registrySha256).Replace(
+    '__STEIN_GIT_EXECUTABLE__',
+    $escapedGitExecutable).Replace(
+    '__STEIN_GIT_LAUNCHER_SHA256__',
+    $gitLauncherSha256).Replace(
+    '__STEIN_GIT_RESOLVED_SHA256__',
+    $gitResolvedSha256).Replace(
+    '__STEIN_EVIDENCE_ROOT__',
+    $escapedEvidenceRelative)
+$moduleBindingProbeEncoded = [Convert]::ToBase64String(
+    [Text.Encoding]::Unicode.GetBytes($moduleBindingProbe))
+$moduleBindingProbeStart = [Diagnostics.ProcessStartInfo]::new()
+$moduleBindingProbeStart.FileName = $powershell
+$moduleBindingProbeStart.Arguments =
+    "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $moduleBindingProbeEncoded"
+$moduleBindingProbeStart.WorkingDirectory = $repoRoot
+$moduleBindingProbeStart.UseShellExecute = $false
+$moduleBindingProbeStart.CreateNoWindow = $true
+$moduleBindingProbeStart.RedirectStandardOutput = $true
+$moduleBindingProbeStart.RedirectStandardError = $true
+$moduleBindingProbeStart.EnvironmentVariables['PSModulePath'] =
+    $poisonedModuleRoot
+$moduleBindingProbeProcess = [Diagnostics.Process]::new()
+$moduleBindingProbeProcess.StartInfo = $moduleBindingProbeStart
+$moduleBindingProbeStarted = $false
+try {
+    if (-not $moduleBindingProbeProcess.Start()) {
+        throw 'The source-command poisoned module-path probe could not start.'
+    }
+    $moduleBindingProbeStarted = $true
+    $moduleBindingProbeStdoutTask =
+        $moduleBindingProbeProcess.StandardOutput.ReadToEndAsync()
+    $moduleBindingProbeStderrTask =
+        $moduleBindingProbeProcess.StandardError.ReadToEndAsync()
+    if (-not $moduleBindingProbeProcess.WaitForExit(660000)) {
+        try { $moduleBindingProbeProcess.Kill() } catch { }
+        throw 'The source-command poisoned module-path probe timed out.'
+    }
+    $moduleBindingProbeProcess.WaitForExit()
+    $moduleBindingProbeStdout = [string]$moduleBindingProbeStdoutTask.Result
+    $moduleBindingProbeStderr = [string]$moduleBindingProbeStderrTask.Result
+    if ($moduleBindingProbeStdout.Length -gt 1048576 -or
+        $moduleBindingProbeStderr.Length -gt 1048576 -or
+        $moduleBindingProbeProcess.ExitCode -ne 0) {
+        throw 'The source-command runner did not repair a poisoned inherited module path.'
+    }
+}
+finally {
+    if ($moduleBindingProbeStarted) {
+        try {
+            if (-not $moduleBindingProbeProcess.HasExited) {
+                $moduleBindingProbeProcess.Kill()
+            }
+        }
+        catch { }
+    }
+    $moduleBindingProbeProcess.Dispose()
 }
 
 $receiptPath = Join-Path $evidencePath `

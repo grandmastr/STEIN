@@ -536,6 +536,14 @@ $sourceCommandRunnerSource = [IO.File]::ReadAllText($sourceCommandRunnerPath)
 $sourceCommandTestSource = [IO.File]::ReadAllText($sourceCommandTestPath)
 foreach ($required in @(
         'if ($LibraryOnly)',
+        'Initialize-SteinSourceCommandSecurityModule',
+        'source_command_windows_powershell_host_invalid',
+        '[Environment]::Is64BitProcess',
+        'Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1',
+        'Microsoft.PowerShell.Security\Get-AuthenticodeSignature',
+        '$env:PSModulePath = $desktopModuleRoot',
+        'Import-Module -Name $desktopSecurityModuleManifest',
+        'source_command_security_module_binding_invalid',
         'Assert-SteinSourceCommandRegistry',
         'ConvertTo-SteinSourceCommandArgumentVector',
         'Get-SteinSourceCommandReceiptCoverage',
@@ -556,6 +564,9 @@ foreach ($required in @(
         'ExecutionGroupCount -ne 25',
         'profileDrift',
         'reasonDrift',
+        'source_command_security_module_shadow_not_rejected',
+        'CouldNotAutoloadMatchingModule',
+        'WaitForExit(660000)',
         'orderedDigest',
         'mismatched resolved Git payload',
         'finalizer accepted incomplete 37-check coverage')) {

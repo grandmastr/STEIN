@@ -814,7 +814,8 @@ function Resolve-SteinSourceCommandExecutable {
         throw 'source_command_executable_invalid'
     }
     if ($Role -ceq 'pwsh') {
-        $signature = Get-AuthenticodeSignature -LiteralPath $item.FullName `
+        $signature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature `
+            -LiteralPath $item.FullName `
             -ErrorAction Stop
         $subject = 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US'
         if ([string]$signature.Status -cne 'Valid' -or
@@ -1895,9 +1896,101 @@ function Get-SteinSourceCommandReceiptCoverage {
     }
 }
 
+function Initialize-SteinSourceCommandSecurityModule {
+    if ($PSVersionTable.PSEdition -cne 'Desktop' -or
+        -not [Environment]::Is64BitProcess) {
+        throw 'source_command_windows_powershell_host_invalid'
+    }
+
+    $expectedDesktopHome = [IO.Path]::GetFullPath((Join-Path (
+                [Environment]::GetFolderPath(
+                    [Environment+SpecialFolder]::System)) `
+            'WindowsPowerShell\v1.0')).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar)
+    $desktopHome = [IO.Path]::GetFullPath([string]$PSHOME).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar)
+    if (-not [string]::Equals(
+            $desktopHome,
+            $expectedDesktopHome,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'source_command_windows_powershell_host_invalid'
+    }
+
+    $desktopModuleRoot = [IO.Path]::GetFullPath((
+            Join-Path $desktopHome 'Modules'))
+    $desktopSecurityModuleRoot = [IO.Path]::GetFullPath((
+            Join-Path $desktopModuleRoot 'Microsoft.PowerShell.Security'))
+    $desktopSecurityModuleManifest = [IO.Path]::GetFullPath((
+            Join-Path $desktopModuleRoot `
+                'Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'))
+    foreach ($binding in @(
+            [pscustomobject]@{ Path = $desktopHome; Container = $true },
+            [pscustomobject]@{ Path = $desktopModuleRoot; Container = $true },
+            [pscustomobject]@{
+                Path = $desktopSecurityModuleRoot
+                Container = $true
+            },
+            [pscustomobject]@{
+                Path = $desktopSecurityModuleManifest
+                Container = $false
+            })) {
+        $item = Get-Item -LiteralPath ([string]$binding.Path) `
+            -Force -ErrorAction Stop
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            ([bool]$binding.Container -and -not $item.PSIsContainer) -or
+            (-not [bool]$binding.Container -and $item.PSIsContainer) -or
+            (-not [bool]$binding.Container -and $item.Length -lt 1) -or
+            -not [string]::Equals(
+                $item.FullName,
+                [string]$binding.Path,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'source_command_security_module_path_unsafe'
+        }
+    }
+
+    foreach ($loadedModule in @(Get-Module `
+                -Name 'Microsoft.PowerShell.Security' -ErrorAction Stop)) {
+        if (-not [string]::Equals(
+                [string]$loadedModule.Path,
+                $desktopSecurityModuleManifest,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'source_command_security_module_binding_invalid'
+        }
+    }
+
+    $env:PSModulePath = $desktopModuleRoot
+    Import-Module -Name $desktopSecurityModuleManifest `
+        -Force -ErrorAction Stop
+    $boundModules = @(Get-Module `
+            -Name 'Microsoft.PowerShell.Security' -ErrorAction Stop)
+    $signatureCommands = @(Get-Command `
+            -Name 'Get-AuthenticodeSignature' `
+            -All `
+            -ErrorAction Stop)
+    if ($boundModules.Count -ne 1 -or
+        $signatureCommands.Count -ne 1 -or
+        -not [string]::Equals(
+            [string]$boundModules[0].Path,
+            $desktopSecurityModuleManifest,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        [string]$signatureCommands[0].ModuleName -cne
+            'Microsoft.PowerShell.Security' -or
+        [string]$signatureCommands[0].CommandType -cne 'Cmdlet' -or
+        $null -eq $signatureCommands[0].Module -or
+        -not [string]::Equals(
+            [string]$signatureCommands[0].Module.Path,
+            $desktopSecurityModuleManifest,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'source_command_security_module_binding_invalid'
+    }
+}
+
 if ($LibraryOnly) {
     return
 }
+Initialize-SteinSourceCommandSecurityModule
 if ($CheckId -cnotmatch '^[a-z0-9][a-z0-9._-]{2,95}$' -or
     $CandidateCommit -cnotmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$' -or
     $CandidateTree -cnotmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$' -or
