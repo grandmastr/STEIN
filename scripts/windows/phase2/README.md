@@ -379,8 +379,8 @@ It records format, all-target/all-feature Rust check/Clippy/tests, renderer
 typecheck/lint/tests/build, Edge-extension policy tests, isolated native-host
 format/check/Clippy/tests, dependency-boundary checks, static MSIX/lifecycle
 checks, the installed-reviewer suite under both exact Windows PowerShell 5.1 and
-PowerShell 7 (`pwsh`), release workspace/production-CORE/native-host builds, and
-the no-bundle Tauri build under a timestamped
+PowerShell 7.5+ (`pwsh`), release workspace/production-CORE/native-host builds,
+and the no-bundle Tauri build under a timestamped
 `artifacts\evidence\phase-2\source-*` directory. The report labels itself
 `source_verification_only`; synthetic
 compile-time PFN/hash/extension values are never represented as an installed or

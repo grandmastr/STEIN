@@ -6,6 +6,12 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 3.0
 
+if ([string]$PSVersionTable.PSEdition -ceq "Core" -and
+    $PSVersionTable.PSVersion -lt [Version]"7.5") {
+    [Console]::Error.WriteLine("powershell_core_7_5_or_newer_required")
+    exit 1
+}
+
 if ($WindowsPowerShellCompatibilityChild) {
     . (Join-Path $PSScriptRoot "Common.ps1")
     if ([string]$PSVersionTable.PSEdition -cne "Desktop") {
@@ -402,6 +408,8 @@ foreach ($required in @(
         "Assert-SteinPhase2NoLeaksReceiptPair",
         "Read-SteinInstalledLockedJsonFile",
         "[IO.FileShare]::Read",
+        "powershell_core_7_5_or_newer_required",
+        '$convertParameters.DateKind = "String"',
         "Assert-SteinInstalledExternalEvidenceFilesStable",
         "runner_artifacts",
         "source_check_ids",

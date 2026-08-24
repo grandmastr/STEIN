@@ -4,6 +4,12 @@ param([switch] $ReviewTestLibraryOnly)
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 3.0
 
+if ([string]$PSVersionTable.PSEdition -ceq "Core" -and
+    $PSVersionTable.PSVersion -lt [Version]"7.5") {
+    [Console]::Error.WriteLine("powershell_core_7_5_or_newer_required")
+    exit 1
+}
+
 $reviewerPath = Join-Path $PSScriptRoot "Review-Installed.ps1"
 $launcherPath = Join-Path $PSScriptRoot "Review-Installed.cmd"
 $commonPath = Join-Path $PSScriptRoot "Common.ps1"
@@ -149,6 +155,8 @@ foreach ($requiredLiteral in @(
         "local_paths_retained = `$false",
         "user_sid_retained = `$false",
         "raw_host_retained = `$false",
+        "powershell_core_7_5_or_newer_required",
+        '$convertParameters.DateKind = "String"',
         "installed_state_mutated = `$false",
         "complete_acceptance",
         "reviewer-generator.json",
@@ -319,7 +327,9 @@ function New-SteinReviewSyntheticFixture {
     $rowsDirectory = Join-Path $evidenceRoot "ledger-rows"
     $null = New-Item -ItemType Directory -Path $rowsDirectory -ErrorAction Stop
 
-    $recordedAt = [DateTime]::UtcNow.AddMinutes(-1).ToString("o")
+    $recordedAt = [DateTime]::UtcNow.AddMinutes(-1).ToString(
+        "yyyy-MM-dd'T'HH:mm:ss'.0000000Z'",
+        [Globalization.CultureInfo]::InvariantCulture)
     $runtimeSources = if ($FabricatedGeneratorSource) {
         @(
             [ordered]@{

@@ -32,6 +32,11 @@ trap {
     exit 1
 }
 
+if ([string]$PSVersionTable.PSEdition -ceq "Core" -and
+    $PSVersionTable.PSVersion -lt [Version]"7.5") {
+    throw "powershell_core_7_5_or_newer_required"
+}
+
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..\..")).Path
 $commonPath = Join-Path $PSScriptRoot "Common.ps1"
 
@@ -617,7 +622,14 @@ function Read-SteinReviewJsonFile {
         $stream.Dispose()
     }
     try {
-        return $jsonText | ConvertFrom-Json -ErrorAction Stop
+        $convertParameters = @{ ErrorAction = "Stop" }
+        if ([string]$PSVersionTable.PSEdition -ceq "Core") {
+            # PowerShell 7.5+ otherwise coerces ISO 8601 strings to DateTime.
+            # Re-serializing those values can trim fractional trailing zeroes and
+            # invalidate digests over the original JSON value model.
+            $convertParameters.DateKind = "String"
+        }
+        return $jsonText | ConvertFrom-Json @convertParameters
     }
     catch {
         throw $FailureCode

@@ -27,6 +27,12 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 3.0
 
+if ([string]$PSVersionTable.PSEdition -ceq "Core" -and
+    $PSVersionTable.PSVersion -lt [Version]"7.5") {
+    [Console]::Error.WriteLine("powershell_core_7_5_or_newer_required")
+    exit 1
+}
+
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..\..")).Path
 function Get-SteinInstalledLockedStreamSha256 {
     param(
@@ -736,7 +742,12 @@ function Read-SteinInstalledLockedJsonFile {
         $stream.Dispose()
     }
     try {
-        $value = $jsonText | ConvertFrom-Json -ErrorAction Stop
+        $convertParameters = @{ ErrorAction = "Stop" }
+        if ([string]$PSVersionTable.PSEdition -ceq "Core") {
+            # Keep locked JSON strings byte-model stable for contract digests.
+            $convertParameters.DateKind = "String"
+        }
+        $value = $jsonText | ConvertFrom-Json @convertParameters
     }
     catch {
         throw $FailureCode
