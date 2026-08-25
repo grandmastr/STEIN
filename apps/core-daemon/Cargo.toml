@@ -1,0 +1,60 @@
+[package]
+name = "stein-core-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "stein-core"
+path = "src/main.rs"
+
+[features]
+default = []
+# Enabled only by the trusted signed production build. build.rs then requires
+# and validates the exact installed broker PFN/AUMID before embedding them.
+production-private-endpoint = [
+    "dep:stein-model-openai",
+    "dep:stein-platform-windows",
+    "dep:stein-store-sqlite",
+    "dep:uuid",
+    "dep:windows",
+    "dep:windows-sys",
+]
+production-edge-producer = [
+    "production-private-endpoint",
+    "dep:stein-broker-windows",
+    "dep:tokio-util",
+]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+stein-core = { path = "../../crates/stein-core" }
+stein-ipc = { path = "../../crates/stein-ipc" }
+tokio.workspace = true
+tokio-util = { workspace = true, optional = true }
+time.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+stein-model-openai = { path = "../../crates/stein-model-openai", optional = true }
+stein-broker-windows = { path = "../../crates/stein-broker-windows", optional = true }
+stein-platform-windows = { path = "../../crates/stein-platform-windows", optional = true }
+stein-store-sqlite = { path = "../../crates/stein-store-sqlite", optional = true }
+windows = { version = "0.61", optional = true, features = [
+    "ApplicationModel",
+    "Win32_System_WinRT",
+] }
+windows-sys = { version = "0.61", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+tempfile = "3.23"

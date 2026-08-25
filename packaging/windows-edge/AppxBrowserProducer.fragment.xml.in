@@ -1,0 +1,18 @@
+<!--
+  This is a review fixture, not a complete AppxManifest and not installed by
+  the browser artifact build. The native Edge launch fixture must prove that
+  direct launch of this executable preserves this exact token application ID.
+-->
+<Application
+  Id="BrowserObservationProducer"
+  Executable="browser-host\stein-edge-native-host.exe"
+  uap10:RuntimeBehavior="packagedClassicApp"
+  uap10:TrustLevel="mediumIL">
+  <uap:VisualElements
+    AppListEntry="none"
+    DisplayName="STEIN Browser Observation Producer"
+    Description="One-way selected Edge observation producer"
+    BackgroundColor="transparent"
+    Square150x150Logo="assets\Square150x150Logo.png"
+    Square44x44Logo="assets\Square44x44Logo.png" />
+</Application>

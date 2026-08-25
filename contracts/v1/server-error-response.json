@@ -1,0 +1,41 @@
+{
+  "message_type": "response",
+  "body": {
+    "request_id": "018f0000-0000-7001-8000-000000000006",
+    "metadata": {
+      "message_id": "018f0000-0000-7001-8000-000000000014",
+      "schema_version": 1,
+      "issued_at": "2026-08-19T08:00:02Z",
+      "correlation_id": "018f0000-0000-7001-8000-000000000008",
+      "causation_id": "018f0000-0000-7001-8000-000000000007",
+      "actor": {
+        "actor_id": "018f0000-0000-7001-8000-000000000004",
+        "kind": "local_os_user"
+      },
+      "origin": "core_daemon",
+      "sensitivity": "personal",
+      "retention": "runtime"
+    },
+    "outcome": {
+      "outcome": "error",
+      "body": {
+        "code": "invalid_argument",
+        "category": "invalid_argument",
+        "summary": "The goal could not be created because a required field is missing.",
+        "retryable": false,
+        "correlation_id": "018f0000-0000-7001-8000-000000000008",
+        "details": {
+          "detail_type": "validation",
+          "detail": {
+            "violations": [
+              {
+                "field": "title",
+                "reason": "required"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

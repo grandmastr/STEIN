@@ -1,0 +1,21 @@
+{
+  "message_type": "open_session",
+  "body": {
+    "client_instance_id": "018f0000-0000-7001-8000-000000000001",
+    "client_name": "STEIN Desktop",
+    "client_build_id": "0.1.0-poc",
+    "protocol_support": {
+      "major": 1,
+      "minimum_minor": 0,
+      "maximum_minor": 0
+    },
+    "max_frame_bytes": 1048576,
+    "capabilities": [
+      "snapshot",
+      "runtime_status",
+      "goal_create",
+      "view_events",
+      "request_cancellation"
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "STEIN Selected Browser Surface",
+  "description": "Shares only an explicitly selected active Edge surface with local STEIN CORE.",
+  "version": "0.1.0",
+  "minimum_chrome_version": "120",
+  "incognito": "not_allowed",
+  "permissions": [
+    "activeTab",
+    "nativeMessaging",
+    "scripting",
+    "storage"
+  ],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Select this tab for STEIN"
+  }
+}
+

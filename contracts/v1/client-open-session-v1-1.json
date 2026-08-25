@@ -1,0 +1,30 @@
+{
+  "message_type": "open_session",
+  "body": {
+    "client_instance_id": "018f0000-0000-7000-8000-000000000011",
+    "client_name": "synthetic-phase2-client",
+    "client_build_id": "0.1.0-phase2-fixture",
+    "protocol_support": {
+      "major": 1,
+      "minimum_minor": 0,
+      "maximum_minor": 1
+    },
+    "max_frame_bytes": 1048576,
+    "capabilities": [
+      "snapshot",
+      "runtime_status",
+      "goal_create",
+      "goal_update",
+      "view_events",
+      "request_cancellation",
+      "model_route_approval",
+      "session_permissions",
+      "focus_sessions",
+      "capture_state",
+      "delivery_channels",
+      "intervention_feedback",
+      "intervention_history",
+      "intervention_explanation"
+    ]
+  }
+}

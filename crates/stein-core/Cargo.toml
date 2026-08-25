@@ -1,0 +1,23 @@
+[package]
+name = "stein-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+stein-protocol = { path = "../stein-protocol" }
+time.workspace = true
+tokio.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
+uuid.workspace = true
+zeroize = "1.9"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints.rust]
+unsafe_code = "forbid"

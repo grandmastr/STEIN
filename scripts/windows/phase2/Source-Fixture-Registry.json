@@ -1,0 +1,827 @@
+{
+  "schema_version": 1,
+  "registry_id": "stein.phase2.source-fixture.registry.v1",
+  "receipt_schema_version": 1,
+  "fixtures": [
+    {
+      "source_check_id": "phase2-source-fixture-upgrade",
+      "source_fixture_id": "phase2-source-fixture-upgrade-v1",
+      "source_runner_id": "stein.phase2.source-fixture.upgrade.v1",
+      "gate_id": "P2-UPGRADE",
+      "gate_fixture_id": "phase2-upgrade-v1",
+      "gate_runner_id": "stein.phase2.upgrade.v1",
+      "semantic_source_paths": [
+        "Cargo.lock",
+        "crates/stein-core/Cargo.toml",
+        "crates/stein-core/src/phase2_domain.rs",
+        "crates/stein-core/src/repository.rs",
+        "crates/stein-store-sqlite/Cargo.toml",
+        "crates/stein-store-sqlite/src/lib.rs",
+        "crates/stein-store-sqlite/tests/repository.rs"
+      ],
+      "subchecks": [
+        {
+          "id": "migration_atomicity_source",
+          "invocations": [
+            { "kind": "store", "module": "repository", "test": "failed_v3_preferences_migration_rolls_back_without_advancing_catalog" },
+            { "kind": "store", "module": "repository", "test": "rolled_back_partial_migration_retries_cleanly" },
+            { "kind": "store", "module": "repository", "test": "failed_v1_data_migration_leaves_original_schema_unchanged" }
+          ]
+        },
+        {
+          "id": "migration_catalog_source",
+          "invocations": [
+            { "kind": "store", "module": "repository", "test": "v1_fixture_upgrades_once_and_preserves_linked_state" },
+            { "kind": "store", "module": "repository", "test": "v2_fixture_upgrades_without_mutating_aggregates" },
+            { "kind": "store", "module": "repository", "test": "immediately_preceding_v5_adds_private_secret_cleanup_storage" },
+            { "kind": "store", "module": "repository", "test": "immediately_preceding_v3_preferences_apply_defaults_and_canonicalize_once" },
+            { "kind": "store", "module": "repository", "test": "migration_catalog_uses_full_checksums_and_mismatch_fails_closed" },
+            { "kind": "store", "module": "repository", "test": "unknown_schema_fails_closed" }
+          ]
+        }
+      ]
+    },
+    {
+      "source_check_id": "phase2-source-fixture-secrets",
+      "source_fixture_id": "phase2-source-fixture-secrets-v1",
+      "source_runner_id": "stein.phase2.source-fixture.secrets.v1",
+      "gate_id": "P2-SECRETS",
+      "gate_fixture_id": "phase2-secrets-v1",
+      "gate_runner_id": "stein.phase2.secrets.v1",
+      "semantic_source_paths": [
+        "Cargo.lock",
+        "apps/desktop/src-tauri/Cargo.toml",
+        "apps/desktop/src-tauri/src/lib.rs",
+        "apps/desktop/src/lib/core.test.ts",
+        "apps/desktop/src/lib/core.ts",
+        "crates/stein-core/Cargo.toml",
+        "crates/stein-core/src/phase2_domain.rs",
+        "crates/stein-core/src/phase2_ports.rs",
+        "crates/stein-core/src/protocol_adapter.rs",
+        "crates/stein-core/src/repository.rs",
+        "crates/stein-core/src/second_mind.rs",
+        "crates/stein-model-openai/Cargo.toml",
+        "crates/stein-model-openai/src/lib.rs",
+        "crates/stein-protocol/Cargo.toml",
+        "crates/stein-protocol/src/message.rs",
+        "crates/stein-protocol/src/views.rs",
+        "crates/stein-protocol/tests/protocol_contract.rs"
+      ],
+      "subchecks": [
+        {
+          "id": "delete_failure_obligation",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "revoked_route_retains_secret_cleanup_until_a_content_free_retry_succeeds" }
+          ]
+        },
+        {
+          "id": "no_client_read",
+          "invocations": [
+            { "kind": "protocol", "module": "protocol_contract", "test": "phase2_secrets_protocol_surface_is_closed_and_value_free" },
+            { "kind": "core", "module": "protocol_adapter", "test": "phase2_secrets_diagnostic_client_cannot_query_model_route_state" },
+            { "kind": "desktop", "module": "phase2_secrets_tests", "test": "phase2_secrets_tauri_command_surface_is_closed_and_value_free" }
+          ]
+        },
+        {
+          "id": "no_fallback",
+          "invocations": [
+            { "kind": "model", "module": "tests", "test": "phase2_secrets_missing_store_value_fails_before_network_without_fallback" }
+          ]
+        }
+      ]
+    },
+    {
+      "source_check_id": "phase2-source-fixture-identity",
+      "source_fixture_id": "phase2-source-fixture-identity-v1",
+      "source_runner_id": "stein.phase2.source-fixture.identity.v1",
+      "gate_id": "P2-IDENTITY",
+      "gate_fixture_id": "phase2-identity-v1",
+      "gate_runner_id": "stein.phase2.identity.v1",
+      "semantic_source_paths": [
+        "Cargo.lock",
+        "crates/stein-core/Cargo.toml",
+        "crates/stein-core/src/phase2_domain.rs",
+        "crates/stein-core/src/repository.rs",
+        "crates/stein-core/src/second_mind.rs",
+        "crates/stein-protocol/Cargo.toml",
+        "crates/stein-protocol/src/message.rs",
+        "crates/stein-protocol/src/views.rs",
+        "crates/stein-store-sqlite/Cargo.toml",
+        "crates/stein-store-sqlite/src/lib.rs",
+        "crates/stein-store-sqlite/tests/repository.rs"
+      ],
+      "subchecks": [
+        {
+          "id": "implicit_learning_denied",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "phase2_identity_observation_model_and_feedback_do_not_mutate_durable_records" }
+          ]
+        },
+        {
+          "id": "revision_conflict",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "phase2_identity_revision_conflict_preserves_current_preferences" },
+            { "kind": "store", "module": "repository", "test": "phase2_identity_sqlite_revision_conflicts_preserve_identity_and_preferences" }
+          ]
+        },
+        {
+          "id": "stricter_policy",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "phase2_identity_stricter_preferences_produce_quieter_effective_policy" }
+          ]
+        }
+      ]
+    },
+    {
+      "source_check_id": "phase2-source-fixture-phase1-regression",
+      "source_fixture_id": "phase2-source-fixture-phase1-regression-v1",
+      "source_runner_id": "stein.phase2.source-fixture.phase1-regression.v1",
+      "gate_id": "P2-PHASE1-REGRESSION",
+      "gate_fixture_id": "phase2-phase1-regression-v1",
+      "gate_runner_id": "stein.phase2.phase1-regression.v1",
+      "semantic_source_paths": [
+        "Cargo.lock",
+        "crates/stein-ipc/Cargo.toml",
+        "crates/stein-ipc/src/client.rs",
+        "crates/stein-ipc/src/lib.rs",
+        "crates/stein-ipc/src/server.rs",
+        "crates/stein-ipc/src/windows/mod.rs",
+        "crates/stein-ipc/src/windows/transport.rs",
+        "crates/stein-protocol/Cargo.toml",
+        "crates/stein-protocol/src/lib.rs",
+        "crates/stein-protocol/src/metadata.rs",
+        "crates/stein-protocol/src/version.rs",
+        "crates/stein-protocol/src/wire.rs"
+      ],
+      "subchecks": [
+        {
+          "id": "cancellation",
+          "invocations": [
+            { "kind": "ipc", "module": "client::implementation", "test": "phase2_source_fixture_phase1_regression_requires_confirmed_client_cancellation" },
+            { "kind": "ipc", "module": "server::implementation", "test": "phase2_source_fixture_phase1_regression_preserves_server_contracts" }
+          ]
+        },
+        {
+          "id": "capacity",
+          "invocations": [
+            { "kind": "ipc", "module": "server::implementation", "test": "phase2_source_fixture_phase1_regression_preserves_server_contracts" }
+          ]
+        },
+        {
+          "id": "protocol",
+          "invocations": [
+            { "kind": "ipc", "module": "server::implementation", "test": "phase2_source_fixture_phase1_regression_preserves_server_contracts" }
+          ]
+        }
+      ]
+    },
+    {
+      "source_check_id": "phase2-source-fixture-goals",
+      "source_fixture_id": "phase2-source-fixture-goals-v1",
+      "source_runner_id": "stein.phase2.source-fixture.goals.v1",
+      "gate_id": "P2-GOALS",
+      "gate_fixture_id": "phase2-goals-v1",
+      "gate_runner_id": "stein.phase2.goals.v1",
+      "semantic_source_paths": [
+        "Cargo.lock",
+        "crates/stein-core/Cargo.toml",
+        "crates/stein-core/src/application.rs",
+        "crates/stein-core/src/domain.rs",
+        "crates/stein-core/src/protocol_adapter.rs",
+        "crates/stein-core/src/repository.rs",
+        "crates/stein-core/src/second_mind.rs",
+        "crates/stein-protocol/Cargo.toml",
+        "crates/stein-protocol/src/message.rs",
+        "crates/stein-protocol/src/metadata.rs",
+        "crates/stein-protocol/src/wire.rs",
+        "crates/stein-store-sqlite/Cargo.toml",
+        "crates/stein-store-sqlite/src/lib.rs",
+        "crates/stein-store-sqlite/tests/repository.rs"
+      ],
+      "subchecks": [
+        {
+          "id": "delete_cascade",
+          "invocations": [
+            { "kind": "store", "module": "repository", "test": "goal_delete_cascades_private_graph_but_preserves_identity_and_route" },
+            { "kind": "store", "module": "repository", "test": "goal_delete_preserves_a_resource_and_its_audit_while_another_goal_references_it" }
+          ]
+        },
+        {
+          "id": "idempotency",
+          "invocations": [
+            { "kind": "core", "module": "application", "test": "duplicate_create_returns_original_result_without_an_event" },
+            { "kind": "core", "module": "application", "test": "reusing_idempotency_key_for_different_input_is_a_safe_conflict" },
+            { "kind": "core", "module": "protocol_adapter", "test": "protocol_create_is_idempotent_and_snapshot_is_authoritative" },
+            { "kind": "store", "module": "repository", "test": "revisions_and_goal_receipt_are_atomic" }
+          ]
+        },
+        {
+          "id": "revision_conflict",
+          "invocations": [
+            { "kind": "core", "module": "application", "test": "update_requires_expected_revision_and_preserves_winning_state" },
+            { "kind": "store", "module": "repository", "test": "revisions_and_goal_receipt_are_atomic" }
+          ]
+        }
+      ]
+    },
+    {
+      "source_check_id": "phase2-source-fixture-pixels",
+      "source_fixture_id": "phase2-source-fixture-pixels-v1",
+      "source_runner_id": "stein.phase2.source-fixture.pixels.v1",
+      "gate_id": "P2-PIXELS",
+      "gate_fixture_id": "phase2-pixels-v1",
+      "gate_runner_id": "stein.phase2.pixels.v1",
+      "semantic_source_paths": [
+        "Cargo.lock",
+        "crates/stein-core/Cargo.toml",
+        "crates/stein-core/src/phase2_domain.rs",
+        "crates/stein-core/src/phase2_ports.rs",
+        "crates/stein-core/src/second_mind.rs",
+        "crates/stein-platform-windows/Cargo.toml",
+        "crates/stein-platform-windows/src/lib.rs",
+        "crates/stein-platform-windows/src/observation.rs",
+        "crates/stein-platform-windows/src/pixel.rs"
+      ],
+      "subchecks": [
+        {
+          "id": "bounded_frame",
+          "invocations": [
+            { "kind": "windows", "module": "pixel", "test": "pixel_dimensions_enforce_frame_and_decoded_storage_bounds" },
+            { "kind": "windows", "module": "pixel", "test": "normalization_emits_only_coarse_non_image_metadata" },
+            { "kind": "windows", "module": "observation", "test": "pixel_source_emits_one_coarse_single_operation_observation" }
+          ]
+        },
+        {
+          "id": "frame_destroyed",
+          "invocations": [
+            { "kind": "windows", "module": "pixel", "test": "transient_cpu_frame_is_zeroized_before_release" },
+            { "kind": "core", "module": "second_mind", "test": "single_operation_observation_is_consumed_by_one_context_assembly" },
+            { "kind": "core", "module": "second_mind", "test": "single_operation_observation_has_a_bounded_unused_retention_fallback" }
+          ]
+        },
+        {
+          "id": "structured_source_preferred",
+          "invocations": [
+            { "kind": "windows", "module": "observation", "test": "active_structured_source_prevents_pixel_capture_and_use" },
+            { "kind": "windows", "module": "observation", "test": "externally_composed_browser_source_prevents_pixel_capture" },
+            { "kind": "windows", "module": "observation", "test": "browser_document_uia_and_window_metadata_precede_pixels" },
+            { "kind": "core", "module": "second_mind", "test": "observation_start_order_is_stable_and_places_structured_sources_before_pixels" }
+          ]
+        }
+      ]
+    },
+    {
+      "source_check_id": "phase2-source-fixture-model-contract",
+      "source_fixture_id": "phase2-source-fixture-model-contract-v1",
+      "source_runner_id": "stein.phase2.source-fixture.model-contract.v1",
+      "gate_id": "P2-MODEL-CONTRACT",
+      "gate_fixture_id": "phase2-model-contract-v1",
+      "gate_runner_id": "stein.phase2.model-contract.v1",
+      "semantic_source_paths": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "apps/desktop/src/components/ModelRouteConsent.tsx",
+        "contracts/model/phase2-openai-model-contract-v1.json",
+        "crates/stein-core/Cargo.toml",
+        "crates/stein-core/src/application.rs",
+        "crates/stein-core/src/clock.rs",
+        "crates/stein-core/src/domain.rs",
+        "crates/stein-core/src/error.rs",
+        "crates/stein-core/src/lib.rs",
+        "crates/stein-core/src/phase2_domain.rs",
+        "crates/stein-core/src/phase2_ports.rs",
+        "crates/stein-core/src/ports.rs",
+        "crates/stein-core/src/protocol_adapter.rs",
+        "crates/stein-core/src/repository.rs",
+        "crates/stein-core/src/second_mind.rs",
+        "crates/stein-core/src/view_publication.rs",
+        "crates/stein-model-openai/Cargo.toml",
+        "crates/stein-model-openai/src/lib.rs",
+        "crates/stein-protocol/Cargo.toml",
+        "crates/stein-protocol/src/ids.rs",
+        "crates/stein-protocol/src/lib.rs",
+        "crates/stein-protocol/src/message.rs",
+        "crates/stein-protocol/src/metadata.rs",
+        "crates/stein-protocol/src/timestamp.rs",
+        "crates/stein-protocol/src/version.rs",
+        "crates/stein-protocol/src/views.rs",
+        "crates/stein-protocol/src/wire.rs",
+        "crates/stein-store-sqlite/Cargo.toml",
+        "crates/stein-store-sqlite/src/lib.rs",
+        "crates/stein-store-sqlite/tests/repository.rs",
+        "scripts/windows/check-boundaries.ps1"
+      ],
+      "subchecks": [
+        {
+          "id": "credential_absent",
+          "invocations": [
+            { "kind": "model", "module": "tests", "test": "request_has_no_tools_state_or_unapproved_category" },
+            { "kind": "model", "module": "tests", "test": "checked_in_model_packet_golden_binds_the_exact_category_intersection" },
+            { "kind": "model", "module": "tests", "test": "authorization_header_is_sensitive_and_rejects_ambiguous_keys" },
+            { "kind": "store", "module": "repository", "test": "schema_and_payloads_exclude_prohibited_private_record_shapes" }
+          ]
+        },
+        {
+          "id": "diagnostic_minimized",
+          "invocations": [
+            { "kind": "model", "module": "tests", "test": "provider_refusal_and_failure_statuses_are_content_free_and_fail_closed" },
+            { "kind": "core", "module": "protocol_adapter", "test": "model_request_receipt_is_v1_2_only_content_free_and_route_exact" }
+          ]
+        },
+        {
+          "id": "least_sensitive_packet",
+          "invocations": [
+            { "kind": "model", "module": "tests", "test": "checked_in_model_packet_golden_binds_the_exact_category_intersection" }
+          ]
+        },
+        {
+          "id": "no_provider_objects",
+          "invocations": [
+            { "kind": "boundary", "module": "boundary", "test": "boundary_contract" },
+            { "kind": "core", "module": "second_mind", "test": "latest_model_request_receipt_is_private_ephemeral_and_route_exact" },
+            { "kind": "core", "module": "protocol_adapter", "test": "model_request_receipt_is_v1_2_only_content_free_and_route_exact" }
+          ]
+        },
+        {
+          "id": "no_raw_response",
+          "invocations": [
+            { "kind": "model", "module": "tests", "test": "provider_refusal_and_failure_statuses_are_content_free_and_fail_closed" },
+            { "kind": "model", "module": "tests", "test": "successful_response_buffer_is_zeroized_and_provider_fields_are_discarded" },
+            { "kind": "model", "module": "tests", "test": "loopback_contract_proves_headers_body_and_strict_response" },
+            { "kind": "core", "module": "second_mind", "test": "latest_model_request_receipt_is_private_ephemeral_and_route_exact" },
+            { "kind": "store", "module": "repository", "test": "schema_and_payloads_exclude_prohibited_private_record_shapes" }
+          ]
+        },
+        {
+          "id": "persistence_minimized",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "full_loop_records_audited_delivery_and_ephemeral_correction" },
+            { "kind": "store", "module": "repository", "test": "schema_and_payloads_exclude_prohibited_private_record_shapes" }
+          ]
+        },
+        {
+          "id": "route_intersection",
+          "invocations": [
+            { "kind": "model", "module": "tests", "test": "route_packet_and_context_categories_must_have_an_exact_narrowing_chain" }
+          ]
+        },
+        {
+          "id": "tools_absent",
+          "invocations": [
+            { "kind": "model", "module": "tests", "test": "request_has_no_tools_state_or_unapproved_category" },
+            { "kind": "model", "module": "tests", "test": "handling_profile_and_structured_response_semantics_are_exact" }
+          ]
+        },
+        {
+          "id": "unapproved_category_absent",
+          "invocations": [
+            { "kind": "model", "module": "tests", "test": "request_has_no_tools_state_or_unapproved_category" },
+            { "kind": "model", "module": "tests", "test": "route_packet_and_context_categories_must_have_an_exact_narrowing_chain" }
+          ]
+        }
+      ]
+    },
+    {
+      "source_check_id": "phase2-source-fixture-intervention",
+      "source_fixture_id": "phase2-source-fixture-intervention-v1",
+      "source_runner_id": "stein.phase2.source-fixture.intervention.v1",
+      "gate_id": "P2-INTERVENTION",
+      "gate_fixture_id": "phase2-intervention-v1",
+      "gate_runner_id": "stein.phase2.intervention.v1",
+      "semantic_source_paths": [
+        "Cargo.lock",
+        "crates/stein-core/Cargo.toml",
+        "crates/stein-core/src/phase2_domain.rs",
+        "crates/stein-core/src/phase2_ports.rs",
+        "crates/stein-core/src/repository.rs",
+        "crates/stein-core/src/second_mind.rs"
+      ],
+      "subchecks": [
+        {
+          "id": "allow_decision",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "phase2_intervention_source_fixture_proves_validated_audited_policy_allow_once" }
+          ]
+        },
+        {
+          "id": "audit_acknowledged",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "phase2_intervention_source_fixture_proves_validated_audited_policy_allow_once" }
+          ]
+        },
+        {
+          "id": "candidate_validated",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "phase2_intervention_source_fixture_proves_validated_audited_policy_allow_once" }
+          ]
+        },
+        {
+          "id": "near_deadline_trace",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "phase2_intervention_source_fixture_proves_validated_audited_policy_allow_once" }
+          ]
+        },
+        {
+          "id": "uncertainty_qualified",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "phase2_intervention_source_fixture_proves_validated_audited_policy_allow_once" }
+          ]
+        }
+      ]
+    },
+    {
+      "source_check_id": "phase2-source-fixture-policy-failsafe",
+      "source_fixture_id": "phase2-source-fixture-policy-failsafe-v1",
+      "source_runner_id": "stein.phase2.source-fixture.policy-failsafe.v1",
+      "gate_id": "P2-POLICY-FAILSAFE",
+      "gate_fixture_id": "phase2-policy-failsafe-v1",
+      "gate_runner_id": "stein.phase2.policy-failsafe.v1",
+      "semantic_source_paths": [
+        "Cargo.lock",
+        "crates/stein-core/Cargo.toml",
+        "crates/stein-core/src/phase2_domain.rs",
+        "crates/stein-core/src/phase2_ports.rs",
+        "crates/stein-core/src/repository.rs",
+        "crates/stein-core/src/second_mind.rs",
+        "crates/stein-model-openai/Cargo.toml",
+        "crates/stein-model-openai/src/lib.rs",
+        "crates/stein-platform-windows/Cargo.toml",
+        "crates/stein-platform-windows/src/notification.rs",
+        "crates/stein-store-sqlite/Cargo.toml",
+        "crates/stein-store-sqlite/src/lib.rs",
+        "crates/stein-store-sqlite/tests/repository.rs"
+      ],
+      "subchecks": [
+        {
+          "id": "audit_failure_denies",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "slow_audit_ack_denies_delivery_without_a_partial_decision" },
+            { "kind": "store", "module": "repository", "test": "conflicting_decision_audit_rolls_back_deliverable_intervention" }
+          ]
+        },
+        {
+          "id": "authority_absent_denies",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "proactive_interventions_require_explicit_opt_in_before_model_use" },
+            { "kind": "core", "module": "second_mind", "test": "goal_revision_change_fences_the_old_session_before_model_use" }
+          ]
+        },
+        {
+          "id": "cap_cooldown_denies",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "significance_and_model_cooldowns_are_deterministic" },
+            { "kind": "core", "module": "second_mind", "test": "model_budget_allows_only_one_in_flight_and_twelve_per_rolling_hour" },
+            { "kind": "core", "module": "second_mind", "test": "zero_user_intervention_cap_avoids_model_cost" }
+          ]
+        },
+        {
+          "id": "invalid_output_denies",
+          "invocations": [
+            { "kind": "model", "module": "tests", "test": "hard_packet_token_output_and_candidate_bounds_fail_closed" },
+            { "kind": "core", "module": "second_mind", "test": "invalid_model_candidate_closes_as_failed_never_strict_candidate" }
+          ]
+        },
+        {
+          "id": "legacy_empty_trace_denies",
+          "invocations": [
+            { "kind": "store", "module": "repository", "test": "standalone_policy_audit_without_a_complete_trace_is_rejected" },
+            { "kind": "store", "module": "repository", "test": "legacy_policy_and_audit_payloads_decode_without_becoming_authoritative" }
+          ]
+        },
+        {
+          "id": "lock_denies",
+          "invocations": [
+            { "kind": "windows", "module": "notification", "test": "locked_switched_and_unknown_presence_fail_before_native_submission" }
+          ]
+        },
+        {
+          "id": "model_failure_denies",
+          "invocations": [
+            { "kind": "model", "module": "tests", "test": "provider_refusal_and_failure_statuses_are_content_free_and_fail_closed" },
+            { "kind": "core", "module": "second_mind", "test": "model_deadline_cancels_the_in_flight_request_without_a_candidate" }
+          ]
+        },
+        {
+          "id": "mute_denies",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "explicit_mute_dnd_and_channel_preferences_fail_closed_before_model_use" },
+            { "kind": "core", "module": "second_mind", "test": "session_mute_cancels_an_in_flight_notification_and_scrubs_the_intervention" }
+          ]
+        },
+        {
+          "id": "policy_failure_denies",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "atomic_decision_revision_conflict_leaves_no_partial_policy_or_audit" },
+            { "kind": "store", "module": "repository", "test": "mismatched_policy_trace_rolls_back_decision_audit_and_intervention" }
+          ]
+        },
+        {
+          "id": "refusal_denies",
+          "invocations": [
+            { "kind": "model", "module": "tests", "test": "provider_refusal_and_failure_statuses_are_content_free_and_fail_closed" }
+          ]
+        },
+        {
+          "id": "revision_mismatch_denies",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "goal_revision_change_fences_the_old_session_before_model_use" },
+            { "kind": "core", "module": "second_mind", "test": "any_preferences_revision_change_invalidates_a_queued_policy_decision" },
+            { "kind": "store", "module": "repository", "test": "stale_intervention_revision_rolls_back_decision_and_audit" }
+          ]
+        },
+        {
+          "id": "stale_source_denies",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "stale_evidence_becomes_silence_without_calling_the_model" }
+          ]
+        },
+        {
+          "id": "tool_shaped_denies",
+          "invocations": [
+            { "kind": "model", "module": "tests", "test": "tool_shaped_and_unknown_evidence_output_is_rejected" },
+            { "kind": "model", "module": "tests", "test": "handling_profile_and_structured_response_semantics_are_exact" }
+          ]
+        },
+        {
+          "id": "trace_content_free",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "policy_trace_digest_is_deterministic_and_audit_keeps_only_the_digest" },
+            { "kind": "store", "module": "repository", "test": "intervention_decision_commit_survives_restart_and_audit_is_privacy_bounded" }
+          ]
+        }
+      ]
+    },
+    {
+      "source_check_id": "phase2-source-fixture-notification",
+      "source_fixture_id": "phase2-source-fixture-notification-v1",
+      "source_runner_id": "stein.phase2.source-fixture.notification.v1",
+      "gate_id": "P2-NOTIFICATION",
+      "gate_fixture_id": "phase2-notification-v1",
+      "gate_runner_id": "stein.phase2.notification.v1",
+      "semantic_source_paths": [
+        "Cargo.lock",
+        "apps/core-cli/Cargo.toml",
+        "apps/core-cli/src/main.rs",
+        "apps/desktop/src-tauri/Cargo.toml",
+        "apps/desktop/src-tauri/build.rs",
+        "apps/desktop/src-tauri/src/lib.rs",
+        "apps/desktop/src-tauri/src/toast_activation.rs",
+        "crates/stein-core/Cargo.toml",
+        "crates/stein-core/src/second_mind.rs",
+        "crates/stein-platform-windows/Cargo.toml",
+        "crates/stein-platform-windows/src/notification.rs",
+        "crates/stein-platform-windows/src/notification/native.rs"
+      ],
+      "subchecks": [
+        {
+          "id": "audit_truthful",
+          "invocations": [
+            { "kind": "windows", "module": "notification", "test": "show_success_means_only_accepted_by_channel" },
+            { "kind": "core", "module": "second_mind", "test": "full_loop_records_audited_delivery_and_ephemeral_correction" }
+          ]
+        },
+        {
+          "id": "diagnostic_denied",
+          "invocations": [
+            { "kind": "cli", "module": "tests", "test": "toast_com_receipt_and_command_are_closed_and_content_free" },
+            { "kind": "desktop", "module": "toast_activation", "test": "command_line_recognizes_only_the_fixed_marker_and_never_a_payload" },
+            { "kind": "desktop", "module": "toast_activation", "test": "com_callback_validates_identity_and_forbids_user_input_before_dispatch" }
+          ]
+        },
+        {
+          "id": "input_bearing_denied",
+          "invocations": [
+            { "kind": "desktop", "module": "toast_activation", "test": "com_callback_validates_identity_and_forbids_user_input_before_dispatch" }
+          ]
+        },
+        {
+          "id": "malformed_denied",
+          "invocations": [
+            { "kind": "desktop", "module": "toast_activation", "test": "accepts_only_exact_open_action_and_canonical_uuid" }
+          ]
+        },
+        {
+          "id": "unpackaged_denied",
+          "invocations": [
+            { "kind": "desktop", "module": "toast_activation", "test": "unpackaged_direct_toast_server_launch_is_rejected_before_tauri" }
+          ]
+        }
+      ]
+    },
+    {
+      "source_check_id": "phase2-source-fixture-outbox-recovery",
+      "source_fixture_id": "phase2-source-fixture-outbox-recovery-v1",
+      "source_runner_id": "stein.phase2.source-fixture.outbox-recovery.v1",
+      "gate_id": "P2-OUTBOX-RECOVERY",
+      "gate_fixture_id": "phase2-outbox-recovery-v1",
+      "gate_runner_id": "stein.phase2.outbox-recovery.v1",
+      "semantic_source_paths": [
+        "Cargo.lock",
+        "crates/stein-core/Cargo.toml",
+        "crates/stein-core/src/phase2_domain.rs",
+        "crates/stein-core/src/repository.rs",
+        "crates/stein-core/src/second_mind.rs",
+        "crates/stein-platform-windows/Cargo.toml",
+        "crates/stein-platform-windows/src/notification.rs",
+        "crates/stein-store-sqlite/Cargo.toml",
+        "crates/stein-store-sqlite/src/lib.rs",
+        "crates/stein-store-sqlite/tests/repository.rs"
+      ],
+      "subchecks": [
+        {
+          "id": "atomic_attempt_marker",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "full_loop_records_audited_delivery_and_ephemeral_correction" },
+            { "kind": "store", "module": "repository", "test": "memory_and_sqlite_require_a_delivering_intervention_before_delivery_failed" }
+          ]
+        },
+        {
+          "id": "before_marker_no_call",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "orphan_allowed_intervention_is_scrubbed_without_submission_on_recovery" },
+            { "kind": "core", "module": "second_mind", "test": "slow_audit_ack_denies_delivery_without_a_partial_decision" }
+          ]
+        },
+        {
+          "id": "legacy_repair",
+          "invocations": [
+            { "kind": "store", "module": "repository", "test": "legacy_outbox_only_unknown_recovers_atomically_without_retry" }
+          ]
+        },
+        {
+          "id": "os_submission_unknown",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "notification_timeout_is_terminal_delivery_unknown_and_never_queued" },
+            { "kind": "windows", "module": "notification", "test": "definite_and_ambiguous_native_outcomes_remain_distinct" }
+          ]
+        },
+        {
+          "id": "post_marker_unknown",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "interrupted_direct_delivery_recovers_as_unknown_without_resubmission" }
+          ]
+        },
+        {
+          "id": "repository_open_no_semantic_recovery",
+          "invocations": [
+            { "kind": "store", "module": "repository", "test": "legacy_outbox_only_unknown_recovers_atomically_without_retry" }
+          ]
+        },
+        {
+          "id": "terminal_audit_unknown",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "interrupted_direct_delivery_recovers_as_unknown_without_resubmission" },
+            { "kind": "core", "module": "second_mind", "test": "queued_interventions_reconcile_terminal_outbox_states_without_retry" },
+            { "kind": "store", "module": "repository", "test": "legacy_outbox_only_unknown_recovers_atomically_without_retry" }
+          ]
+        }
+      ]
+    },
+    {
+      "source_check_id": "phase2-source-fixture-revocation-race",
+      "source_fixture_id": "phase2-source-fixture-revocation-race-v1",
+      "source_runner_id": "stein.phase2.source-fixture.revocation-race.v1",
+      "gate_id": "P2-REVOCATION-RACE",
+      "gate_fixture_id": "phase2-revocation-race-v1",
+      "gate_runner_id": "stein.phase2.revocation-race.v1",
+      "semantic_source_paths": [
+        "Cargo.lock",
+        "crates/stein-core/Cargo.toml",
+        "crates/stein-core/src/phase2_domain.rs",
+        "crates/stein-core/src/phase2_ports.rs",
+        "crates/stein-core/src/repository.rs",
+        "crates/stein-core/src/second_mind.rs",
+        "crates/stein-platform-windows/Cargo.toml",
+        "crates/stein-platform-windows/src/browser.rs",
+        "crates/stein-platform-windows/src/browser_ingress.rs",
+        "crates/stein-platform-windows/src/observation.rs",
+        "crates/stein-platform-windows/src/pixel.rs",
+        "crates/stein-store-sqlite/Cargo.toml",
+        "crates/stein-store-sqlite/src/lib.rs",
+        "crates/stein-store-sqlite/tests/repository.rs"
+      ],
+      "subchecks": [
+        {
+          "id": "credential_cleanup_pending",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "revoked_route_retains_secret_cleanup_until_a_content_free_retry_succeeds" },
+            { "kind": "store", "module": "repository", "test": "revoked_route_and_secret_cleanup_are_atomic_and_survive_restart" }
+          ]
+        },
+        {
+          "id": "delivery_late_denied",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "revocation_during_failed_delivery_cancels_and_scrubs" },
+            { "kind": "core", "module": "second_mind", "test": "authority_change_during_recovered_failed_delivery_cancels_and_scrubs" }
+          ]
+        },
+        {
+          "id": "native_cleanup_pending",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "native_cleanup_retry_never_restores_removed_resource_authority" },
+            { "kind": "store", "module": "repository", "test": "selected_resource_removal_is_idempotent_and_retains_native_cleanup" }
+          ]
+        },
+        {
+          "id": "observation_late_denied",
+          "invocations": [
+            { "kind": "windows", "module": "browser_ingress", "test": "revision_change_or_revocation_cancels_and_rejects_late_packets" },
+            { "kind": "windows", "module": "browser", "test": "lock_and_revocation_destroy_pending_and_reject_late_values" },
+            { "kind": "windows", "module": "observation", "test": "selected_resource_identity_loss_closes_without_a_late_observation" },
+            { "kind": "windows", "module": "pixel", "test": "revoked_and_cancelled_boundaries_fail_before_native_capture" }
+          ]
+        },
+        {
+          "id": "queue_late_denied",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "mute_between_unavailable_check_and_enqueue_cancels_the_late_queue" },
+            { "kind": "core", "module": "second_mind", "test": "authority_change_after_revalidation_cancels_without_repointing_the_queued_record" },
+            { "kind": "core", "module": "second_mind", "test": "revoked_notification_grant_cancels_and_scrubs_queued_delivery" }
+          ]
+        },
+        {
+          "id": "reasoning_late_denied",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "disabling_proactive_interventions_cancels_an_in_flight_model_without_stopping_observation" },
+            { "kind": "core", "module": "second_mind", "test": "goal_edit_cancels_an_in_flight_model_before_the_revision_commit" }
+          ]
+        }
+      ]
+    },
+    {
+      "source_check_id": "phase2-source-fixture-retention",
+      "source_fixture_id": "phase2-source-fixture-retention-v1",
+      "source_runner_id": "stein.phase2.source-fixture.retention.v1",
+      "gate_id": "P2-RETENTION",
+      "gate_fixture_id": "phase2-retention-v1",
+      "gate_runner_id": "stein.phase2.retention.v1",
+      "semantic_source_paths": [
+        "Cargo.lock",
+        "crates/stein-core/Cargo.toml",
+        "crates/stein-core/src/phase2_domain.rs",
+        "crates/stein-core/src/phase2_ports.rs",
+        "crates/stein-core/src/repository.rs",
+        "crates/stein-core/src/second_mind.rs",
+        "crates/stein-platform-windows/Cargo.toml",
+        "crates/stein-platform-windows/src/observation.rs",
+        "crates/stein-platform-windows/src/pixel.rs",
+        "crates/stein-store-sqlite/Cargo.toml",
+        "crates/stein-store-sqlite/src/lib.rs",
+        "crates/stein-store-sqlite/tests/repository.rs"
+      ],
+      "subchecks": [
+        {
+          "id": "audit_thirty_day",
+          "invocations": [
+            { "kind": "store", "module": "repository", "test": "audit_expiry_is_exact_and_idempotent" }
+          ]
+        },
+        {
+          "id": "context_session",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "phase2_retention_context_is_erased_at_session_end_and_restart" }
+          ]
+        },
+        {
+          "id": "deletion_all_paths",
+          "invocations": [
+            { "kind": "store", "module": "repository", "test": "phase2_retention_sqlite_delete_scrubs_all_reads_restart_and_recovery_copy" }
+          ]
+        },
+        {
+          "id": "observation_ten_minute",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "retention_sweep_removes_observations_at_and_after_ttl_without_new_ingestion" }
+          ]
+        },
+        {
+          "id": "outbox_actionability",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "phase2_retention_outbox_scrubs_at_exact_actionability_boundary" }
+          ]
+        },
+        {
+          "id": "raw_immediate",
+          "invocations": [
+            { "kind": "windows", "module": "pixel", "test": "transient_cpu_frame_is_zeroized_before_release" },
+            { "kind": "windows", "module": "pixel", "test": "normalization_emits_only_coarse_non_image_metadata" },
+            { "kind": "core", "module": "second_mind", "test": "single_operation_observation_is_consumed_by_one_context_assembly" },
+            { "kind": "core", "module": "second_mind", "test": "single_operation_observation_has_a_bounded_unused_retention_fallback" }
+          ]
+        },
+        {
+          "id": "sweep_cadence",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "retention_maintenance_cleans_quiet_sessions_and_shutdown_is_bounded" }
+          ]
+        },
+        {
+          "id": "sweep_shutdown_join",
+          "invocations": [
+            { "kind": "core", "module": "second_mind", "test": "retention_maintenance_cleans_quiet_sessions_and_shutdown_is_bounded" }
+          ]
+        }
+      ]
+    }
+  ]
+}

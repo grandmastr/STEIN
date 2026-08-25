@@ -1,0 +1,667 @@
+{
+  "schema_version": 1,
+  "registry_id": "stein.phase2.source-command-registry.v1",
+  "checks": [
+    {
+      "id": "rust-format",
+      "category": "direct_execution",
+      "executable_role": "cargo",
+      "arguments": [
+        { "kind": "literal", "value": "fmt" },
+        { "kind": "literal", "value": "--all" },
+        { "kind": "literal", "value": "--" },
+        { "kind": "literal", "value": "--check" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 600
+    },
+    {
+      "id": "rust-check",
+      "category": "direct_execution",
+      "executable_role": "cargo",
+      "arguments": [
+        { "kind": "literal", "value": "check" },
+        { "kind": "literal", "value": "--workspace" },
+        { "kind": "literal", "value": "--all-targets" },
+        { "kind": "literal", "value": "--all-features" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 3600
+    },
+    {
+      "id": "rust-clippy",
+      "category": "direct_execution",
+      "executable_role": "cargo",
+      "arguments": [
+        { "kind": "literal", "value": "clippy" },
+        { "kind": "literal", "value": "--workspace" },
+        { "kind": "literal", "value": "--all-targets" },
+        { "kind": "literal", "value": "--all-features" },
+        { "kind": "literal", "value": "--" },
+        { "kind": "literal", "value": "-D" },
+        { "kind": "literal", "value": "warnings" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 3600
+    },
+    {
+      "id": "rust-tests",
+      "category": "direct_execution",
+      "executable_role": "cargo",
+      "arguments": [
+        { "kind": "literal", "value": "test" },
+        { "kind": "literal", "value": "--workspace" },
+        { "kind": "literal", "value": "--all-targets" },
+        { "kind": "literal", "value": "--all-features" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 7200
+    },
+    {
+      "id": "desktop-typecheck",
+      "category": "direct_execution",
+      "executable_role": "pnpm",
+      "arguments": [{ "kind": "literal", "value": "typecheck" }],
+      "working_directory": "apps/desktop",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "desktop-lint",
+      "category": "direct_execution",
+      "executable_role": "pnpm",
+      "arguments": [{ "kind": "literal", "value": "lint" }],
+      "working_directory": "apps/desktop",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "desktop-tests",
+      "category": "direct_execution",
+      "executable_role": "pnpm",
+      "arguments": [{ "kind": "literal", "value": "test" }],
+      "working_directory": "apps/desktop",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "desktop-build",
+      "category": "direct_execution",
+      "executable_role": "pnpm",
+      "arguments": [{ "kind": "literal", "value": "build" }],
+      "working_directory": "apps/desktop",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "edge-extension-tests",
+      "category": "direct_execution",
+      "executable_role": "pnpm",
+      "arguments": [{ "kind": "literal", "value": "test" }],
+      "working_directory": "extensions/edge",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "edge-host-format",
+      "category": "direct_execution",
+      "executable_role": "cargo",
+      "arguments": [
+        { "kind": "literal", "value": "fmt" },
+        { "kind": "literal", "value": "--manifest-path" },
+        { "kind": "repository_relative_path", "value": "apps/edge-native-host/Cargo.toml" },
+        { "kind": "literal", "value": "--" },
+        { "kind": "literal", "value": "--check" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 600
+    },
+    {
+      "id": "edge-host-check",
+      "category": "direct_execution",
+      "executable_role": "cargo",
+      "arguments": [
+        { "kind": "literal", "value": "check" },
+        { "kind": "literal", "value": "--manifest-path" },
+        { "kind": "repository_relative_path", "value": "apps/edge-native-host/Cargo.toml" },
+        { "kind": "literal", "value": "--all-targets" },
+        { "kind": "literal", "value": "--all-features" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 3600
+    },
+    {
+      "id": "edge-host-clippy",
+      "category": "direct_execution",
+      "executable_role": "cargo",
+      "arguments": [
+        { "kind": "literal", "value": "clippy" },
+        { "kind": "literal", "value": "--manifest-path" },
+        { "kind": "repository_relative_path", "value": "apps/edge-native-host/Cargo.toml" },
+        { "kind": "literal", "value": "--all-targets" },
+        { "kind": "literal", "value": "--all-features" },
+        { "kind": "literal", "value": "--" },
+        { "kind": "literal", "value": "-D" },
+        { "kind": "literal", "value": "warnings" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 3600
+    },
+    {
+      "id": "edge-host-tests",
+      "category": "direct_execution",
+      "executable_role": "cargo",
+      "arguments": [
+        { "kind": "literal", "value": "test" },
+        { "kind": "literal", "value": "--manifest-path" },
+        { "kind": "repository_relative_path", "value": "apps/edge-native-host/Cargo.toml" },
+        { "kind": "literal", "value": "--all-targets" },
+        { "kind": "literal", "value": "--all-features" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 3600
+    },
+    {
+      "id": "boundary-contract",
+      "category": "direct_execution",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/check-boundaries.ps1" },
+        { "kind": "literal", "value": "-Json" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "source-evidence-contract",
+      "category": "direct_execution",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoLogo" },
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/phase2/Test-VerifySource.ps1" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 7200
+    },
+    {
+      "id": "installed-evidence-harness-static",
+      "category": "direct_execution",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoLogo" },
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/phase2/Test-VerifyInstalled.ps1" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 7200
+    },
+    {
+      "id": "no-leaks-scanner-static",
+      "category": "direct_execution",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoLogo" },
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/phase2/Test-ScanNoLeaks.ps1" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 7200
+    },
+    {
+      "id": "no-leaks-producer-workflow",
+      "category": "retained_obligation",
+      "reason_code": "candidate_owned_installed_artifact_producer_unimplemented"
+    },
+    {
+      "id": "native-toolchain-provenance",
+      "category": "retained_obligation",
+      "reason_code": "authenticated_native_toolchain_provenance_unimplemented"
+    },
+    {
+      "id": "pinned-clean-build-environment",
+      "category": "retained_obligation",
+      "reason_code": "immutable_candidate_and_fresh_build_isolation_unimplemented"
+    },
+    {
+      "id": "portable-runner-attestation",
+      "category": "direct_execution",
+      "executable_role": "gh",
+      "arguments": [
+        { "kind": "literal", "value": "attestation" },
+        { "kind": "literal", "value": "verify" },
+        { "kind": "literal", "value": "--predicate-type" },
+        { "kind": "literal", "value": "https://slsa.dev/provenance/v1" },
+        { "kind": "literal", "value": "--cert-oidc-issuer" },
+        { "kind": "literal", "value": "https://token.actions.githubusercontent.com" },
+        { "kind": "evidence_relative_path", "value": "portable-runner-attestation/portable-fixture.json" },
+        { "kind": "literal", "value": "--bundle" },
+        { "kind": "evidence_relative_path", "value": "portable-runner-attestation/portable-fixture.attestation.json" },
+        { "kind": "literal", "value": "--repo" },
+        { "kind": "literal", "value": "grandmastr/STEIN" },
+        { "kind": "literal", "value": "--cert-identity" },
+        { "kind": "portable_source_ref", "value": "portable_cert_identity" },
+        { "kind": "literal", "value": "--signer-digest" },
+        { "kind": "candidate_commit", "value": "candidate_commit" },
+        { "kind": "literal", "value": "--source-digest" },
+        { "kind": "candidate_commit", "value": "candidate_commit" },
+        { "kind": "literal", "value": "--source-ref" },
+        { "kind": "portable_source_ref", "value": "portable_source_ref" },
+        { "kind": "literal", "value": "--deny-self-hosted-runners" },
+        { "kind": "literal", "value": "--digest-alg" },
+        { "kind": "literal", "value": "sha256" },
+        { "kind": "literal", "value": "--hostname" },
+        { "kind": "literal", "value": "github.com" },
+        { "kind": "literal", "value": "--format" },
+        { "kind": "literal", "value": "json" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 600
+    },
+    {
+      "id": "source-report-command-provenance",
+      "category": "derived",
+      "derivation": "exact_registry_and_receipt_coverage"
+    },
+    {
+      "id": "phase2-source-fixture-upgrade",
+      "category": "grouped_fixture_execution",
+      "group_id": "closed-source-fixture-suite",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoLogo" },
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/phase2/Run-Source-Fixture.ps1" },
+        { "kind": "literal", "value": "-OutputDirectory" },
+        { "kind": "evidence_relative_path", "value": "source-fixtures" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_source_fixture_v1",
+      "timeout_seconds": 14400,
+      "fixture_receipt_path": "source-fixtures/phase2-source-fixture-upgrade.receipt.json"
+    },
+    {
+      "id": "phase2-source-fixture-secrets",
+      "category": "grouped_fixture_execution",
+      "group_id": "closed-source-fixture-suite",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoLogo" },
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/phase2/Run-Source-Fixture.ps1" },
+        { "kind": "literal", "value": "-OutputDirectory" },
+        { "kind": "evidence_relative_path", "value": "source-fixtures" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_source_fixture_v1",
+      "timeout_seconds": 14400,
+      "fixture_receipt_path": "source-fixtures/phase2-source-fixture-secrets.receipt.json"
+    },
+    {
+      "id": "phase2-source-fixture-identity",
+      "category": "grouped_fixture_execution",
+      "group_id": "closed-source-fixture-suite",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoLogo" },
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/phase2/Run-Source-Fixture.ps1" },
+        { "kind": "literal", "value": "-OutputDirectory" },
+        { "kind": "evidence_relative_path", "value": "source-fixtures" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_source_fixture_v1",
+      "timeout_seconds": 14400,
+      "fixture_receipt_path": "source-fixtures/phase2-source-fixture-identity.receipt.json"
+    },
+    {
+      "id": "phase2-source-fixture-phase1-regression",
+      "category": "grouped_fixture_execution",
+      "group_id": "closed-source-fixture-suite",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoLogo" },
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/phase2/Run-Source-Fixture.ps1" },
+        { "kind": "literal", "value": "-OutputDirectory" },
+        { "kind": "evidence_relative_path", "value": "source-fixtures" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_source_fixture_v1",
+      "timeout_seconds": 14400,
+      "fixture_receipt_path": "source-fixtures/phase2-source-fixture-phase1-regression.receipt.json"
+    },
+    {
+      "id": "phase2-source-fixture-goals",
+      "category": "grouped_fixture_execution",
+      "group_id": "closed-source-fixture-suite",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoLogo" },
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/phase2/Run-Source-Fixture.ps1" },
+        { "kind": "literal", "value": "-OutputDirectory" },
+        { "kind": "evidence_relative_path", "value": "source-fixtures" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_source_fixture_v1",
+      "timeout_seconds": 14400,
+      "fixture_receipt_path": "source-fixtures/phase2-source-fixture-goals.receipt.json"
+    },
+    {
+      "id": "phase2-source-fixture-pixels",
+      "category": "grouped_fixture_execution",
+      "group_id": "closed-source-fixture-suite",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoLogo" },
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/phase2/Run-Source-Fixture.ps1" },
+        { "kind": "literal", "value": "-OutputDirectory" },
+        { "kind": "evidence_relative_path", "value": "source-fixtures" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_source_fixture_v1",
+      "timeout_seconds": 14400,
+      "fixture_receipt_path": "source-fixtures/phase2-source-fixture-pixels.receipt.json"
+    },
+    {
+      "id": "phase2-source-fixture-model-contract",
+      "category": "grouped_fixture_execution",
+      "group_id": "closed-source-fixture-suite",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoLogo" },
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/phase2/Run-Source-Fixture.ps1" },
+        { "kind": "literal", "value": "-OutputDirectory" },
+        { "kind": "evidence_relative_path", "value": "source-fixtures" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_source_fixture_v1",
+      "timeout_seconds": 14400,
+      "fixture_receipt_path": "source-fixtures/phase2-source-fixture-model-contract.receipt.json"
+    },
+    {
+      "id": "phase2-source-fixture-intervention",
+      "category": "grouped_fixture_execution",
+      "group_id": "closed-source-fixture-suite",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoLogo" },
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/phase2/Run-Source-Fixture.ps1" },
+        { "kind": "literal", "value": "-OutputDirectory" },
+        { "kind": "evidence_relative_path", "value": "source-fixtures" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_source_fixture_v1",
+      "timeout_seconds": 14400,
+      "fixture_receipt_path": "source-fixtures/phase2-source-fixture-intervention.receipt.json"
+    },
+    {
+      "id": "phase2-source-fixture-policy-failsafe",
+      "category": "grouped_fixture_execution",
+      "group_id": "closed-source-fixture-suite",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoLogo" },
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/phase2/Run-Source-Fixture.ps1" },
+        { "kind": "literal", "value": "-OutputDirectory" },
+        { "kind": "evidence_relative_path", "value": "source-fixtures" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_source_fixture_v1",
+      "timeout_seconds": 14400,
+      "fixture_receipt_path": "source-fixtures/phase2-source-fixture-policy-failsafe.receipt.json"
+    },
+    {
+      "id": "phase2-source-fixture-notification",
+      "category": "grouped_fixture_execution",
+      "group_id": "closed-source-fixture-suite",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoLogo" },
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/phase2/Run-Source-Fixture.ps1" },
+        { "kind": "literal", "value": "-OutputDirectory" },
+        { "kind": "evidence_relative_path", "value": "source-fixtures" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_source_fixture_v1",
+      "timeout_seconds": 14400,
+      "fixture_receipt_path": "source-fixtures/phase2-source-fixture-notification.receipt.json"
+    },
+    {
+      "id": "phase2-source-fixture-outbox-recovery",
+      "category": "grouped_fixture_execution",
+      "group_id": "closed-source-fixture-suite",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoLogo" },
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/phase2/Run-Source-Fixture.ps1" },
+        { "kind": "literal", "value": "-OutputDirectory" },
+        { "kind": "evidence_relative_path", "value": "source-fixtures" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_source_fixture_v1",
+      "timeout_seconds": 14400,
+      "fixture_receipt_path": "source-fixtures/phase2-source-fixture-outbox-recovery.receipt.json"
+    },
+    {
+      "id": "phase2-source-fixture-revocation-race",
+      "category": "grouped_fixture_execution",
+      "group_id": "closed-source-fixture-suite",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoLogo" },
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/phase2/Run-Source-Fixture.ps1" },
+        { "kind": "literal", "value": "-OutputDirectory" },
+        { "kind": "evidence_relative_path", "value": "source-fixtures" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_source_fixture_v1",
+      "timeout_seconds": 14400,
+      "fixture_receipt_path": "source-fixtures/phase2-source-fixture-revocation-race.receipt.json"
+    },
+    {
+      "id": "phase2-source-fixture-retention",
+      "category": "grouped_fixture_execution",
+      "group_id": "closed-source-fixture-suite",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoLogo" },
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/phase2/Run-Source-Fixture.ps1" },
+        { "kind": "literal", "value": "-OutputDirectory" },
+        { "kind": "evidence_relative_path", "value": "source-fixtures" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_source_fixture_v1",
+      "timeout_seconds": 14400,
+      "fixture_receipt_path": "source-fixtures/phase2-source-fixture-retention.receipt.json"
+    },
+    {
+      "id": "installed-reviewer-windows-powershell-contract",
+      "category": "direct_execution",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoLogo" },
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/phase2/Test-ReviewInstalled.ps1" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 7200
+    },
+    {
+      "id": "installed-reviewer-pwsh-contract",
+      "category": "direct_execution",
+      "executable_role": "pwsh",
+      "arguments": [
+        { "kind": "literal", "value": "-NoLogo" },
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "scripts/windows/phase2/Test-ReviewInstalled.ps1" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 7200
+    },
+    {
+      "id": "msix-static-contract",
+      "category": "direct_execution",
+      "executable_role": "windows_powershell",
+      "arguments": [
+        { "kind": "literal", "value": "-NoProfile" },
+        { "kind": "literal", "value": "-ExecutionPolicy" },
+        { "kind": "literal", "value": "Bypass" },
+        { "kind": "literal", "value": "-File" },
+        { "kind": "repository_relative_path", "value": "packaging/windows-msix/Test-Static.ps1" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 14400
+    },
+    {
+      "id": "release-workspace",
+      "category": "direct_execution",
+      "executable_role": "cargo",
+      "arguments": [
+        { "kind": "literal", "value": "build" },
+        { "kind": "literal", "value": "--workspace" },
+        { "kind": "literal", "value": "--release" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 7200
+    },
+    {
+      "id": "release-production-core",
+      "category": "direct_execution",
+      "executable_role": "cargo",
+      "arguments": [
+        { "kind": "literal", "value": "build" },
+        { "kind": "literal", "value": "--release" },
+        { "kind": "literal", "value": "-p" },
+        { "kind": "literal", "value": "stein-core-daemon" },
+        { "kind": "literal", "value": "--features" },
+        { "kind": "literal", "value": "production-private-endpoint,production-edge-producer" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 7200
+    },
+    {
+      "id": "release-edge-host",
+      "category": "direct_execution",
+      "executable_role": "cargo",
+      "arguments": [
+        { "kind": "literal", "value": "build" },
+        { "kind": "literal", "value": "--release" },
+        { "kind": "literal", "value": "--manifest-path" },
+        { "kind": "repository_relative_path", "value": "apps/edge-native-host/Cargo.toml" },
+        { "kind": "literal", "value": "--features" },
+        { "kind": "literal", "value": "production-edge-host" }
+      ],
+      "working_directory": ".",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 7200
+    },
+    {
+      "id": "release-tauri-no-bundle",
+      "category": "direct_execution",
+      "executable_role": "pnpm",
+      "arguments": [
+        { "kind": "literal", "value": "exec" },
+        { "kind": "literal", "value": "tauri" },
+        { "kind": "literal", "value": "build" },
+        { "kind": "literal", "value": "--no-bundle" }
+      ],
+      "working_directory": "apps/desktop",
+      "environment_profile": "phase2_synthetic_compile_v1",
+      "timeout_seconds": 7200
+    },
+    {
+      "id": "windows-native-ignored-fixtures",
+      "category": "retained_obligation",
+      "reason_code": "versioned_closed_native_fixture_receipts_unimplemented"
+    },
+    {
+      "id": "source-provenance-stability",
+      "category": "derived",
+      "derivation": "candidate_and_registry_streams_stable"
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+[package]
+name = "stein-model-openai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+stein-core = { path = "../stein-core" }
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+stein-platform-windows = { path = "../stein-platform-windows" }
+
+[lints.rust]
+unsafe_code = "forbid"

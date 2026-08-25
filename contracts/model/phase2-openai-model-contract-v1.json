@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "fixture_id": "phase2-openai-model-contract-v1",
+  "provider": "openai",
+  "route": {
+    "placement": "remote",
+    "handling_profile": "openai-responses-default-2026-08",
+    "allowed_categories": [
+      "goal",
+      "workspace_activity"
+    ],
+    "maximum_input_tokens": 8000,
+    "maximum_output_tokens": 220,
+    "fallback_allowed": false
+  },
+  "packet": {
+    "permitted_categories": [
+      "goal",
+      "workspace_activity"
+    ],
+    "goal": {
+      "title": "Validate the synthetic release",
+      "success_statement": "All synthetic gates pass.",
+      "deadline": null
+    },
+    "evidence": [
+      {
+        "reference": "evidence-0",
+        "category": "workspace_activity",
+        "source": "fixture-workspace",
+        "age_ms": 50,
+        "confidence_basis_points": 9000,
+        "untrusted_value": "A synthetic fixture changed."
+      }
+    ]
+  },
+  "provider_request": {
+    "model": "synthetic-model",
+    "store": false,
+    "background": false,
+    "tool_choice": "none",
+    "tools": [],
+    "strict_schema": true,
+    "forbidden_fields": [
+      "account_profile",
+      "conversation",
+      "credential",
+      "previous_response_id",
+      "secret_ref"
+    ]
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "message_type": "request",
+  "body": {
+    "request_id": "018f0000-0000-7001-8000-000000000006",
+    "metadata": {
+      "message_id": "018f0000-0000-7001-8000-000000000007",
+      "schema_version": 1,
+      "issued_at": "2026-08-19T08:00:00Z",
+      "correlation_id": "018f0000-0000-7001-8000-000000000008",
+      "origin": "desktop_client",
+      "sensitivity": "personal",
+      "retention": "runtime",
+      "idempotency_key": "018f0000-0000-7001-8000-000000000009",
+      "deadline_at": "2026-08-19T08:00:10Z",
+      "cancellation_id": "018f0000-0000-7001-8000-000000000010"
+    },
+    "body": {
+      "request_type": "create_goal",
+      "payload": {
+        "title": "Synthetic Atlas brief",
+        "success_statement": "A synthetic introduction and recommendation exist.",
+        "deadline": "2026-08-19T09:00:00Z"
+      }
+    }
+  }
+}

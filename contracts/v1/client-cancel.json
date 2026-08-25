@@ -1,0 +1,11 @@
+{
+  "message_type": "cancel",
+  "body": {
+    "message_id": "018f0000-0000-7001-8000-000000000011",
+    "issued_at": "2026-08-19T08:00:01Z",
+    "correlation_id": "018f0000-0000-7001-8000-000000000008",
+    "origin": "desktop_client",
+    "target_request_id": "018f0000-0000-7001-8000-000000000006",
+    "cancellation_id": "018f0000-0000-7001-8000-000000000010"
+  }
+}

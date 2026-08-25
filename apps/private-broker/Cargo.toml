@@ -1,0 +1,39 @@
+[package]
+name = "stein-private-broker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "stein-private-broker"
+path = "src/main.rs"
+
+[features]
+default = []
+# Development packages have a distinct package name and may only be built with
+# debug assertions. Production CORE never admits this identity.
+development-package = []
+
+[dependencies]
+stein-broker-windows = { path = "../../crates/stein-broker-windows" }
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "time",
+] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_Packaging_Appx",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }

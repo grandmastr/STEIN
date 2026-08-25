@@ -1,0 +1,22 @@
+{
+  "message_type": "request",
+  "body": {
+    "request_id": "018f0000-0000-7001-8000-000000000031",
+    "metadata": {
+      "message_id": "018f0000-0000-7001-8000-000000000032",
+      "schema_version": 1,
+      "issued_at": "2026-08-19T08:00:03Z",
+      "correlation_id": "018f0000-0000-7001-8000-000000000033",
+      "origin": "core_cli",
+      "sensitivity": "operational",
+      "retention": "runtime",
+      "deadline_at": "2026-08-19T08:00:13Z"
+    },
+    "body": {
+      "request_type": "shutdown",
+      "payload": {
+        "reason": "test"
+      }
+    }
+  }
+}
