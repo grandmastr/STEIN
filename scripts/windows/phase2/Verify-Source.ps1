@@ -346,13 +346,13 @@ function Assert-SteinSourcePortableAttestationDirectory {
 
     $resolved = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
     $root = Get-Item -LiteralPath $resolved -Force -ErrorAction Stop
-    if (-not $root.PSIsContainer -or
+    if (-not ($root -is [IO.DirectoryInfo]) -or
         (($root.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
         throw 'portable_attestation_directory_invalid'
     }
     $probe = $root
     while ($null -ne $probe) {
-        if (-not $probe.PSIsContainer -or
+        if (-not ($probe -is [IO.DirectoryInfo]) -or
             (($probe.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
             throw 'portable_attestation_directory_invalid'
         }
@@ -374,7 +374,8 @@ function Assert-SteinSourcePortableAttestationDirectory {
         $matches = @($rootEntries | Where-Object {
                 [string]$_.Name -ceq [string]$name
             })
-        if ($matches.Count -ne 1 -or $matches[0].PSIsContainer -or
+        if ($matches.Count -ne 1 -or
+            -not ($matches[0] -is [IO.FileInfo]) -or
             (($matches[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
             [long]$matches[0].Length -lt 1 -or
             [long]$matches[0].Length -gt [long]$contract[$name]) {
@@ -382,7 +383,8 @@ function Assert-SteinSourcePortableAttestationDirectory {
         }
     }
     $logs = @($rootEntries | Where-Object { [string]$_.Name -ceq 'logs' })
-    if ($logs.Count -ne 1 -or -not $logs[0].PSIsContainer -or
+    if ($logs.Count -ne 1 -or
+        -not ($logs[0] -is [IO.DirectoryInfo]) -or
         (($logs[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
         throw 'portable_attestation_directory_invalid'
     }
@@ -395,7 +397,8 @@ function Assert-SteinSourcePortableAttestationDirectory {
                 [string]$_.Name -ceq [string]$name
             })
         $relative = "logs/$name"
-        if ($matches.Count -ne 1 -or $matches[0].PSIsContainer -or
+        if ($matches.Count -ne 1 -or
+            -not ($matches[0] -is [IO.FileInfo]) -or
             (($matches[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
             [long]$matches[0].Length -lt 1 -or
             [long]$matches[0].Length -gt [long]$contract[$relative]) {

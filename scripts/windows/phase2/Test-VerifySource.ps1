@@ -1688,6 +1688,67 @@ try {
         throw "The source bootstrap probe cleanup target is invalid."
     }
     [IO.Directory]::Delete($bootstrapProbeRoot, $true)
+
+    foreach ($functionName in @(
+            'Get-SteinSourcePortableAttestationFileContract',
+            'Assert-SteinSourcePortableAttestationDirectory')) {
+        $functionAst = @($verifyAst.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -ceq $functionName
+                }, $true))
+        if ($functionAst.Count -ne 1) {
+            throw "A portable-attestation directory helper is not uniquely defined."
+        }
+        . ([scriptblock]::Create($functionAst[0].Extent.Text))
+    }
+    $portableDirectoryProbeRoot = Join-Path `
+        $fixtureRoot 'portable-directory-probe'
+    $null = New-Item -ItemType Directory `
+        -Path (Join-Path $portableDirectoryProbeRoot 'logs') `
+        -Force -ErrorAction Stop
+    $portableDirectoryContract =
+        Get-SteinSourcePortableAttestationFileContract
+    foreach ($relative in @($portableDirectoryContract.Keys)) {
+        $path = Join-Path $portableDirectoryProbeRoot `
+            (([string]$relative).Replace(
+                '/', [IO.Path]::DirectorySeparatorChar))
+        [IO.File]::WriteAllText(
+            $path,
+            "x",
+            [Text.UTF8Encoding]::new($false))
+    }
+    $validatedPortableDirectory =
+        Assert-SteinSourcePortableAttestationDirectory `
+            -Path $portableDirectoryProbeRoot
+    if (-not [string]::Equals(
+            [IO.Path]::GetFullPath($portableDirectoryProbeRoot),
+            [string]$validatedPortableDirectory,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The portable-attestation directory helper changed its root."
+    }
+    $portableDirectoryExtra = Join-Path `
+        $portableDirectoryProbeRoot 'unexpected.txt'
+    [IO.File]::WriteAllText(
+        $portableDirectoryExtra,
+        "x",
+        [Text.UTF8Encoding]::new($false))
+    Assert-SteinVerifySourceTestRejected `
+        -Action {
+            $null = Assert-SteinSourcePortableAttestationDirectory `
+                -Path $portableDirectoryProbeRoot
+        } `
+        -Description 'an extra physical portable-attestation file'
+    [IO.File]::Delete($portableDirectoryExtra)
+    if ([IO.Path]::GetFileName($portableDirectoryProbeRoot) -cne
+            'portable-directory-probe' -or
+        -not [IO.Path]::GetFullPath($portableDirectoryProbeRoot).StartsWith(
+            "$([IO.Path]::GetFullPath($fixtureRoot).TrimEnd('\', '/'))$([IO.Path]::DirectorySeparatorChar)",
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The portable-attestation directory probe cleanup target is invalid."
+    }
+    [IO.Directory]::Delete($portableDirectoryProbeRoot, $true)
+
     $externalSourcePath = Join-Path $externalFixtureRoot "external-source.ps1"
     [IO.File]::WriteAllText(
         $externalSourcePath,
