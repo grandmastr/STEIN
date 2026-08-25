@@ -7,7 +7,9 @@ Set-StrictMode -Version 3.0
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..'))
 $runnerPath = Join-Path $PSScriptRoot 'Run-Source-Check.ps1'
 $registryPath = Join-Path $PSScriptRoot 'Source-Command-Registry.json'
+$portableLibraryPath = Join-Path $PSScriptRoot 'Portable-Attestation.ps1'
 . $runnerPath -LibraryOnly
+. $portableLibraryPath
 
 if ([long]$script:SourceCommandMaximumLogBytes -ne 16777216L) {
     throw 'The source-command log bound differs from the downstream evidence contract.'
@@ -476,15 +478,15 @@ $registry = Get-Content -LiteralPath $registryPath -Raw -Encoding UTF8 |
 $contract = Assert-SteinSourceCommandRegistry -Registry $registry
 $checks = @($registry.checks)
 if ($checks.Count -ne 44 -or
-    @($checks | Where-Object { $_.category -ceq 'direct_execution' }).Count -ne 24 -or
+    @($checks | Where-Object { $_.category -ceq 'direct_execution' }).Count -ne 25 -or
     @($checks | Where-Object {
             $_.category -ceq 'grouped_fixture_execution'
         }).Count -ne 13 -or
     @($checks | Where-Object { $_.category -ceq 'derived' }).Count -ne 2 -or
     @($checks | Where-Object {
             $_.category -ceq 'retained_obligation'
-        }).Count -ne 5 -or
-    [long]$contract.ExecutionGroupCount -ne 25) {
+        }).Count -ne 4 -or
+    [long]$contract.ExecutionGroupCount -ne 26) {
     throw 'The source-command registry coverage counts are invalid.'
 }
 
@@ -501,6 +503,49 @@ if ($singleArgumentCheck.Count -ne 1 -or
     throw 'A one-element source-command argument vector was not retained as an array.'
 }
 
+$portableCheck = @($checks | Where-Object {
+        [string]$_.id -ceq 'portable-runner-attestation'
+    })
+$portableVectorRoot = Join-Path $repoRoot `
+    'artifacts\evidence\phase-2\source-command-vector-contract'
+$portableVectorCommit = 'a' * 40
+$portableVectorRef = 'refs/heads/phase-2-completion'
+$portableArgumentVector = @(ConvertTo-SteinSourceCommandArgumentVector `
+        -Check $portableCheck[0] `
+        -ResolvedEvidenceRoot $portableVectorRoot `
+        -CandidateCommit $portableVectorCommit `
+        -PortableSourceRef $portableVectorRef)
+Assert-SteinSourceCommandTestSequence `
+    -Actual $portableArgumentVector `
+    -Expected @(
+        'attestation', 'verify',
+        '--predicate-type', 'https://slsa.dev/provenance/v1',
+        '--cert-oidc-issuer', 'https://token.actions.githubusercontent.com',
+        'artifacts/evidence/phase-2/source-command-vector-contract/portable-runner-attestation/portable-fixture.json',
+        '--bundle',
+        'artifacts/evidence/phase-2/source-command-vector-contract/portable-runner-attestation/portable-fixture.attestation.json',
+        '--repo', 'grandmastr/STEIN',
+        '--cert-identity',
+        'https://github.com/grandmastr/STEIN/.github/workflows/portable-semantic.yml@refs/heads/phase-2-completion',
+        '--signer-digest', $portableVectorCommit,
+        '--source-digest', $portableVectorCommit,
+        '--source-ref', $portableVectorRef,
+        '--deny-self-hosted-runners', '--digest-alg', 'sha256',
+        '--hostname', 'github.com', '--format', 'json') `
+    -Description 'the portable attestation argument vector'
+if ($portableCheck.Count -ne 1 -or
+    [string]$portableCheck[0].executable_role -cne 'gh') {
+    throw 'The portable attestation command is not the exact direct gh row.'
+}
+foreach ($invalidRef in @(
+        '', 'refs/tags/main', 'refs/heads/.hidden', 'refs/heads/main.lock',
+        'refs/heads/main..other', 'refs/heads/main//other',
+        'refs/heads/main@{one}')) {
+    if (Test-SteinSourceCommandPortableSourceRef -Value $invalidRef) {
+        throw "The source-command runner accepted invalid source ref $invalidRef."
+    }
+}
+
 foreach ($mutation in @(
         [pscustomobject]@{ Value = 'contains space'; Description = 'a whitespace token' },
         [pscustomobject]@{ Value = '"quoted"'; Description = 'a quoted token' },
@@ -514,6 +559,65 @@ foreach ($mutation in @(
     Assert-SteinSourceCommandTestRejected `
         -Description ([string]$mutation.Description) `
         -Action { $null = Assert-SteinSourceCommandRegistry -Registry $candidate }
+}
+
+$portableRoleDrift = Copy-SteinSourceCommandTestValue -Value $registry
+@($portableRoleDrift.checks | Where-Object {
+        [string]$_.id -ceq 'portable-runner-attestation'
+    })[0].executable_role = 'cargo'
+Assert-SteinSourceCommandTestRejected `
+    -Description 'a non-gh portable attestation executable' `
+    -Action {
+        $null = Assert-SteinSourceCommandRegistry -Registry $portableRoleDrift
+    }
+
+$nonPortableDynamic = Copy-SteinSourceCommandTestValue -Value $registry
+$nonPortableDynamic.checks[0].arguments[0].kind = 'candidate_commit'
+$nonPortableDynamic.checks[0].arguments[0].value = 'candidate_commit'
+Assert-SteinSourceCommandTestRejected `
+    -Description 'a dynamic candidate argument on a non-portable row' `
+    -Action {
+        $null = Assert-SteinSourceCommandRegistry -Registry $nonPortableDynamic
+    }
+
+foreach ($portableMutation in @(
+        [pscustomobject]@{
+            Index = 6
+            Kind = 'evidence_relative_path'
+            Value = 'portable-runner-attestation/other.json'
+            Description = 'a noncanonical portable subject path'
+        },
+        [pscustomobject]@{
+            Index = 12
+            Kind = 'portable_source_ref'
+            Value = 'portable_source_ref'
+            Description = 'a weakened portable certificate identity'
+        },
+        [pscustomobject]@{
+            Index = 14
+            Kind = 'candidate_commit'
+            Value = 'other_commit'
+            Description = 'a changed signer-commit sentinel'
+        },
+        [pscustomobject]@{
+            Index = 18
+            Kind = 'portable_source_ref'
+            Value = 'portable_cert_identity'
+            Description = 'a changed raw source-ref sentinel'
+        })) {
+    $portableDrift = Copy-SteinSourceCommandTestValue -Value $registry
+    $portableDriftCheck = @($portableDrift.checks | Where-Object {
+            [string]$_.id -ceq 'portable-runner-attestation'
+        })[0]
+    $portableDriftCheck.arguments[[int]$portableMutation.Index].kind =
+        [string]$portableMutation.Kind
+    $portableDriftCheck.arguments[[int]$portableMutation.Index].value =
+        [string]$portableMutation.Value
+    Assert-SteinSourceCommandTestRejected `
+        -Description ([string]$portableMutation.Description) `
+        -Action {
+            $null = Assert-SteinSourceCommandRegistry -Registry $portableDrift
+        }
 }
 
 $groupDrift = Copy-SteinSourceCommandTestValue -Value $registry
@@ -542,6 +646,293 @@ if ($orderedDigest -cne (Get-SteinSourceCommandArgumentDigest -Arguments $ordere
     throw 'The source-command argument digest is not ordered and deterministic.'
 }
 
+$originalGhToken = [Environment]::GetEnvironmentVariable(
+    'GH_TOKEN', [EnvironmentVariableTarget]::Process)
+$originalGithubToken = [Environment]::GetEnvironmentVariable(
+    'GITHUB_TOKEN', [EnvironmentVariableTarget]::Process)
+$environmentBinding = $null
+try {
+    [Environment]::SetEnvironmentVariable(
+        'GH_TOKEN', 'synthetic-gh-token', [EnvironmentVariableTarget]::Process)
+    [Environment]::SetEnvironmentVariable(
+        'GITHUB_TOKEN', 'synthetic-github-token',
+        [EnvironmentVariableTarget]::Process)
+    $environmentBinding = Set-SteinSourceCommandEnvironmentProfile `
+        -Profile 'phase2_synthetic_compile_v1'
+    if ($null -ne [Environment]::GetEnvironmentVariable(
+            'GH_TOKEN', [EnvironmentVariableTarget]::Process) -or
+        $null -ne [Environment]::GetEnvironmentVariable(
+            'GITHUB_TOKEN', [EnvironmentVariableTarget]::Process) -or
+        [string]$environmentBinding.Digest -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'The source-command environment did not clear inherited gh tokens.'
+    }
+    Restore-SteinSourceCommandEnvironmentProfile `
+        -Original $environmentBinding.Original
+    $environmentBinding = $null
+    if ([Environment]::GetEnvironmentVariable(
+            'GH_TOKEN', [EnvironmentVariableTarget]::Process) -cne
+            'synthetic-gh-token' -or
+        [Environment]::GetEnvironmentVariable(
+            'GITHUB_TOKEN', [EnvironmentVariableTarget]::Process) -cne
+            'synthetic-github-token') {
+        throw 'The source-command environment did not restore inherited gh tokens.'
+    }
+}
+finally {
+    if ($null -ne $environmentBinding) {
+        Restore-SteinSourceCommandEnvironmentProfile `
+            -Original $environmentBinding.Original
+    }
+    [Environment]::SetEnvironmentVariable(
+        'GH_TOKEN', $originalGhToken, [EnvironmentVariableTarget]::Process)
+    [Environment]::SetEnvironmentVariable(
+        'GITHUB_TOKEN', $originalGithubToken,
+        [EnvironmentVariableTarget]::Process)
+}
+
+$ghTool = Resolve-SteinSourceCommandExecutable -Role 'gh'
+$ghToolPath = [string]$ghTool.Path
+$exclusiveGhReadRejected = $false
+try {
+    if ([string]$ghTool.Role -cne 'gh' -or
+        [string]$ghTool.Name -cne 'gh.exe' -or
+        [string]$ghTool.Sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'The source-command gh executable binding is invalid.'
+    }
+    $exclusiveProbe = $null
+    try {
+        $exclusiveProbe = [IO.FileStream]::new(
+            $ghToolPath,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::None)
+    }
+    catch {
+        $exclusiveGhReadRejected = $true
+    }
+    finally {
+        if ($null -ne $exclusiveProbe) {
+            $exclusiveProbe.Dispose()
+        }
+    }
+    if (-not $exclusiveGhReadRejected) {
+        throw 'The source-command gh executable was not locked through use.'
+    }
+}
+finally {
+    $ghTool.Stream.Dispose()
+}
+$releasedProbe = [IO.FileStream]::new(
+    $ghToolPath,
+    [IO.FileMode]::Open,
+    [IO.FileAccess]::Read,
+    [IO.FileShare]::None)
+$releasedProbe.Dispose()
+
+$portableReaderRelative =
+    "artifacts/evidence/phase-2/portable-reader-contract-$([Guid]::NewGuid().ToString('N'))"
+$portableReaderEvidence = Join-Path $repoRoot $portableReaderRelative.Replace(
+    '/', [IO.Path]::DirectorySeparatorChar)
+$portableReaderRoot = Join-Path $portableReaderEvidence `
+    'portable-runner-attestation'
+$portableReaderLogs = Join-Path $portableReaderRoot 'logs'
+$portableReaderCommit = '1' * 40
+$portableReaderTree = '2' * 40
+$portableReaderWorkflowSha256 = '3' * 64
+$portableReaderCargoLockSha256 = '4' * 64
+$portableReaderRustToolchainSha256 = '5' * 64
+$utf8NoBom = [Text.UTF8Encoding]::new($false)
+$portableReaderResult = $null
+try {
+    $null = New-Item -ItemType Directory -Path $portableReaderLogs `
+        -Force -ErrorAction Stop
+    $subchecks = New-Object Collections.Generic.List[object]
+    foreach ($id in @($script:SteinPortableCommands.Keys)) {
+        $logRelative = "logs/$id.log"
+        $logPath = Join-Path $portableReaderRoot $logRelative.Replace(
+            '/', [IO.Path]::DirectorySeparatorChar)
+        [IO.File]::WriteAllText(
+            $logPath, "synthetic-log=$id`n", $utf8NoBom)
+        [IO.File]::WriteAllText(
+            (Join-Path $portableReaderRoot "$id.exit"), "0`n", $utf8NoBom)
+        $logItem = Get-Item -LiteralPath $logPath -Force -ErrorAction Stop
+        $subchecks.Add([ordered]@{
+                artifact = [ordered]@{
+                    path = $logRelative
+                    sha256 = (Get-FileHash -LiteralPath $logPath `
+                            -Algorithm SHA256).Hash.ToLowerInvariant()
+                    size_bytes = [long]$logItem.Length
+                }
+                command = [string]$script:SteinPortableCommands[$id]
+                exit_code = 0
+                id = [string]$id
+                result = 'pass'
+            })
+    }
+    $rustcText = @(
+        'rustc 1.98.0 (88d9e12ae 2026-08-18)',
+        'binary: rustc',
+        'commit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea',
+        'commit-date: 2026-08-18',
+        'host: x86_64-unknown-linux-gnu',
+        'release: 1.98.0',
+        'LLVM version: 22.1.8') -join "`n"
+    $rustcText += "`n"
+    $cargoText = 'cargo 1.98.0 (797e8a9bc 2026-08-05)'
+    $fixture = [ordered]@{
+        fixture_id = 'phase2-portable-semantic-v1'
+        gate_id = 'P2-PORTABLE-FIXTURE'
+        generated_at = '2026-08-25T01:23:18.452251Z'
+        generator = [ordered]@{
+            workflow_path = '.github/workflows/portable-semantic.yml'
+            workflow_sha256 = $portableReaderWorkflowSha256
+        }
+        repository = [ordered]@{
+            clean_after = $true
+            clean_before = $true
+            commit = $portableReaderCommit
+            tree = $portableReaderTree
+        }
+        result = 'pass'
+        runner_id = 'github-actions-ubuntu-portable-v1'
+        schema_version = 1
+        subchecks = $subchecks.ToArray()
+        toolchain = [ordered]@{
+            cargo_lock_sha256 = $portableReaderCargoLockSha256
+            cargo_version = $cargoText
+            rust_toolchain_sha256 = $portableReaderRustToolchainSha256
+            rustc_verbose = $rustcText
+        }
+    }
+    $bundle = [ordered]@{
+        mediaType = 'application/vnd.dev.sigstore.bundle.v0.3+json'
+        verificationMaterial = [ordered]@{ certificate = [ordered]@{} }
+        dsseEnvelope = [ordered]@{
+            payload = 'c3ludGhldGlj'
+            payloadType = 'application/vnd.in-toto+json'
+            signatures = @([ordered]@{ sig = 'c3ludGhldGlj' })
+        }
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $portableReaderRoot 'portable-fixture.json'),
+        ($fixture | ConvertTo-Json -Depth 20) + "`n", $utf8NoBom)
+    [IO.File]::WriteAllText(
+        (Join-Path $portableReaderRoot 'portable-fixture.attestation.json'),
+        ($bundle | ConvertTo-Json -Depth 20) + "`n", $utf8NoBom)
+    foreach ($binding in @(
+            [pscustomobject]@{ Name = 'repository-commit.txt'; Text = "$portableReaderCommit`n" },
+            [pscustomobject]@{ Name = 'repository-tree.txt'; Text = "$portableReaderTree`n" },
+            [pscustomobject]@{ Name = 'clean-before.txt'; Text = "true`n" },
+            [pscustomobject]@{ Name = 'clean-after.txt'; Text = "true`n" },
+            [pscustomobject]@{ Name = 'cargo.txt'; Text = "$cargoText`n" },
+            [pscustomobject]@{ Name = 'rustc.txt'; Text = $rustcText })) {
+        [IO.File]::WriteAllText(
+            (Join-Path $portableReaderRoot ([string]$binding.Name)),
+            [string]$binding.Text,
+            $utf8NoBom)
+    }
+    $portableReaderResult =
+        Read-SteinSourceCommandPortableAttestationArtifacts `
+            -EvidencePath $portableReaderEvidence `
+            -ExpectedCommit $portableReaderCommit `
+            -ExpectedTree $portableReaderTree `
+            -ExpectedWorkflowSha256 $portableReaderWorkflowSha256 `
+            -ExpectedCargoLockSha256 $portableReaderCargoLockSha256 `
+            -ExpectedRustToolchainSha256 $portableReaderRustToolchainSha256
+    if ($portableReaderResult.Locks.Count -ne 22 -or
+        @($portableReaderResult.Artifacts).Count -ne 2 -or
+        [string]$portableReaderResult.Artifacts[0].role -cne
+            'portable_fixture_subject' -or
+        [string]$portableReaderResult.Artifacts[1].role -cne
+            'portable_sigstore_bundle') {
+        throw 'The portable combined-artifact reader did not retain exact evidence.'
+    }
+    $extraPath = Join-Path $portableReaderRoot 'extra.txt'
+    [IO.File]::WriteAllText($extraPath, "extra`n", $utf8NoBom)
+    Assert-SteinSourceCommandTestRejected `
+        -Description 'an extra portable attestation file' `
+        -Action {
+            $null = Assert-SteinSourceCommandPortableAttestationClosure `
+                -PortableRoot $portableReaderRoot
+        }
+    Remove-Item -LiteralPath $extraPath -Force -ErrorAction Stop
+    foreach ($lock in $portableReaderResult.Locks.ToArray()) {
+        $lock.Stream.Dispose()
+    }
+    $portableReaderResult = $null
+    [IO.File]::WriteAllText(
+        (Join-Path $portableReaderRoot 'rust_format.exit'), "1`n", $utf8NoBom)
+    Assert-SteinSourceCommandTestRejected `
+        -Description 'a nonzero portable subcheck companion' `
+        -Action {
+            $invalidPortable =
+                Read-SteinSourceCommandPortableAttestationArtifacts `
+                    -EvidencePath $portableReaderEvidence `
+                    -ExpectedCommit $portableReaderCommit `
+                    -ExpectedTree $portableReaderTree `
+                    -ExpectedWorkflowSha256 $portableReaderWorkflowSha256 `
+                    -ExpectedCargoLockSha256 $portableReaderCargoLockSha256 `
+                    -ExpectedRustToolchainSha256 `
+                        $portableReaderRustToolchainSha256
+            foreach ($lock in $invalidPortable.Locks.ToArray()) {
+                $lock.Stream.Dispose()
+            }
+        }
+}
+finally {
+    if ($null -ne $portableReaderResult) {
+        foreach ($lock in $portableReaderResult.Locks.ToArray()) {
+            $lock.Stream.Dispose()
+        }
+    }
+    if (Test-Path -LiteralPath $portableReaderEvidence) {
+        Remove-Item -LiteralPath $portableReaderEvidence `
+            -Recurse -Force -ErrorAction Stop
+    }
+}
+
+$portableDelegationRoot = Join-Path $repoRoot (
+    "artifacts\evidence\phase-2\portable-delegation-$([Guid]::NewGuid().ToString('N'))")
+$portableDelegationPath = Join-Path $portableDelegationRoot 'stdout.json'
+$script:PortableDelegationCalled = $false
+try {
+    $null = New-Item -ItemType Directory -Path $portableDelegationRoot `
+        -Force -ErrorAction Stop
+    [IO.File]::WriteAllText(
+        $portableDelegationPath, "[{`"probe`":true}]`n", $utf8NoBom)
+    function Assert-SteinPortableAttestationVerification {
+        param(
+            [Parameter(Mandatory = $true)][object[]] $VerificationResults,
+            [Parameter(Mandatory = $true)][string] $ExpectedCommit,
+            [Parameter(Mandatory = $true)][string] $ExpectedSourceRef,
+            [Parameter(Mandatory = $true)][string] $ExpectedSubjectSha256
+        )
+        if ($VerificationResults.Count -ne 1 -or
+            -not [bool]$VerificationResults[0].probe -or
+            $ExpectedCommit -cne ('6' * 40) -or
+            $ExpectedSourceRef -cne 'refs/heads/phase-2-completion' -or
+            $ExpectedSubjectSha256 -cne ('7' * 64)) {
+            throw 'The source-command portable verifier delegation changed bindings.'
+        }
+        $script:PortableDelegationCalled = $true
+    }
+    Assert-SteinSourceCommandPortableVerification `
+        -StdoutPath $portableDelegationPath `
+        -ExpectedCommit ('6' * 40) `
+        -ExpectedSourceRef 'refs/heads/phase-2-completion' `
+        -ExpectedSubjectSha256 ('7' * 64)
+    if (-not $script:PortableDelegationCalled) {
+        throw 'The source-command runner bypassed the portable verifier library.'
+    }
+}
+finally {
+    . $portableLibraryPath
+    if (Test-Path -LiteralPath $portableDelegationRoot) {
+        Remove-Item -LiteralPath $portableDelegationRoot `
+            -Recurse -Force -ErrorAction Stop
+    }
+}
+
 $gitExecutable = [string](@(Get-Command git.exe -CommandType Application `
             -ErrorAction Stop)[0].Source)
 Test-SteinSourceCommandCandidateBinding -GitExecutable $gitExecutable
@@ -555,6 +946,7 @@ $gitResolvedSha256 = (Get-FileHash -LiteralPath $gitResolvedExecutable `
 
 $commit = (& $gitExecutable rev-parse HEAD).Trim()
 $tree = (& $gitExecutable rev-parse 'HEAD^{tree}').Trim()
+$portableSourceRef = 'refs/heads/phase-2-completion'
 if ($LASTEXITCODE -ne 0) {
     throw 'The source-command test could not resolve the candidate tree.'
 }
@@ -623,6 +1015,7 @@ $env:PSModulePath = '__STEIN_POISONED_MODULE_ROOT__'
     -CheckId 'rust-format' `
     -CandidateCommit '__STEIN_CANDIDATE_COMMIT__' `
     -CandidateTree '__STEIN_CANDIDATE_TREE__' `
+    -PortableSourceRef '__STEIN_PORTABLE_SOURCE_REF__' `
     -ExpectedRegistrySha256 '__STEIN_REGISTRY_SHA256__' `
     -ExpectedGitLauncherPath '__STEIN_GIT_EXECUTABLE__' `
     -ExpectedGitLauncherSha256 '__STEIN_GIT_LAUNCHER_SHA256__' `
@@ -638,6 +1031,8 @@ $moduleBindingProbe = $moduleBindingProbeTemplate.Replace(
     $commit).Replace(
     '__STEIN_CANDIDATE_TREE__',
     $tree).Replace(
+    '__STEIN_PORTABLE_SOURCE_REF__',
+    $portableSourceRef).Replace(
     '__STEIN_REGISTRY_SHA256__',
     $registrySha256).Replace(
     '__STEIN_GIT_EXECUTABLE__',
@@ -683,7 +1078,11 @@ try {
     if ($moduleBindingProbeStdout.Length -gt 1048576 -or
         $moduleBindingProbeStderr.Length -gt 1048576 -or
         $moduleBindingProbeProcess.ExitCode -ne 0) {
-        throw 'The source-command runner did not repair a poisoned inherited module path.'
+        $diagnostic = $moduleBindingProbeStderr.Trim()
+        if ($diagnostic.Length -gt 4096) {
+            $diagnostic = $diagnostic.Substring(0, 4096)
+        }
+        throw "The source-command runner did not repair a poisoned inherited module path (exit $($moduleBindingProbeProcess.ExitCode)): $diagnostic"
     }
 }
 finally {
@@ -773,7 +1172,7 @@ if ([long]$receipt.schema_version -ne 1 -or
     [string]$receipt.bindings.git_launcher_sha256 -cne $gitLauncherSha256 -or
     [string]$receipt.bindings.git_resolved_sha256 -cne $gitResolvedSha256 -or
     [string]$receipt.bindings.registry_sha256 -cne $registrySha256 -or
-    [long]$receipt.bindings.execution_group_count -ne 25 -or
+    [long]$receipt.bindings.execution_group_count -ne 26 -or
     [string]$receipt.bindings.check_definition_sha256 -cne
         (Get-SteinSourceCommandObjectSha256 -Value $rustFormatDefinition) -or
     [string]$receipt.command.arguments_sha256 -cne
@@ -827,6 +1226,7 @@ $ErrorActionPreference = 'Continue'
     -CheckId rust-format `
     -CandidateCommit $commit `
     -CandidateTree $tree `
+    -PortableSourceRef $portableSourceRef `
     -ExpectedRegistrySha256 $registrySha256 `
     -ExpectedGitLauncherPath $gitExecutable `
     -ExpectedGitLauncherSha256 $gitLauncherSha256 `
@@ -850,6 +1250,7 @@ $ErrorActionPreference = 'Continue'
     -CheckId source-provenance-stability `
     -CandidateCommit $commit `
     -CandidateTree $tree `
+    -PortableSourceRef $portableSourceRef `
     -ExpectedRegistrySha256 $registrySha256 `
     -ExpectedGitLauncherPath $gitExecutable `
     -ExpectedGitLauncherSha256 $gitLauncherSha256 `
@@ -871,6 +1272,7 @@ $ErrorActionPreference = 'Continue'
     -CheckId source-report-command-provenance `
     -CandidateCommit $commit `
     -CandidateTree $tree `
+    -PortableSourceRef $portableSourceRef `
     -ExpectedRegistrySha256 $registrySha256 `
     -ExpectedGitLauncherPath $gitExecutable `
     -ExpectedGitLauncherSha256 $gitLauncherSha256 `
@@ -881,7 +1283,7 @@ $ErrorActionPreference = 'Stop'
 if ($finalizerExitCode -eq 0 -or
     (Test-Path -LiteralPath (Join-Path $evidencePath `
             'source-command-receipts\index.json'))) {
-    throw 'The receipt-suite finalizer accepted incomplete 37-check coverage.'
+    throw 'The receipt-suite finalizer accepted incomplete 38-check coverage.'
 }
 
 Write-Host 'Source-command registry, runner, argv domain, receipt, and finalizer contracts are valid.'

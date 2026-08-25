@@ -151,8 +151,8 @@ not the required `no-leaks-producer-workflow` check and cannot promote
 `not_run` evidence with the bounded reason that the candidate-owned installed
 artifact producer is not implemented.
 
-The same checked-in contract fixes the full 44-row source-report check set (39
-required `pass`; five exact frozen `not_run`) and the exact twenty generator
+The same checked-in contract fixes the full 44-row source-report check set (40
+required `pass`; four exact frozen `not_run`) and the exact twenty-three generator
 paths. Source provenance schema 2 records both the
 launcher shims and the rustup-selected Cargo/rustc payload hashes/toolchain ID,
 the pnpm JavaScript entrypoint hash, and both the Git-for-Windows launcher and
@@ -172,12 +172,12 @@ source bytes/Git blobs, environment, harness binary, exact command, result, and
 suite index.
 
 The frozen source-command registry (`SHA-256
-9a1bb265a11a3b7ca18d1e8b67a2b1c47f9cb090910a458ca3d41fb221b50cbc`)
-defines the category of all 44 report rows and, for the 37 executed rows, the
+8263b2c63295dae6fbd05940639fc8b23bde77263833d4d5af5f249cd4d7865e`)
+defines the category of all 44 report rows and, for the 38 executed rows, the
 exact executable role, ordered argument vector, working directory, environment
 profile, timeout, and execution grouping.
-Twenty-four direct commands and one shared source-fixture suite execution emit
-37 per-check receipts across 25 execution groups and 50 unique bounded logs.
+Twenty-five direct commands and one shared source-fixture suite execution emit
+38 per-check receipts across 26 execution groups and 52 unique bounded logs.
 Their candidate manifest is the canonical Git tree record set
 (`UTF-8 path length:path|mode|blob object ID`). The runner holds every tracked
 worktree file open and proves its raw stream is either the exact blob or differs
@@ -257,13 +257,14 @@ synthetic fixtures pass.
 The `P2-PORTABLE-FIXTURE` schema binds the candidate, workflow/toolchain hashes,
 seven named check receipts, and each extracted log's bytes. Its fixture and
 runner IDs are not by themselves authenticated GitHub Actions provenance;
-retain a separately authenticated run/attestation when that assurance is
-needed.
+the required passing source attestation row supplies that separate assurance.
 The gate additionally requires the exact `portable-runner-attestation` source-
-report check. It remains `not_run` until an authenticated GitHub artifact
-attestation or equivalent Sigstore bundle binds the repository, workflow,
-candidate commit, and portable-artifact digest. A self-declared schema-1 JSON
-and `runner_id` cannot promote the gate.
+report check. The source verifier earns that pass only when an authenticated
+GitHub artifact attestation binds the exact repository, workflow identity and
+digest, branch ref, candidate commit, GitHub-hosted runner, SLSA predicate type,
+and fixture subject digest. It retains the exact ordered descriptors for all 22
+files in the combined artifact. A self-declared schema-1 JSON and `runner_id`
+cannot promote the gate.
 
 The automatic pull-request job remains read-only and emits only the existing
 content-integrity artifact. To create an attestation candidate, an operator must
@@ -278,6 +279,11 @@ and bind the exact fixture, bundle, repository, workflow, event, source ref,
 commit, GitHub-hosted runner, and subject digest before
 `portable-runner-attestation` can pass.
 
+The retained bundle is an external post-commit input. Its dependency graph is
+`candidate commit -> workflow fixture -> external bundle -> source report ->
+signed package`; committing the candidate-specific bundle would create an
+impossible hash fixed point and is prohibited.
+
 The combined attested artifact has a 30-day GitHub retention window. Export it
 into the candidate evidence root before expiry; a later missing bundle is not
 durable completion evidence. The attestation authenticates a GitHub-hosted run,
@@ -290,8 +296,8 @@ underlying artifact hashes, and native semantics before promotion. The retained
 mechanism is tamper-evident and content-bound, but it is not proof against a
 malicious evidence owner and does not cryptographically authenticate a local
 runner controlled by that same owner. The portable gate is stricter because it
-asserts execution by an external GitHub runner and therefore remains blocked on
-the separate attestation obligation above.
+asserts execution by an external GitHub runner and therefore requires the
+separately verified attestation obligation above.
 
 The `P2-RETENTION` source fixture invokes the public one-shot maintenance path
 with a controllable clock immediately before, exactly at, and after the

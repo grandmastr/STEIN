@@ -173,8 +173,12 @@ $bootstrapSourceBinding = Get-SteinVerifiedSourceBuildBinding `
     -ExpectedCandidateGitCommit $ExpectedCandidateGitCommit `
     -ExpectedCandidateGitTree $ExpectedCandidateGitTree `
     -BootstrapOnly
-if ([string]$bootstrapSourceBinding.CandidateBindingScope -cne "bootstrap_only") {
-    throw "The initial source binding exceeded its bootstrap-only scope."
+if ([string]$bootstrapSourceBinding.CandidateBindingScope -cne "bootstrap_only" -or
+    $bootstrapSourceBinding.PortableAttestationVerified -isnot [bool] -or
+    -not [bool]$bootstrapSourceBinding.PortableAttestationVerified -or
+    -not (Test-SteinPackageSha256Value `
+        -Value ([string]$bootstrapSourceBinding.GhExecutableSha256))) {
+    throw "The initial source binding or portable signer prerequisite is invalid."
 }
 $toolchain = Get-SteinVerifiedBuildToolchain `
     -SourceBinding $bootstrapSourceBinding `
@@ -209,9 +213,13 @@ try {
     if ([string]$sourceBinding.CandidateBindingScope -cne
             "authoritative_locked_snapshot" -or
         [long]$sourceBinding.CandidateTreeFileCount -ne @($snapshot.Files).Count -or
+        $sourceBinding.PortableAttestationVerified -isnot [bool] -or
+        -not [bool]$sourceBinding.PortableAttestationVerified -or
         -not (Test-SteinPackageSha256Value `
-            -Value ([string]$sourceBinding.CandidateTreeManifestSha256))) {
-        throw "The authoritative source binding did not ground the locked candidate tree."
+            -Value ([string]$sourceBinding.CandidateTreeManifestSha256)) -or
+        -not (Test-SteinPackageSha256Value `
+            -Value ([string]$sourceBinding.GhExecutableSha256))) {
+        throw "The authoritative source binding or portable signer prerequisite is invalid."
     }
     foreach ($bindingProperty in @(
             "GitExecutableSha256", "GitResolvedExecutableSha256",
@@ -219,12 +227,19 @@ try {
             "CargoResolvedExecutableSha256", "RustcExecutableSha256",
             "RustcResolvedExecutableSha256", "RustupExecutableSha256",
             "NodeExecutableSha256", "PnpmExecutableSha256",
-            "PnpmResolvedEntrypointSha256", "RustupToolchain")) {
+            "PnpmResolvedEntrypointSha256", "RustupToolchain",
+            "PortableSourceRef", "PortableRunInvocationUri",
+            "PortableGeneratedAt", "PortableEarliestVerifiedAt",
+            "PortableLatestVerifiedAt", "PortableVerifiedTimestampCount",
+            "GhExecutableSha256", "GhSignerSubject", "GhSignerThumbprint")) {
         if ([string]$sourceBinding.$bindingProperty -cne
             [string]$bootstrapSourceBinding.$bindingProperty) {
             throw "The private candidate uses a different source toolchain contract."
         }
     }
+    # Both the bootstrap tree and locked candidate independently reran the
+    # offline gh attestation authentication. No release signing occurs before
+    # this exact portable signer prerequisite has been established twice.
     $candidateBuildScript = Resolve-SteinPackageRegularFileUnderRoot `
         -Root $snapshot.Root `
         -Path (Join-Path $snapshot.Root "packaging\windows-msix\Build-Msix.ps1")

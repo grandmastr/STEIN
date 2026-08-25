@@ -4,6 +4,15 @@ param([switch] $CleanupTestsOnly)
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot "PackageTools.ps1")
+$script:SteinStaticProductionGitHubCliResolver =
+    (Get-Command `
+        -Name 'Resolve-SteinPackageAuthenticatedGitHubCli' `
+        -CommandType Function `
+        -ErrorAction Stop).ScriptBlock
+if ([string]$script:SteinStaticProductionGitHubCliResolver.File -cne
+    (Join-Path $PSScriptRoot 'PackageTools.ps1')) {
+    throw 'The static test did not capture the production GitHub CLI resolver.'
+}
 
 function Remove-SteinStaticTemporaryLeaf {
     param([Parameter(Mandatory = $true)][string] $Path)
@@ -123,7 +132,8 @@ function New-SteinStaticSourceCommandEvidence {
         [Parameter(Mandatory = $true)][string] $GitResolvedSha256,
         [Parameter(Mandatory = $true)][Collections.IDictionary] $ToolDescriptors,
         [Parameter(Mandatory = $true)][Collections.IDictionary] $FixtureByCheck,
-        [Parameter(Mandatory = $true)] $FixtureSuite
+        [Parameter(Mandatory = $true)] $FixtureSuite,
+        [Parameter(Mandatory = $true)][Collections.IDictionary] $PortableAttestation
     )
 
     $repositoryPath = [IO.Path]::GetFullPath($RepositoryRoot).TrimEnd(
@@ -180,7 +190,9 @@ function New-SteinStaticSourceCommandEvidence {
         }
         $arguments = @(Get-SteinPhase2SourceCommandExpectedArguments `
                 -RegistryCheck $definition `
-                -EvidenceRootRelative $evidenceRootRelative)
+                -EvidenceRootRelative $evidenceRootRelative `
+                -CandidateCommit $CandidateCommit `
+                -PortableSourceRef ([string]$PortableAttestation.source_ref))
         $command = [ordered]@{
             executable_role = [string]$definition.executable_role
             executable_name = [string]$tool.Name
@@ -224,7 +236,7 @@ function New-SteinStaticSourceCommandEvidence {
                 sha256 = $emptyLogSha256
             }
         }
-        $startedAt = '2026-08-24T00:00:00.0000000Z'
+        $startedAt = '2026-08-24T00:00:02.0000000Z'
         $completedAt = $startedAt
         $execution = [ordered]@{
             execution_group_id = $executionGroupId
@@ -273,13 +285,26 @@ function New-SteinStaticSourceCommandEvidence {
                     sha256 = [string]$fixtureRecord.Sha256
                 })
         }
+        elseif ($id -ceq 'portable-runner-attestation') {
+            $artifacts = @(
+                [ordered]@{
+                    role = 'portable_fixture_subject'
+                    size = [long]$PortableAttestation.subject.size
+                    sha256 = [string]$PortableAttestation.subject.sha256
+                },
+                [ordered]@{
+                    role = 'portable_sigstore_bundle'
+                    size = [long]$PortableAttestation.bundle.size
+                    sha256 = [string]$PortableAttestation.bundle.sha256
+                })
+        }
         $bindings = [ordered]@{}
         foreach ($bindingName in $commonBindings.Keys) {
             $bindings[$bindingName] = $commonBindings[$bindingName]
         }
         $bindings.check_definition_sha256 =
             Get-SteinPhase2EvidenceObjectSha256 -Value $definition
-        $bindings.execution_group_count = 25
+        $bindings.execution_group_count = 26
         $receipt = [ordered]@{
             schema_version = 1
             claim = 'closed_source_command_execution_only'
@@ -323,8 +348,8 @@ function New-SteinStaticSourceCommandEvidence {
         claim = 'closed_source_command_receipt_index'
         registry_id = 'stein.phase2.source-command-registry.v1'
         bindings = $commonBindings
-        executed_check_count = 37
-        execution_group_count = 25
+        executed_check_count = 38
+        execution_group_count = 26
         receipts = $indexDescriptors.ToArray()
     }
     $indexPath = Join-Path $receiptDirectory 'index.json'
@@ -347,6 +372,260 @@ function New-SteinStaticSourceCommandEvidence {
     }
 }
 
+function New-SteinStaticPortableEvidence {
+    param(
+        [Parameter(Mandatory = $true)][string] $EvidenceRoot,
+        [Parameter(Mandatory = $true)][string] $CandidateCommit,
+        [Parameter(Mandatory = $true)][string] $CandidateTree,
+        [Parameter(Mandatory = $true)][string] $WorkflowSha256,
+        [Parameter(Mandatory = $true)][string] $CargoLockSha256,
+        [Parameter(Mandatory = $true)][string] $RustToolchainSha256,
+        [Parameter(Mandatory = $true)][string] $SourceRef
+    )
+
+    $portableRoot = Join-Path $EvidenceRoot 'portable-runner-attestation'
+    $portableLogRoot = Join-Path $portableRoot 'logs'
+    $null = New-Item `
+        -ItemType Directory `
+        -Path $portableLogRoot `
+        -Force `
+        -ErrorAction Stop
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    $generatedAt = '2026-08-24T00:00:00.0000000Z'
+    $verifiedAt = '2026-08-24T00:00:01.0000000Z'
+    $runInvocationUri =
+        'https://github.com/grandmastr/STEIN/actions/runs/1/attempts/1'
+    $cargoVersion = 'cargo 1.98.0 (797e8a9bc 2026-08-05)'
+    $rustcVerbose =
+        "rustc 1.98.0 (88d9e12ae 2026-08-18)`n" +
+        "binary: rustc`n" +
+        "commit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea`n" +
+        "commit-date: 2026-08-18`n" +
+        "host: x86_64-unknown-linux-gnu`n" +
+        "release: 1.98.0`n" +
+        "LLVM version: 22.1.8`n"
+    $portableCommands = [ordered]@{
+        rust_format = 'cargo fmt --all -- --check'
+        portable_check = 'cargo check --locked --all-targets -p stein-core -p stein-protocol -p stein-ipc -p stein-model-openai -p stein-store-sqlite'
+        portable_clippy = 'cargo clippy --locked --all-targets -p stein-core -p stein-protocol -p stein-ipc -p stein-model-openai -p stein-store-sqlite -- -D warnings'
+        semantic_full_loop = 'cargo test --locked -p stein-core --lib second_mind::tests::full_loop_records_audited_delivery_and_ephemeral_correction -- --exact'
+        semantic_outbox_recovery = 'cargo test --locked -p stein-core --lib second_mind::tests::unavailable_channel_queues_then_fresh_recovery_delivers_once -- --exact'
+        semantic_restart_recovery = 'cargo test --locked -p stein-core --lib second_mind::tests::restart_recovery_requires_authorized_continuity_and_fresh_health -- --exact'
+        portable_full_suite = 'cargo test --locked --all-targets -p stein-core -p stein-protocol -p stein-ipc -p stein-model-openai -p stein-store-sqlite'
+    }
+    $subchecks = @(
+        foreach ($entry in $portableCommands.GetEnumerator()) {
+            $id = [string]$entry.Key
+            $relativeLogPath = "logs/$id.log"
+            $logPath = Join-Path $portableRoot ($relativeLogPath.Replace(
+                    '/', [IO.Path]::DirectorySeparatorChar))
+            [IO.File]::WriteAllText(
+                $logPath,
+                "synthetic portable output: $id`n",
+                $utf8)
+            $logItem = Get-Item -LiteralPath $logPath -Force -ErrorAction Stop
+            [ordered]@{
+                artifact = [ordered]@{
+                    path = $relativeLogPath
+                    sha256 = Get-SteinPackageFileSha256 -Path $logPath
+                    size_bytes = [long]$logItem.Length
+                }
+                command = [string]$entry.Value
+                exit_code = 0
+                id = $id
+                result = 'pass'
+            }
+        })
+    $fixture = [ordered]@{
+        fixture_id = 'phase2-portable-semantic-v1'
+        gate_id = 'P2-PORTABLE-FIXTURE'
+        generated_at = $generatedAt
+        generator = [ordered]@{
+            workflow_path = '.github/workflows/portable-semantic.yml'
+            workflow_sha256 = $WorkflowSha256
+        }
+        repository = [ordered]@{
+            clean_after = $true
+            clean_before = $true
+            commit = $CandidateCommit
+            tree = $CandidateTree
+        }
+        result = 'pass'
+        runner_id = 'github-actions-ubuntu-portable-v1'
+        schema_version = 1
+        subchecks = $subchecks
+        toolchain = [ordered]@{
+            cargo_lock_sha256 = $CargoLockSha256
+            cargo_version = $cargoVersion
+            rust_toolchain_sha256 = $RustToolchainSha256
+            rustc_verbose = $rustcVerbose
+        }
+    }
+    $subjectPath = Join-Path $portableRoot 'portable-fixture.json'
+    [IO.File]::WriteAllText(
+        $subjectPath,
+        ($fixture | ConvertTo-Json -Depth 30),
+        $utf8)
+    $bundle = [ordered]@{
+        mediaType = 'application/vnd.dev.sigstore.bundle.v0.3+json'
+        verificationMaterial = [ordered]@{ content = 'synthetic' }
+        dsseEnvelope = [ordered]@{ content = 'synthetic' }
+    }
+    $bundlePath = Join-Path $portableRoot `
+        'portable-fixture.attestation.json'
+    [IO.File]::WriteAllText(
+        $bundlePath,
+        ($bundle | ConvertTo-Json -Depth 12),
+        $utf8)
+    $fixedPortableText = [ordered]@{
+        'cargo.txt' = "$cargoVersion`n"
+        'clean-after.txt' = "true`n"
+        'clean-before.txt' = "true`n"
+        'portable_check.exit' = "0`n"
+        'portable_clippy.exit' = "0`n"
+        'portable_full_suite.exit' = "0`n"
+        'repository-commit.txt' = "$CandidateCommit`n"
+        'repository-tree.txt' = "$CandidateTree`n"
+        'rust_format.exit' = "0`n"
+        'rustc.txt' = $rustcVerbose
+        'semantic_full_loop.exit' = "0`n"
+        'semantic_outbox_recovery.exit' = "0`n"
+        'semantic_restart_recovery.exit' = "0`n"
+    }
+    foreach ($entry in $fixedPortableText.GetEnumerator()) {
+        [IO.File]::WriteAllText(
+            (Join-Path $portableRoot ([string]$entry.Key)),
+            ([string]$entry.Value),
+            $utf8)
+    }
+
+    $files = @(
+        foreach ($relativePath in @(
+                (Get-SteinPhase2PortableAttestationFileContract).Keys)) {
+            $relativePath = [string]$relativePath
+            $stagedRelative = $relativePath.Substring(
+                'portable-runner-attestation/'.Length)
+            $path = Join-Path $portableRoot ($stagedRelative.Replace(
+                    '/', [IO.Path]::DirectorySeparatorChar))
+            $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+            [ordered]@{
+                path = $relativePath
+                size = [long]$item.Length
+                sha256 = Get-SteinPackageFileSha256 -Path $path
+            }
+        })
+    $subjectFile = @($files | Where-Object {
+            [string]$_.path -ceq
+                'portable-runner-attestation/portable-fixture.json'
+        })[0]
+    $bundleFile = @($files | Where-Object {
+            [string]$_.path -ceq
+                'portable-runner-attestation/portable-fixture.attestation.json'
+        })[0]
+    $attestation = [ordered]@{
+        source_ref = $SourceRef
+        subject = [ordered]@{
+            path = [string]$subjectFile.path
+            size = [long]$subjectFile.size
+            sha256 = [string]$subjectFile.sha256
+        }
+        bundle = [ordered]@{
+            path = [string]$bundleFile.path
+            size = [long]$bundleFile.size
+            sha256 = [string]$bundleFile.sha256
+            media_type = 'application/vnd.dev.sigstore.bundle.v0.3+json'
+        }
+        workflow_sha256 = $WorkflowSha256
+        run_invocation_uri = $runInvocationUri
+        generated_at = $generatedAt
+        earliest_verified_at = $verifiedAt
+        latest_verified_at = $verifiedAt
+        verified_timestamp_count = 1L
+        subchecks = @($subchecks | ForEach-Object {
+                [ordered]@{
+                    id = [string]$_.id
+                    path = [string]$_.artifact.path
+                    size = [long]$_.artifact.size_bytes
+                    sha256 = [string]$_.artifact.sha256
+                }
+            })
+        files = $files
+    }
+    $workflowIdentity =
+        "https://github.com/grandmastr/STEIN/.github/workflows/portable-semantic.yml@$SourceRef"
+    $certificate = [ordered]@{
+        certificateIssuer = 'CN=sigstore-intermediate,O=sigstore.dev'
+        subjectAlternativeName = $workflowIdentity
+        issuer = 'https://token.actions.githubusercontent.com'
+        githubWorkflowTrigger = 'workflow_dispatch'
+        githubWorkflowSHA = $CandidateCommit
+        githubWorkflowName = 'portable-semantic-fixture'
+        githubWorkflowRepository = 'grandmastr/STEIN'
+        githubWorkflowRef = $SourceRef
+        buildSignerURI = $workflowIdentity
+        buildSignerDigest = $CandidateCommit
+        runnerEnvironment = 'github-hosted'
+        sourceRepositoryURI = 'https://github.com/grandmastr/STEIN'
+        sourceRepositoryDigest = $CandidateCommit
+        sourceRepositoryRef = $SourceRef
+        sourceRepositoryIdentifier = '1335864815'
+        sourceRepositoryOwnerURI = 'https://github.com/grandmastr'
+        sourceRepositoryOwnerIdentifier = '24866656'
+        buildConfigURI = $workflowIdentity
+        buildConfigDigest = $CandidateCommit
+        buildTrigger = 'workflow_dispatch'
+        runInvocationURI = $runInvocationUri
+        sourceRepositoryVisibilityAtSigning = 'public'
+    }
+    $verificationEntry = [pscustomobject][ordered]@{
+        attestation = [pscustomobject][ordered]@{
+            bundle = [pscustomobject]$bundle
+            bundle_url = ''
+            initiator = ''
+        }
+        verificationResult = [pscustomobject][ordered]@{
+            mediaType =
+                'application/vnd.dev.sigstore.verificationresult+json;version=0.1'
+            signature = [pscustomobject][ordered]@{
+                certificate = [pscustomobject]$certificate
+            }
+            verifiedTimestamps = @([pscustomobject][ordered]@{
+                    type = 'Tlog'
+                    uri = 'https://rekor.sigstore.dev'
+                    timestamp = $verifiedAt
+                })
+            verifiedIdentity = [pscustomobject][ordered]@{
+                subjectAlternativeName = [pscustomobject][ordered]@{
+                    subjectAlternativeName = $workflowIdentity
+                }
+                issuer = [pscustomobject][ordered]@{
+                    issuer = ''
+                    regexp = '.*'
+                }
+                runnerEnvironment = 'github-hosted'
+            }
+            statement = [pscustomobject][ordered]@{
+                _type = 'https://in-toto.io/Statement/v1'
+                subject = @([pscustomobject][ordered]@{
+                        name = 'portable-fixture.json'
+                        digest = [pscustomobject][ordered]@{
+                            sha256 = [string]$subjectFile.sha256
+                        }
+                    })
+                predicateType = 'https://slsa.dev/provenance/v1'
+                predicate = [pscustomobject][ordered]@{
+                    buildDefinition = [pscustomobject]@{}
+                }
+            }
+        }
+    }
+    return [pscustomobject]@{
+        Root = $portableRoot
+        Attestation = $attestation
+        VerificationResults = @($verificationEntry)
+    }
+}
+
 function Copy-SteinStaticJsonValue {
     param([Parameter(Mandatory = $true)] $Value)
 
@@ -356,6 +635,208 @@ function Copy-SteinStaticJsonValue {
         return $json | ConvertFrom-Json -DateKind String -ErrorAction Stop
     }
     return $json | ConvertFrom-Json -ErrorAction Stop
+}
+
+function Test-SteinStaticProductionGitHubCliResolverLock {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock] $Resolver,
+        [Parameter(Mandatory = $true)][string] $Root
+    )
+
+    $sourceCommands = @(Get-Command gh.exe -CommandType Application -All `
+            -ErrorAction Stop)
+    if ($sourceCommands.Count -lt 1 -or
+        [string]::IsNullOrWhiteSpace([string]$sourceCommands[0].Source)) {
+        throw 'The static GitHub CLI lock probe has no signed source binary.'
+    }
+    $sourcePath = Resolve-SteinPackageRegularFileWithAncestors `
+        -Path ([string]$sourceCommands[0].Source)
+    $toolRoot = Join-Path $Root `
+        ('artifacts\static-gh-lock-' + [Guid]::NewGuid().ToString('N'))
+    $null = New-Item `
+        -ItemType Directory `
+        -Path $toolRoot `
+        -Force `
+        -ErrorAction Stop
+    $probePath = Join-Path $toolRoot 'gh.exe'
+    [IO.File]::Copy($sourcePath, $probePath, $false)
+    $expectedSha256 = Get-SteinPackageFileSha256 -Path $probePath
+
+    # Prove the synthetic copy permits a write-capable open before testing
+    # whether the production resolver's read/share-read handle blocks it.
+    $preLockProbe = [IO.FileStream]::new(
+        $probePath,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::ReadWrite,
+        [IO.FileShare]::Read)
+    $preLockProbe.Dispose()
+
+    $binding = $null
+    $originalPath = $env:PATH
+    try {
+        $env:PATH = "$toolRoot$([IO.Path]::PathSeparator)$originalPath"
+        $binding = & $Resolver -ExpectedSha256 $expectedSha256
+    }
+    finally {
+        $env:PATH = $originalPath
+    }
+    try {
+        if ($null -eq $binding -or
+            $null -eq $binding.PSObject.Properties['Path'] -or
+            $null -eq $binding.PSObject.Properties['Size'] -or
+            $null -eq $binding.PSObject.Properties['Sha256'] -or
+            $null -eq $binding.PSObject.Properties['SignerSubject'] -or
+            $null -eq $binding.PSObject.Properties['SignerThumbprint'] -or
+            $null -eq $binding.PSObject.Properties['Stream'] -or
+            $binding.Stream -isnot [IO.FileStream] -or
+            -not [string]::Equals(
+                [IO.Path]::GetFullPath([string]$binding.Path),
+                [IO.Path]::GetFullPath($probePath),
+                [StringComparison]::OrdinalIgnoreCase) -or
+            [long]$binding.Size -ne [long]$binding.Stream.Length -or
+            [string]$binding.Sha256 -cne $expectedSha256 -or
+            (Get-SteinPackageStreamSha256 -Stream $binding.Stream) -cne
+                $expectedSha256) {
+            throw 'The production GitHub CLI resolver did not return its exact live lock.'
+        }
+        $writeOpenRejected = $false
+        try {
+            $writeProbe = [IO.FileStream]::new(
+                $probePath,
+                [IO.FileMode]::Open,
+                [IO.FileAccess]::ReadWrite,
+                [IO.FileShare]::Read)
+            $writeProbe.Dispose()
+        }
+        catch {
+            $failure = $_.Exception
+            while ($null -ne $failure.InnerException) {
+                $failure = $failure.InnerException
+            }
+            if ($failure -isnot [IO.IOException]) {
+                throw
+            }
+            $writeOpenRejected = $true
+        }
+        if (-not $writeOpenRejected) {
+            throw 'The production GitHub CLI lock allowed a write-capable open.'
+        }
+    }
+    finally {
+        if ($null -ne $binding -and
+            $binding.Stream -is [IDisposable]) {
+            $binding.Stream.Dispose()
+        }
+    }
+
+    $postLockProbe = [IO.FileStream]::new(
+        $probePath,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::ReadWrite,
+        [IO.FileShare]::Read)
+    $postLockProbe.Dispose()
+    return $true
+}
+
+$script:SteinStaticPortableGitHubCli = $null
+$script:SteinStaticPortableVerificationResults = $null
+$script:SteinStaticPortableExpectedArguments = $null
+$script:SteinStaticPortableExpectedWorkingDirectory = $null
+$script:SteinStaticPortableVerificationCount = 0
+$script:SteinStaticPortableLastGitHubCliStream = $null
+$script:SteinStaticPortableStreamMutation = $null
+$script:SteinStaticPortableReplacementStream = $null
+
+function Resolve-SteinStaticPortableGitHubCli {
+    param([Parameter(Mandatory = $true)][string] $ExpectedSha256)
+
+    $configured = $script:SteinStaticPortableGitHubCli
+    if ($null -eq $configured -or
+        [string]$configured.Sha256 -cne $ExpectedSha256) {
+        throw 'The static portable GitHub CLI binding is invalid.'
+    }
+    $path = Resolve-SteinPackageRegularFileWithAncestors `
+        -Path ([string]$configured.Path)
+    $stream = [IO.FileStream]::new(
+        $path,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read)
+    try {
+        $sha256 = Get-SteinPackageStreamSha256 -Stream $stream
+        if ($sha256 -cne $ExpectedSha256) {
+            throw 'The static portable GitHub CLI bytes are invalid.'
+        }
+        $binding = [pscustomobject]@{
+            Path = $path
+            Size = [long]$stream.Length
+            Sha256 = $sha256
+            SignerSubject = [string]$configured.SignerSubject
+            SignerThumbprint = [string]$configured.SignerThumbprint
+            Stream = $stream
+        }
+        $script:SteinStaticPortableLastGitHubCliStream = $stream
+        return $binding
+    }
+    catch {
+        $stream.Dispose()
+        throw
+    }
+}
+
+function Invoke-SteinStaticPortableAttestationVerification {
+    param(
+        [Parameter(Mandatory = $true)] $GitHubCli,
+        [Parameter(Mandatory = $true)][string[]] $Arguments,
+        [Parameter(Mandatory = $true)][string] $WorkingDirectory
+    )
+
+    $expectedArguments = @($script:SteinStaticPortableExpectedArguments)
+    $actualArguments = @($Arguments | ForEach-Object { [string]$_ })
+    $expectedWorkingDirectory = [IO.Path]::GetFullPath(
+        [string]$script:SteinStaticPortableExpectedWorkingDirectory).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar)
+    $actualWorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar)
+    if ($null -eq $GitHubCli -or
+        $null -eq $GitHubCli.PSObject.Properties['Stream'] -or
+        $GitHubCli.Stream -isnot [IO.FileStream] -or
+        -not [object]::ReferenceEquals(
+            $GitHubCli.Stream,
+            $script:SteinStaticPortableLastGitHubCliStream) -or
+        -not $GitHubCli.Stream.CanRead -or
+        [long]$GitHubCli.Size -ne [long]$GitHubCli.Stream.Length -or
+        [string]$GitHubCli.Sha256 -cne
+            [string]$script:SteinStaticPortableGitHubCli.Sha256 -or
+        (Get-SteinPackageStreamSha256 -Stream $GitHubCli.Stream) -cne
+            [string]$GitHubCli.Sha256 -or
+        $expectedArguments.Count -ne 26 -or
+        $actualArguments.Count -ne $expectedArguments.Count -or
+        @(Compare-Object `
+                -ReferenceObject $expectedArguments `
+                -DifferenceObject $actualArguments `
+                -CaseSensitive `
+                -SyncWindow 0).Count -ne 0 -or
+        -not [string]::Equals(
+            $actualWorkingDirectory,
+            $expectedWorkingDirectory,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        $null -eq $script:SteinStaticPortableVerificationResults) {
+        throw 'The static portable attestation invocation is invalid.'
+    }
+    $script:SteinStaticPortableVerificationCount++
+    if ([string]$script:SteinStaticPortableStreamMutation -ceq 'disposed') {
+        $GitHubCli.Stream.Dispose()
+    }
+    elseif ([string]$script:SteinStaticPortableStreamMutation -ceq
+        'substituted') {
+        $replacement = [IO.MemoryStream]::new([byte[]](1, 2, 3, 4))
+        $script:SteinStaticPortableReplacementStream = $replacement
+        $GitHubCli.Stream = $replacement
+    }
+    return ,$script:SteinStaticPortableVerificationResults
 }
 
 function Set-SteinStaticSourceCommandExecutionTimestamp {
@@ -1416,6 +1897,10 @@ try {
             "synthetic lock: $dependencyLockRelativePath`n",
             [Text.UTF8Encoding]::new($false))
     }
+    [IO.File]::WriteAllText(
+        (Join-Path $provenanceFixtureRoot 'rust-toolchain.toml'),
+        "[toolchain]`nchannel = '1.98.0'`nprofile = 'minimal'`n",
+        [Text.UTF8Encoding]::new($false))
     foreach ($generatorRelativePath in @(
             $sourceReportSpec.source_report_contract.required_generator_paths)) {
         $generatorPath = Join-Path $provenanceFixtureRoot (
@@ -1433,6 +1918,7 @@ try {
         elseif ([string]$generatorRelativePath -cin @(
                 "scripts/windows/phase2/Source-Command-Registry.json",
                 "scripts/windows/phase2/Run-Source-Check.ps1",
+                "scripts/windows/phase2/Portable-Attestation.ps1",
                 "scripts/windows/phase2/Source-Fixture-Registry.json")) {
             Get-Content -LiteralPath (Join-Path $repoRoot `
                 ([string]$generatorRelativePath).Replace(
@@ -1464,6 +1950,10 @@ try {
         "scripts\windows\phase2\Source-Command-Registry.json"
     $expectedSourceCommandRegistrySha256 = [string](
         $sourceReportSpec.source_report_contract.source_command_registry_sha256)
+    if ($expectedSourceCommandRegistrySha256 -cne
+        '8263b2c63295dae6fbd05940639fc8b23bde77263833d4d5af5f249cd4d7865e') {
+        throw 'The static source-command registry digest is not promoted.'
+    }
     $syntheticCommandRegistryRead = Read-SteinPhase2SourceCommandRegistry `
         -Path $syntheticCommandRegistryPath `
         -ExpectedSha256 $expectedSourceCommandRegistrySha256
@@ -1507,6 +1997,10 @@ try {
     Assert-NativeCommandSucceeded -Operation "provenance fixture Git commit"
 
     $gitExecutableDigest = Get-SteinPackageFileSha256 -Path $gitCommand.Source
+    $productionGitHubCliLockVerified =
+        Test-SteinStaticProductionGitHubCliResolverLock `
+            -Resolver $script:SteinStaticProductionGitHubCliResolver `
+            -Root $provenanceFixtureRoot
     $gitFixtureState = Get-SteinCleanGitCandidateState `
         -RepositoryRoot $provenanceFixtureRoot `
         -GitExecutable $gitCommand.Source `
@@ -1769,7 +2263,29 @@ try {
             Size = $syntheticToolSize
             Sha256 = $gitExecutableDigest
         }
+        gh = [pscustomobject]@{
+            Name = 'gh.exe'
+            Size = $syntheticToolSize
+            Sha256 = $gitExecutableDigest
+        }
     }
+    $portableWorkflowGenerators = @($generatorFiles | Where-Object {
+            [string]$_.path -ceq '.github/workflows/portable-semantic.yml'
+        })
+    if ($portableWorkflowGenerators.Count -ne 1) {
+        throw 'The static portable workflow generator is unavailable.'
+    }
+    $portableSourceRef = 'refs/heads/phase-2-completion'
+    $syntheticPortableEvidence = New-SteinStaticPortableEvidence `
+        -EvidenceRoot $evidenceDirectory `
+        -CandidateCommit $gitFixtureState.Commit `
+        -CandidateTree $gitFixtureState.Tree `
+        -WorkflowSha256 ([string]$portableWorkflowGenerators[0].sha256) `
+        -CargoLockSha256 (Get-SteinPackageFileSha256 -Path (
+            Join-Path $provenanceFixtureRoot 'Cargo.lock')) `
+        -RustToolchainSha256 (Get-SteinPackageFileSha256 -Path (
+            Join-Path $provenanceFixtureRoot 'rust-toolchain.toml')) `
+        -SourceRef $portableSourceRef
     $syntheticSourceCommandSuite = New-SteinStaticSourceCommandEvidence `
         -EvidenceRoot $evidenceDirectory `
         -Registry $syntheticCommandRegistryRead.value `
@@ -1784,12 +2300,67 @@ try {
         -GitResolvedSha256 $gitExecutableDigest `
         -ToolDescriptors $syntheticSourceCommandTools `
         -FixtureByCheck $syntheticFixtureByCheck `
-        -FixtureSuite $syntheticFixtureSuite
+        -FixtureSuite $syntheticFixtureSuite `
+        -PortableAttestation $syntheticPortableEvidence.Attestation
+    $portableCommandDefinitions = @(
+        $syntheticCommandRegistryRead.value.checks | Where-Object {
+            [string]$_.id -ceq 'portable-runner-attestation'
+        })
+    if ($portableCommandDefinitions.Count -ne 1) {
+        throw 'The static portable command definition is unavailable.'
+    }
+    $script:SteinStaticPortableGitHubCli = [pscustomobject]@{
+        Path = [string]$gitCommand.Source
+        Sha256 = $gitExecutableDigest
+        SignerSubject =
+            'CN="GitHub, Inc.", O="GitHub, Inc.", L=San Francisco, S=California, C=US'
+        SignerThumbprint = '1' * 40
+    }
+    $script:SteinStaticPortableVerificationResults =
+        @($syntheticPortableEvidence.VerificationResults)
+    $script:SteinStaticPortableExpectedArguments = @(
+        Get-SteinPhase2SourceCommandExpectedArguments `
+            -RegistryCheck $portableCommandDefinitions[0] `
+            -EvidenceRootRelative `
+                ([string]$syntheticSourceCommandSuite.EvidenceRootRelative) `
+            -CandidateCommit ([string]$gitFixtureState.Commit) `
+            -PortableSourceRef $portableSourceRef)
+    $script:SteinStaticPortableExpectedWorkingDirectory = $provenanceFixtureRoot
+    Set-Item `
+        -Path 'Function:\Resolve-SteinPackageAuthenticatedGitHubCli' `
+        -Value ${function:Resolve-SteinStaticPortableGitHubCli}
+    Set-Item `
+        -Path 'Function:\Invoke-SteinPackagePortableAttestationVerification' `
+        -Value ${function:Invoke-SteinStaticPortableAttestationVerification}
+    $staticPortableCommandRecord =
+        $syntheticSourceCommandSuite.RecordsById['portable-runner-attestation']
+    $staticPortableReceipt = $staticPortableCommandRecord.Receipt
+    $staticPortableArguments = @(
+        $staticPortableReceipt.command.arguments | ForEach-Object { [string]$_ })
+    if (@($script:SteinStaticPortableExpectedArguments).Count -ne 26 -or
+        $staticPortableArguments.Count -ne 26 -or
+        @(Compare-Object `
+                -ReferenceObject $script:SteinStaticPortableExpectedArguments `
+                -DifferenceObject $staticPortableArguments `
+                -CaseSensitive `
+                -SyncWindow 0).Count -ne 0 -or
+        [string]$staticPortableArguments[6] -cne
+            'artifacts/evidence/phase-2/source-static/portable-runner-attestation/portable-fixture.json' -or
+        [string]$staticPortableArguments[8] -cne
+            'artifacts/evidence/phase-2/source-static/portable-runner-attestation/portable-fixture.attestation.json' -or
+        [string]$staticPortableArguments[12] -cne
+            "https://github.com/grandmastr/STEIN/.github/workflows/portable-semantic.yml@$portableSourceRef" -or
+        [string]$staticPortableArguments[14] -cne
+            [string]$gitFixtureState.Commit -or
+        [string]$staticPortableArguments[16] -cne
+            [string]$gitFixtureState.Commit -or
+        [string]$staticPortableArguments[18] -cne $portableSourceRef) {
+        throw 'The static portable command vector is not exact.'
+    }
     $frozenSourceCheckReasons = [ordered]@{
         "native-toolchain-provenance" = "Authenticated Rust/rustup/Git/VS/MSVC/Windows SDK/package-tool payload, runtime, sysroot, library, and linker provenance is not implemented."
         "no-leaks-producer-workflow" = "Candidate-owned installed artifact producer is not implemented."
         "pinned-clean-build-environment" = "Authenticated immutable candidate input and fresh dependency, build, and output isolation are not implemented for every source check."
-        "portable-runner-attestation" = "Authenticated GitHub artifact attestation tied to repository, workflow, commit, and artifact digest is not implemented."
         "windows-native-ignored-fixtures" = "Requires explicit native-fixture workflow support; interactive native fixtures remain unimplemented source evidence."
     }
     $checks = New-Object Collections.Generic.List[object]
@@ -1816,8 +2387,8 @@ try {
                         registry_sha256 = [string]$syntheticSourceCommandSuite.
                             RegistrySha256
                         runner_sha256 = [string]$syntheticSourceCommandSuite.RunnerSha256
-                        executed_check_count = 37
-                        execution_group_count = 25
+                        executed_check_count = 38
+                        execution_group_count = 26
                         source_command_receipt_index =
                             $syntheticSourceCommandSuite.Index
                         source_command_receipt_index_artifact =
@@ -1882,18 +2453,61 @@ try {
                 sha256 = [string]$syntheticFixtureSuite.IndexSha256
             }
         }
+        elseif ($checkId -ceq 'portable-runner-attestation') {
+            $row['portable_attestation'] =
+                $syntheticPortableEvidence.Attestation
+        }
         $checks.Add($row)
     }
     $report.checks = $checks.ToArray()
     $report.summary.pass = @($report.checks | Where-Object status -ceq "pass").Count
     $report.summary.not_run = @(
         $report.checks | Where-Object status -ceq "not_run").Count
+    $staticCommandRows = @($report.checks | Where-Object {
+            ($_ -is [Collections.IDictionary] -and
+                $_.Contains('source_command_receipt')) -or
+            ($_ -isnot [Collections.IDictionary] -and
+                $null -ne $_.PSObject.Properties['source_command_receipt'])
+        })
+    $staticExecutionGroups = @($staticCommandRows | ForEach-Object {
+            [string]$_.source_command_receipt.execution.execution_group_id
+        } | Sort-Object -Unique)
+    $staticLogPaths = @($staticCommandRows | ForEach-Object {
+            [string]$_.source_command_receipt.execution.stdout.path
+            [string]$_.source_command_receipt.execution.stderr.path
+        } | Sort-Object -Unique)
+    $staticRegistryCategoryCounts = @{}
+    foreach ($categoryGroup in @(
+            $syntheticCommandRegistryRead.value.checks |
+                Group-Object -Property category)) {
+        $staticRegistryCategoryCounts[[string]$categoryGroup.Name] =
+            [int]$categoryGroup.Count
+    }
     if (@($report.checks).Count -ne 44 -or
-        [long]$report.summary.pass -ne 39 -or
+        [long]$report.summary.pass -ne 40 -or
         [long]$report.summary.fail -ne 0 -or
-        [long]$report.summary.not_run -ne 5 -or
-        @($report.integrity.generator.files).Count -ne 20) {
-        throw "The static source-report fixture has invalid exact coverage."
+        [long]$report.summary.not_run -ne 4 -or
+        @($report.integrity.generator.files).Count -ne 23 -or
+        $staticCommandRows.Count -ne 38 -or
+        $staticExecutionGroups.Count -ne 26 -or
+        $staticLogPaths.Count -ne 52 -or
+        [int]$staticRegistryCategoryCounts['direct_execution'] -ne 25 -or
+        [int]$staticRegistryCategoryCounts['grouped_fixture_execution'] -ne 13 -or
+        [int]$staticRegistryCategoryCounts['derived'] -ne 2 -or
+        [int]$staticRegistryCategoryCounts['retained_obligation'] -ne 4) {
+        throw ("The static source-report fixture has invalid exact coverage: " +
+            "checks=$(@($report.checks).Count), " +
+            "pass=$([long]$report.summary.pass), " +
+            "fail=$([long]$report.summary.fail), " +
+            "not_run=$([long]$report.summary.not_run), " +
+            "generators=$(@($report.integrity.generator.files).Count), " +
+            "executions=$($staticCommandRows.Count), " +
+            "groups=$($staticExecutionGroups.Count), " +
+            "logs=$($staticLogPaths.Count), " +
+            "direct=$([int]$staticRegistryCategoryCounts['direct_execution']), " +
+            "grouped=$([int]$staticRegistryCategoryCounts['grouped_fixture_execution']), " +
+            "derived=$([int]$staticRegistryCategoryCounts['derived']), " +
+            "retained=$([int]$staticRegistryCategoryCounts['retained_obligation']).")
     }
     $preflightSourceCommandContract = Get-SteinPackageSourceCommandRegistryContract `
         -CandidateRoot $provenanceFixtureRoot `
@@ -1957,6 +2571,19 @@ try {
         ($anchor | ConvertTo-Json -Depth 8),
         [Text.UTF8Encoding]::new($false))
     $anchorDigest = Get-SteinPackageFileSha256 -Path $anchorPath
+    foreach ($overrideName in @(
+            'Resolve-SteinPackageAuthenticatedGitHubCli',
+            'Invoke-SteinPackagePortableAttestationVerification')) {
+        $overrideCommand = Get-Command `
+            -Name $overrideName `
+            -CommandType Function `
+            -ErrorAction Stop
+        if ([string]$overrideCommand.ScriptBlock.File -cne $PSCommandPath) {
+            throw ("The static portable verification override $overrideName " +
+                "was replaced: actual='$([string]$overrideCommand.ScriptBlock.File)', " +
+                "expected='$PSCommandPath'.")
+        }
+    }
     $verifiedSourceBinding = Get-SteinVerifiedSourceBuildBinding `
         -RepositoryRoot $provenanceFixtureRoot `
         -CandidateRoot ([string]$groundingSnapshot.Root) `
@@ -1994,6 +2621,7 @@ try {
         EvidenceSpecification = $sourceReportSpec
         CommandContract = $commandContract
         SourceGeneratorByPath = $syntheticGeneratorByPath
+        CandidateRoot = [string]$groundingSnapshot.Root
         RepositoryRoot = $provenanceFixtureRoot
         ReportDirectory = $evidenceDirectory
         ExpectedCandidateGitCommit = $gitFixtureState.Commit
@@ -2001,9 +2629,17 @@ try {
         CandidateCommandBinding = $groundingCommandBinding
         RequireCandidateGrounding = $true
     }
-    $null = Assert-SteinPackageSourceCommandEvidenceFiles `
+    $validatedSourceCommandEvidence =
+        Assert-SteinPackageSourceCommandEvidenceFiles `
         -SourceReport $sourceReportForValidation `
         @commandEvidenceArguments
+    if (-not [bool]$productionGitHubCliLockVerified -or
+        -not [bool]$validatedSourceCommandEvidence.Verified -or
+        $script:SteinStaticPortableVerificationCount -lt 1 -or
+        $null -eq $script:SteinStaticPortableLastGitHubCliStream -or
+        $script:SteinStaticPortableLastGitHubCliStream.CanRead) {
+        throw 'The signer did not retain and release its exact GitHub CLI lock.'
+    }
     $wrongCommandBindingArguments = @{}
     foreach ($argumentName in $commandEvidenceArguments.Keys) {
         $wrongCommandBindingArguments[$argumentName] =
@@ -2187,6 +2823,40 @@ try {
                     })[0]
                 $row.source_command_receipt.execution.stdout.size = 16777217L
             }
+        },
+        [pscustomobject]@{
+            Description = 'portable file-order mutation'
+            Apply = {
+                param($mutated)
+                $row = @($mutated.checks | Where-Object {
+                        [string]$_.id -ceq 'portable-runner-attestation'
+                    })[0]
+                $first = $row.portable_attestation.files[0]
+                $row.portable_attestation.files[0] =
+                    $row.portable_attestation.files[1]
+                $row.portable_attestation.files[1] = $first
+            }
+        },
+        [pscustomobject]@{
+            Description = 'portable subject-alias mutation'
+            Apply = {
+                param($mutated)
+                $row = @($mutated.checks | Where-Object {
+                        [string]$_.id -ceq 'portable-runner-attestation'
+                    })[0]
+                $row.portable_attestation.subject.sha256 = 'c' * 64
+            }
+        },
+        [pscustomobject]@{
+            Description = 'portable latest-verification mutation'
+            Apply = {
+                param($mutated)
+                $row = @($mutated.checks | Where-Object {
+                        [string]$_.id -ceq 'portable-runner-attestation'
+                    })[0]
+                $row.portable_attestation.latest_verified_at =
+                    '2026-08-24T00:00:01.0000001Z'
+            }
         })
     foreach ($mutationCase in $sourceCommandMutationCases) {
         $mutatedReport = Copy-SteinStaticJsonValue `
@@ -2212,6 +2882,21 @@ try {
             Description = 'log file tamper'
             Path = Join-Path $evidenceDirectory `
                 'source-command-logs\rust-format.stdout.txt'
+        },
+        [pscustomobject]@{
+            Description = 'portable subject file tamper'
+            Path = Join-Path $evidenceDirectory `
+                'portable-runner-attestation\portable-fixture.json'
+        },
+        [pscustomobject]@{
+            Description = 'portable bundle file tamper'
+            Path = Join-Path $evidenceDirectory `
+                'portable-runner-attestation\portable-fixture.attestation.json'
+        },
+        [pscustomobject]@{
+            Description = 'portable subcheck log tamper'
+            Path = Join-Path $evidenceDirectory `
+                'portable-runner-attestation\logs\rust_format.log'
         })
     foreach ($tamperCase in $sourceCommandFileTamperCases) {
         $originalBytes = [IO.File]::ReadAllBytes([string]$tamperCase.Path)
@@ -2241,6 +2926,87 @@ try {
     $null = Assert-SteinPackageSourceCommandEvidenceFiles `
         -SourceReport $sourceReportForValidation `
         @commandEvidenceArguments
+
+    foreach ($streamMutation in @('disposed', 'substituted')) {
+        $script:SteinStaticPortableStreamMutation = $streamMutation
+        $script:SteinStaticPortableReplacementStream = $null
+        $streamMutationRejected = $false
+        try {
+            $null = Assert-SteinPackageSourceCommandEvidenceFiles `
+                -SourceReport $sourceReportForValidation `
+                @commandEvidenceArguments
+        }
+        catch {
+            $streamMutationRejected = $true
+        }
+        finally {
+            $script:SteinStaticPortableStreamMutation = $null
+            if ($script:SteinStaticPortableReplacementStream -is
+                [IDisposable]) {
+                $script:SteinStaticPortableReplacementStream.Dispose()
+            }
+            $script:SteinStaticPortableReplacementStream = $null
+        }
+        if (-not $streamMutationRejected -or
+            $null -eq $script:SteinStaticPortableLastGitHubCliStream -or
+            $script:SteinStaticPortableLastGitHubCliStream.CanRead) {
+            throw "The signer accepted a $streamMutation GitHub CLI stream."
+        }
+    }
+
+    $extraPortablePath = Join-Path $syntheticPortableEvidence.Root `
+        'unregistered-extra.txt'
+    [IO.File]::WriteAllText(
+        $extraPortablePath,
+        'extra',
+        [Text.UTF8Encoding]::new($false))
+    try {
+        $extraPortableRejected = $false
+        try {
+            $null = Assert-SteinPackageSourceCommandEvidenceFiles `
+                -SourceReport $sourceReportForValidation `
+                @commandEvidenceArguments
+        }
+        catch {
+            $extraPortableRejected = $true
+        }
+        if (-not $extraPortableRejected) {
+            throw 'The signer accepted an extra portable-attestation file.'
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $extraPortablePath -PathType Leaf) {
+            [IO.File]::Delete($extraPortablePath)
+        }
+    }
+
+    $validPortableVerificationResults =
+        $script:SteinStaticPortableVerificationResults
+    try {
+        $wrongPortableVerificationResults = @(
+            Copy-SteinStaticJsonValue `
+                -Value $validPortableVerificationResults)
+        $wrongPortableVerificationResults[0].verificationResult.statement.
+            subject[0].digest.sha256 = 'd' * 64
+        $script:SteinStaticPortableVerificationResults =
+            $wrongPortableVerificationResults
+        $wrongPortableVerificationRejected = $false
+        try {
+            $null = Assert-SteinPackageSourceCommandEvidenceFiles `
+                -SourceReport $sourceReportForValidation `
+                @commandEvidenceArguments
+        }
+        catch {
+            $wrongPortableVerificationRejected = $true
+        }
+        if (-not $wrongPortableVerificationRejected) {
+            throw 'The signer accepted a mismatched portable verification result.'
+        }
+    }
+    finally {
+        $script:SteinStaticPortableVerificationResults =
+            $validPortableVerificationResults
+    }
 
     $extraFixturePath = Join-Path $syntheticFixtureDirectory `
         'unregistered-extra.json'
@@ -3061,6 +3827,10 @@ if ($null -eq $installedEvidenceStatic -or
     -not [bool]$installedEvidenceStatic.evidence_spec_swap_rejected -or
     -not [bool]$installedEvidenceStatic.closed_runner_order_enforced -or
     -not [bool]$installedEvidenceStatic.no_leaks_pair_mismatch_rejected -or
+    -not [bool]$installedEvidenceStatic.portable_attestation_contract_bound -or
+    -not [bool]$installedEvidenceStatic.portable_file_order_rejected -or
+    -not [bool]$installedEvidenceStatic.portable_extra_file_rejected -or
+    -not [bool]$installedEvidenceStatic.portable_alias_mismatch_rejected -or
     -not [bool]$installedEvidenceStatic.runtime_source_swap_rejected -or
     -not [bool]$installedEvidenceStatic.exact_gate_evidence_contract) {
     throw "The Phase 2 installed-evidence harness failed its static contract."
@@ -3089,7 +3859,7 @@ if ($null -eq $reviewerStatic -or
     [int]$reviewerStatic.exact_gate_count -ne 32 -or
     -not [bool]$reviewerStatic.frozen_baseline_incomplete -or
     -not [bool]$reviewerStatic.reviewer_runtime_source_swap_rejected -or
-    [int]$reviewerStatic.negative_case_count -lt 28 -or
+    [int]$reviewerStatic.negative_case_count -lt 39 -or
     [int]$reviewerStatic.installed_state_mutations -ne 0) {
     throw "The Phase 2 installed-evidence reviewer failed its static contract."
 }
@@ -3099,20 +3869,21 @@ if ($null -eq $sourceEvidenceStatic -or
     -not [bool]$sourceEvidenceStatic.verified -or
     [int]$sourceEvidenceStatic.report_schema_version -ne 2 -or
     [int]$sourceEvidenceStatic.provenance_schema_version -ne 2 -or
-    [int]$sourceEvidenceStatic.generator_file_count -ne 21 -or
+    [int]$sourceEvidenceStatic.generator_file_count -ne 23 -or
     [int]$sourceEvidenceStatic.source_report_check_count -ne 44 -or
-    [int]$sourceEvidenceStatic.source_report_required_pass_count -ne 39 -or
-    [int]$sourceEvidenceStatic.source_report_allowed_not_run_count -ne 5 -or
+    [int]$sourceEvidenceStatic.source_report_required_pass_count -ne 40 -or
+    [int]$sourceEvidenceStatic.source_report_allowed_not_run_count -ne 4 -or
     -not [bool]$sourceEvidenceStatic.source_report_contract_bound -or
     [string]$sourceEvidenceStatic.source_command_registry_sha256 -cne
-        "9a1bb265a11a3b7ca18d1e8b67a2b1c47f9cb090910a458ca3d41fb221b50cbc" -or
+        "8263b2c63295dae6fbd05940639fc8b23bde77263833d4d5af5f249cd4d7865e" -or
     [int]$sourceEvidenceStatic.source_command_registry_row_count -ne 44 -or
-    [int]$sourceEvidenceStatic.source_command_executed_receipt_count -ne 37 -or
-    [int]$sourceEvidenceStatic.source_command_execution_group_count -ne 25 -or
+    [int]$sourceEvidenceStatic.source_command_executed_receipt_count -ne 38 -or
+    [int]$sourceEvidenceStatic.source_command_execution_group_count -ne 26 -or
     -not [bool]$sourceEvidenceStatic.source_command_tamper_contracts_bound -or
     -not [bool]$sourceEvidenceStatic.source_command_runner_library_bound -or
     -not [bool]$sourceEvidenceStatic.source_command_test_parsed -or
     -not [bool]$sourceEvidenceStatic.portable_attestation_workflow_bound -or
+    -not [bool]$sourceEvidenceStatic.portable_attestation_contract_bound -or
     -not [bool]$sourceEvidenceStatic.gate_specific_source_mapping_bound -or
     -not [bool]$sourceEvidenceStatic.repository_state_content_free -or
     -not [bool]$sourceEvidenceStatic.generated_outputs_ignored -or

@@ -2271,6 +2271,24 @@ function ConvertTo-SteinPackageCanonicalSourceTimestamp {
     return $text
 }
 
+function ConvertFrom-SteinPackageCanonicalSourceTimestamp {
+    param([Parameter(Mandatory = $true)] $Value)
+
+    $text = ConvertTo-SteinPackageCanonicalSourceTimestamp -Value $Value
+    $parsed = [DateTimeOffset]::MinValue
+    $styles = [Globalization.DateTimeStyles]::AssumeUniversal -bor
+        [Globalization.DateTimeStyles]::AdjustToUniversal
+    if (-not [DateTimeOffset]::TryParseExact(
+            $text,
+            "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'",
+            [Globalization.CultureInfo]::InvariantCulture,
+            $styles,
+            [ref]$parsed)) {
+        throw "A source-verification timestamp is invalid."
+    }
+    return $parsed
+}
+
 function Get-SteinPackageSourceFixtureRegistryContract {
     param(
         [Parameter(Mandatory = $true)][string] $CandidateRoot,
@@ -2380,7 +2398,7 @@ function Get-SteinPackageSourceCommandRegistryContract {
         -MaximumBytes 1048576 `
         -RejectDuplicateKeys
     $expectedRegistrySha256 =
-        '9a1bb265a11a3b7ca18d1e8b67a2b1c47f9cb090910a458ca3d41fb221b50cbc'
+        '8263b2c63295dae6fbd05940639fc8b23bde77263833d4d5af5f249cd4d7865e'
     if ([string]$registryFile.Sha256 -cne $expectedRegistrySha256 -or
         [string]$EvidenceSpecification.source_report_contract.source_command_registry_sha256 `
             -cne $expectedRegistrySha256) {
@@ -2394,12 +2412,12 @@ function Get-SteinPackageSourceCommandRegistryContract {
         throw "The signer source-command registry is invalid."
     }
     $catalog = $validated.catalog
-    if (@($catalog.Direct).Count -ne 24 -or
+    if (@($catalog.Direct).Count -ne 25 -or
         @($catalog.Grouped).Count -ne 13 -or
         @($catalog.Derived).Count -ne 2 -or
-        @($catalog.Retained).Count -ne 5 -or
+        @($catalog.Retained).Count -ne 4 -or
         @($catalog.Ordered).Count -ne 44 -or
-        [long]$validated.execution_group_count -ne 25) {
+        [long]$validated.execution_group_count -ne 26) {
         throw "The signer source-command registry coverage is invalid."
     }
     $expectedPass = @(
@@ -2413,7 +2431,7 @@ function Get-SteinPackageSourceCommandRegistryContract {
     [Array]::Sort($expectedNotRun, [StringComparer]::Ordinal)
     [Array]::Sort($contractPass, [StringComparer]::Ordinal)
     [Array]::Sort($contractNotRun, [StringComparer]::Ordinal)
-    if ($contractPass.Count -ne 39 -or $contractNotRun.Count -ne 5 -or
+    if ($contractPass.Count -ne 40 -or $contractNotRun.Count -ne 4 -or
         @(Compare-Object -ReferenceObject $expectedPass `
                 -DifferenceObject $contractPass -CaseSensitive).Count -ne 0 -or
         @(Compare-Object -ReferenceObject $expectedNotRun `
@@ -2429,7 +2447,7 @@ function Get-SteinPackageSourceCommandRegistryContract {
                 [string]$_.category -cin @(
                     'direct_execution', 'grouped_fixture_execution')
             })
-        ExecutionGroupCount = 25
+        ExecutionGroupCount = 26
     }
 }
 
@@ -2515,6 +2533,9 @@ function Get-SteinPackageCanonicalSourceChecksDigest {
             path = [string]$check.source_command_receipt_artifact.path
             size = $check.source_command_receipt_artifact.size
             sha256 = [string]$check.source_command_receipt_artifact.sha256
+        }
+        if ([string]$check.id -ceq 'portable-runner-attestation') {
+            $canonicalCheck.portable_attestation = $check.portable_attestation
         }
         if ($fixtureSet.Contains([string]$check.id)) {
             $canonicalCheck.source_fixture_receipt = $check.source_fixture_receipt
@@ -2829,6 +2850,18 @@ function Assert-SteinPackageSourceReportCheckContract {
             [string]$CommandContract.RegistrySha256) {
         throw "The signer source-report contract has an invalid registry binding."
     }
+    try {
+        $reportStartedAt = ConvertFrom-SteinPackageCanonicalSourceTimestamp `
+            -Value $SourceReport.started_at
+        $reportCompletedAt = ConvertFrom-SteinPackageCanonicalSourceTimestamp `
+            -Value $SourceReport.completed_at
+    }
+    catch {
+        throw "The signer source-report interval is invalid."
+    }
+    if ($reportCompletedAt -lt $reportStartedAt) {
+        throw "The signer source-report interval is invalid."
+    }
     $requiredIds = @($Contract.required_pass_check_ids)
     $allowedNotRunIds = @($Contract.allowed_not_run_check_ids)
     if ($requiredIds.Count -le 0 -or
@@ -2919,10 +2952,10 @@ function Assert-SteinPackageSourceReportCheckContract {
                     -Value ([string]$check.runner_sha256)) -or
                 ($check.executed_check_count -isnot [int] -and
                     $check.executed_check_count -isnot [long]) -or
-                [long]$check.executed_check_count -ne 37 -or
+                [long]$check.executed_check_count -ne 38 -or
                 ($check.execution_group_count -isnot [int] -and
                     $check.execution_group_count -isnot [long]) -or
-                [long]$check.execution_group_count -ne 25 -or
+                [long]$check.execution_group_count -ne 26 -or
                 $null -ne $check.failure_summary) {
                 throw "The source-command provenance check is invalid."
             }
@@ -2936,7 +2969,6 @@ function Assert-SteinPackageSourceReportCheckContract {
                 "native-toolchain-provenance" = "Authenticated Rust/rustup/Git/VS/MSVC/Windows SDK/package-tool payload, runtime, sysroot, library, and linker provenance is not implemented."
                 "no-leaks-producer-workflow" = "Candidate-owned installed artifact producer is not implemented."
                 "pinned-clean-build-environment" = "Authenticated immutable candidate input and fresh dependency, build, and output isolation are not implemented for every source check."
-                "portable-runner-attestation" = "Authenticated GitHub artifact attestation tied to repository, workflow, commit, and artifact digest is not implemented."
                 "windows-native-ignored-fixtures" = "Requires explicit native-fixture workflow support; interactive native fixtures remain unimplemented source evidence."
             }
             $reason = [string]$check.reason
@@ -2958,6 +2990,9 @@ function Assert-SteinPackageSourceReportCheckContract {
                 "source_fixture_receipt", "source_fixture_receipt_artifact",
                 "source_fixture_suite_index")
         }
+        if ($id -ceq 'portable-runner-attestation') {
+            $expectedPassingProperties += 'portable_attestation'
+        }
         Assert-SteinPackageJsonShape -Value $check `
             -Description "A source-verification passing process check" `
             -ExpectedProperties $expectedPassingProperties
@@ -2974,10 +3009,20 @@ function Assert-SteinPackageSourceReportCheckContract {
             $null -eq $check.arguments) {
             throw "A source-verification passing process check is invalid."
         }
-        $null = ConvertTo-SteinPackageCanonicalSourceTimestamp `
-            -Value $check.started_at
-        $null = ConvertTo-SteinPackageCanonicalSourceTimestamp `
-            -Value $check.completed_at
+        try {
+            $checkStartedAt = ConvertFrom-SteinPackageCanonicalSourceTimestamp `
+                -Value $check.started_at
+            $checkCompletedAt = ConvertFrom-SteinPackageCanonicalSourceTimestamp `
+                -Value $check.completed_at
+        }
+        catch {
+            throw "A source-verification passing process interval is invalid."
+        }
+        if ($checkStartedAt -lt $reportStartedAt -or
+            $checkCompletedAt -gt $reportCompletedAt -or
+            $checkCompletedAt -lt $checkStartedAt) {
+            throw "A source-verification passing process escaped the report interval."
+        }
         $logPaths = [Collections.Generic.HashSet[string]]::new(
             [StringComparer]::OrdinalIgnoreCase)
         foreach ($logProperty in @("stdout", "stderr")) {
@@ -3044,12 +3089,722 @@ function Assert-SteinPackageSourceReportCheckContract {
     }
 }
 
+function Open-SteinPackagePortableEvidenceFileLock {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][long] $MaximumBytes
+    )
+
+    $resolved = Resolve-SteinPackageRegularFileWithAncestors -Path $Path
+    $item = Get-Item -LiteralPath $resolved -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        [long]$item.Length -lt 1 -or
+        [long]$item.Length -gt $MaximumBytes) {
+        throw "A portable-attestation evidence file is outside its closed contract."
+    }
+    $stream = [IO.FileStream]::new(
+        $item.FullName,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read)
+    try {
+        if ([long]$stream.Length -ne [long]$item.Length) {
+            throw "A portable-attestation evidence file changed before it was locked."
+        }
+        return [pscustomobject]@{
+            Path = $item.FullName
+            Size = [long]$stream.Length
+            Sha256 = Get-SteinPackageStreamSha256 -Stream $stream
+            Stream = $stream
+        }
+    }
+    catch {
+        $stream.Dispose()
+        throw
+    }
+}
+
+function Resolve-SteinPackageAuthenticatedGitHubCli {
+    param([Parameter(Mandatory = $true)][string] $ExpectedSha256)
+
+    if (-not (Test-SteinPackageSha256Value -Value $ExpectedSha256)) {
+        throw "The portable-attestation GitHub CLI binding is invalid."
+    }
+    $commands = @(Get-Command gh.exe -CommandType Application -All `
+            -ErrorAction Stop)
+    if ($commands.Count -lt 1 -or
+        [string]::IsNullOrWhiteSpace([string]$commands[0].Source)) {
+        throw "Authenticated gh.exe is required to verify portable signer evidence."
+    }
+    $path = Resolve-SteinPackageRegularFileWithAncestors `
+        -Path ([string]$commands[0].Source)
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    if ([string]$item.Name -cne 'gh.exe' -or
+        [long]$item.Length -lt 1 -or
+        [long]$item.Length -gt 268435456) {
+        throw "The portable-attestation GitHub CLI executable is invalid."
+    }
+    $stream = [IO.FileStream]::new(
+        $path,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read)
+    try {
+        if ([long]$stream.Length -ne [long]$item.Length) {
+            throw "The portable-attestation GitHub CLI changed before it was locked."
+        }
+        $signature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature `
+            -LiteralPath $path `
+            -ErrorAction Stop
+        $expectedSubject =
+            'CN="GitHub, Inc.", O="GitHub, Inc.", L=San Francisco, S=California, C=US'
+        if ($signature.Status -ne
+                [Management.Automation.SignatureStatus]::Valid -or
+            $null -eq $signature.SignerCertificate -or
+            [string]$signature.SignerCertificate.Subject -cne $expectedSubject) {
+            throw "The portable-attestation GitHub CLI is not Authenticode-valid under GitHub."
+        }
+        $codeSigningOid = '1.3.6.1.5.5.7.3.3'
+        $ekuValues = @($signature.SignerCertificate.EnhancedKeyUsageList |
+            ForEach-Object { [string]$_.ObjectId })
+        if ($codeSigningOid -cnotin $ekuValues) {
+            throw "The portable-attestation GitHub CLI signer is not valid for code signing."
+        }
+        $sha256 = Get-SteinPackageStreamSha256 -Stream $stream
+        if ($sha256 -cne $ExpectedSha256) {
+            throw "The portable-attestation GitHub CLI differs from the source receipt."
+        }
+        $binding = [pscustomobject]@{
+            Path = $path
+            Size = [long]$stream.Length
+            Sha256 = $sha256
+            SignerSubject = $expectedSubject
+            SignerThumbprint =
+                ([string]$signature.SignerCertificate.Thumbprint).ToLowerInvariant()
+            Stream = $stream
+        }
+        $null = Assert-SteinPackageAuthenticatedGitHubCliLock `
+            -GitHubCli $binding `
+            -ExpectedStream $stream
+        return $binding
+    }
+    catch {
+        $stream.Dispose()
+        throw
+    }
+}
+
+function Assert-SteinPackageAuthenticatedGitHubCliLock {
+    param(
+        [Parameter(Mandatory = $true)] $GitHubCli,
+        [Parameter(Mandatory = $true)][IO.FileStream] $ExpectedStream
+    )
+
+    Assert-SteinPackageJsonShape -Value $GitHubCli `
+        -ExpectedProperties @(
+            'Path', 'Size', 'Sha256', 'SignerSubject', 'SignerThumbprint',
+            'Stream') `
+        -Description 'The portable-attestation GitHub CLI lock'
+    if (-not [object]::ReferenceEquals($GitHubCli.Stream, $ExpectedStream) -or
+        -not $ExpectedStream.CanRead -or -not $ExpectedStream.CanSeek -or
+        -not [IO.Path]::IsPathRooted([string]$GitHubCli.Path) -or
+        ($GitHubCli.Size -isnot [int] -and $GitHubCli.Size -isnot [long]) -or
+        [long]$GitHubCli.Size -lt 1 -or
+        [long]$GitHubCli.Size -gt 268435456 -or
+        [long]$ExpectedStream.Length -ne [long]$GitHubCli.Size -or
+        -not (Test-SteinPackageSha256Value -Value ([string]$GitHubCli.Sha256)) -or
+        [string]$GitHubCli.SignerSubject -cne
+            'CN="GitHub, Inc.", O="GitHub, Inc.", L=San Francisco, S=California, C=US' -or
+        [string]$GitHubCli.SignerThumbprint -cnotmatch '^[0-9a-f]{40}$') {
+        throw "The portable-attestation GitHub CLI lock is invalid."
+    }
+    $lockedPath = Resolve-SteinPackageRegularFileWithAncestors `
+        -Path ([string]$GitHubCli.Path)
+    $streamPath = [IO.Path]::GetFullPath([string]$ExpectedStream.Name)
+    if (-not [string]::Equals(
+            $lockedPath,
+            $streamPath,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        (Get-SteinPackageStreamSha256 -Stream $ExpectedStream) -cne
+            [string]$GitHubCli.Sha256) {
+        throw "The portable-attestation GitHub CLI lock differs from its binding."
+    }
+    return $true
+}
+
+function Invoke-SteinPackagePortableAttestationVerification {
+    param(
+        [Parameter(Mandatory = $true)] $GitHubCli,
+        [Parameter(Mandatory = $true)][string[]] $Arguments,
+        [Parameter(Mandatory = $true)][string] $WorkingDirectory
+    )
+
+    if ($null -eq $GitHubCli -or
+        $null -eq $GitHubCli.PSObject.Properties['Stream'] -or
+        $GitHubCli.Stream -isnot [IO.FileStream]) {
+        throw "The portable-attestation GitHub CLI lock is unavailable."
+    }
+    $ghStream = [IO.FileStream]$GitHubCli.Stream
+    $null = Assert-SteinPackageAuthenticatedGitHubCliLock `
+        -GitHubCli $GitHubCli `
+        -ExpectedStream $ghStream
+    $workingPath = Resolve-SteinPackageRegularDirectoryWithAncestors `
+        -Path $WorkingDirectory
+    $quoteArgument = {
+        param([string] $Value)
+        if ($Value -notmatch '[\s"]') { return $Value }
+        $builder = [Text.StringBuilder]::new()
+        $null = $builder.Append('"')
+        $backslashes = 0
+        foreach ($character in $Value.ToCharArray()) {
+            if ($character -ceq '\') {
+                $backslashes++
+                continue
+            }
+            if ($character -ceq '"') {
+                $null = $builder.Append(('\' * (($backslashes * 2) + 1)))
+                $null = $builder.Append('"')
+                $backslashes = 0
+                continue
+            }
+            if ($backslashes -gt 0) {
+                $null = $builder.Append(('\' * $backslashes))
+                $backslashes = 0
+            }
+            $null = $builder.Append($character)
+        }
+        if ($backslashes -gt 0) {
+            $null = $builder.Append(('\' * ($backslashes * 2)))
+        }
+        $null = $builder.Append('"')
+        return $builder.ToString()
+    }
+
+    $savedTokens = @{}
+    foreach ($tokenName in @('GH_TOKEN', 'GITHUB_TOKEN')) {
+        $savedTokens[$tokenName] = [Environment]::GetEnvironmentVariable(
+            $tokenName,
+            [EnvironmentVariableTarget]::Process)
+    }
+    $process = $null
+    try {
+        foreach ($tokenName in @($savedTokens.Keys)) {
+            [Environment]::SetEnvironmentVariable(
+                [string]$tokenName,
+                $null,
+                [EnvironmentVariableTarget]::Process)
+        }
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = [string]$GitHubCli.Path
+        $startInfo.WorkingDirectory = $workingPath
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.StandardOutputEncoding = [Text.UTF8Encoding]::new($false, $true)
+        $startInfo.StandardErrorEncoding = [Text.UTF8Encoding]::new($false, $true)
+        $startInfo.Arguments = (@($Arguments | ForEach-Object {
+                    & $quoteArgument ([string]$_)
+                }) -join ' ')
+        $null = $startInfo.EnvironmentVariables.Remove('GH_TOKEN')
+        $null = $startInfo.EnvironmentVariables.Remove('GITHUB_TOKEN')
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) {
+            throw "The portable-attestation GitHub CLI could not start."
+        }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(300000)) {
+            try { $process.Kill() } catch { }
+            $process.WaitForExit()
+            throw "The portable-attestation GitHub CLI timed out."
+        }
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        if ([int]$process.ExitCode -ne 0 -or
+            ([string]$stdout).Length -lt 1 -or
+            ([string]$stdout).Length -gt 16777216 -or
+            ([string]$stderr).Length -gt 1048576) {
+            throw "Independent portable-attestation authentication failed."
+        }
+        $null = Assert-SteinPortableVerificationJsonDocument `
+            -Text ([string]$stdout)
+        Assert-SteinPackageJsonUniqueObjectKeys -Text ([string]$stdout)
+        try {
+            $converter = Get-Command ConvertFrom-Json -CommandType Cmdlet `
+                -ErrorAction Stop
+            if ($converter.Parameters.ContainsKey('DateKind')) {
+                $verificationResults = ([string]$stdout) |
+                    ConvertFrom-Json -DateKind String -ErrorAction Stop
+            }
+            elseif ($PSVersionTable.PSEdition -ceq 'Core') {
+                throw "PowerShell Core 7.5 or newer is required for stable attestation dates."
+            }
+            else {
+                $verificationResults = ([string]$stdout) |
+                    ConvertFrom-Json -ErrorAction Stop
+            }
+        }
+        catch {
+            throw "The independent portable-attestation result is not strict JSON."
+        }
+    }
+    finally {
+        if ($null -ne $process) { $process.Dispose() }
+        foreach ($tokenName in @($savedTokens.Keys)) {
+            [Environment]::SetEnvironmentVariable(
+                [string]$tokenName,
+                $savedTokens[$tokenName],
+                [EnvironmentVariableTarget]::Process)
+        }
+    }
+    $null = Assert-SteinPackageAuthenticatedGitHubCliLock `
+        -GitHubCli $GitHubCli `
+        -ExpectedStream $ghStream
+    return ,$verificationResults
+}
+
+function Open-SteinPackagePortableAttestationFileSet {
+    param(
+        [Parameter(Mandatory = $true)] $PortableContract,
+        [Parameter(Mandatory = $true)][string] $ReportDirectory
+    )
+
+    $reportPath = Resolve-SteinPackageRegularDirectoryWithAncestors `
+        -Path $ReportDirectory
+    $portableRoot = Resolve-SteinPackageRegularDirectoryWithAncestors `
+        -Path (Join-Path $reportPath 'portable-runner-attestation')
+    if (-not [string]::Equals(
+            (Split-Path -Parent $portableRoot),
+            $reportPath,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The signer portable-attestation directory escaped its report root."
+    }
+    $logRoot = Resolve-SteinPackageRegularDirectoryWithAncestors `
+        -Path (Join-Path $portableRoot 'logs')
+    if (-not [string]::Equals(
+            (Split-Path -Parent $logRoot),
+            $portableRoot,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The signer portable-attestation log directory escaped its root."
+    }
+
+    $fileContract = Get-SteinPhase2PortableAttestationFileContract
+    $fileKeys = @($fileContract.Keys)
+    if ($fileKeys.Count -ne 22 -or
+        @($PortableContract.Attestation.files).Count -ne 22) {
+        throw "The signer portable-attestation file contract is incomplete."
+    }
+    $locks = New-Object Collections.Generic.List[object]
+    $locksByPath = @{}
+    $expectedRootNames = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    $expectedLogNames = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    try {
+        foreach ($relativePath in $fileKeys) {
+            $descriptor = $PortableContract.FilesByPath[[string]$relativePath]
+            $stagedRelative = ([string]$relativePath).Substring(
+                'portable-runner-attestation/'.Length)
+            $segments = @($stagedRelative.Split('/'))
+            if ($segments.Count -eq 1) {
+                $null = $expectedRootNames.Add($segments[0])
+            }
+            elseif ($segments.Count -eq 2 -and $segments[0] -ceq 'logs') {
+                $null = $expectedLogNames.Add($segments[1])
+            }
+            else {
+                throw "A signer portable-attestation descriptor path is invalid."
+            }
+            $artifactPath = Resolve-SteinPackageRegularFileUnderRoot `
+                -Root $portableRoot `
+                -Path (Join-Path $portableRoot ($stagedRelative.Replace(
+                            '/', [IO.Path]::DirectorySeparatorChar)))
+            $lock = Open-SteinPackagePortableEvidenceFileLock `
+                -Path $artifactPath `
+                -MaximumBytes ([long]$fileContract[$relativePath])
+            $locks.Add($lock)
+            $locksByPath[[string]$relativePath] = $lock
+            if ([long]$lock.Size -ne [long]$descriptor.size -or
+                [string]$lock.Sha256 -cne [string]$descriptor.sha256) {
+                throw "A signer portable-attestation file differs from its descriptor."
+            }
+        }
+        if ($expectedRootNames.Count -ne 15 -or $expectedLogNames.Count -ne 7) {
+            throw "The signer portable-attestation file contract is incomplete."
+        }
+        $actualRootEntries = @(Get-ChildItem -LiteralPath $portableRoot -Force `
+                -ErrorAction Stop)
+        if ($actualRootEntries.Count -ne ($expectedRootNames.Count + 1)) {
+            throw "The signer portable-attestation directory is not closed."
+        }
+        foreach ($entry in $actualRootEntries) {
+            $isReparse = (($entry.Attributes -band
+                    [IO.FileAttributes]::ReparsePoint) -ne 0)
+            if ($isReparse -or
+                ($entry.PSIsContainer -and [string]$entry.Name -cne 'logs') -or
+                (-not $entry.PSIsContainer -and
+                    -not $expectedRootNames.Contains([string]$entry.Name))) {
+                throw "The signer portable-attestation directory is not closed."
+            }
+        }
+        $actualLogEntries = @(Get-ChildItem -LiteralPath $logRoot -Force `
+                -ErrorAction Stop)
+        if ($actualLogEntries.Count -ne $expectedLogNames.Count) {
+            throw "The signer portable-attestation log directory is not closed."
+        }
+        foreach ($entry in $actualLogEntries) {
+            if ($entry.PSIsContainer -or
+                (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+                -not $expectedLogNames.Contains([string]$entry.Name)) {
+                throw "The signer portable-attestation log directory is not closed."
+            }
+        }
+        return [pscustomobject]@{
+            Root = $portableRoot
+            LogRoot = $logRoot
+            FileKeys = $fileKeys
+            Locks = $locks.ToArray()
+            LocksByPath = $locksByPath
+        }
+    }
+    catch {
+        foreach ($lock in $locks.ToArray()) { $lock.Stream.Dispose() }
+        throw
+    }
+}
+
+function Assert-SteinPackagePortableFixtureFiles {
+    param(
+        [Parameter(Mandatory = $true)] $SourceReport,
+        [Parameter(Mandatory = $true)] $SourceGeneratorByPath,
+        [Parameter(Mandatory = $true)] $PortableContract,
+        [Parameter(Mandatory = $true)] $FileSet,
+        [Parameter(Mandatory = $true)][string] $CandidateRoot,
+        [Parameter(Mandatory = $true)][string] $ExpectedCandidateGitCommit,
+        [Parameter(Mandatory = $true)][string] $ExpectedCandidateGitTree
+    )
+
+    $candidatePath = Resolve-SteinPackageRegularDirectoryWithAncestors `
+        -Path $CandidateRoot
+
+    $attestation = $PortableContract.Attestation
+    $subjectPath = [string]$attestation.subject.path
+    $bundlePath = [string]$attestation.bundle.path
+    $fixtureRead = Read-SteinPackageLockedJson `
+        -Path ([string]$FileSet.LocksByPath[$subjectPath].Path) `
+        -MaximumBytes 1048576 `
+        -RejectDuplicateKeys `
+        -PreserveDateStrings
+    $bundleRead = Read-SteinPackageLockedJson `
+        -Path ([string]$FileSet.LocksByPath[$bundlePath].Path) `
+        -MaximumBytes 4194304 `
+        -RejectDuplicateKeys
+    if ([long]$fixtureRead.Size -ne [long]$attestation.subject.size -or
+        [string]$fixtureRead.Sha256 -cne [string]$attestation.subject.sha256 -or
+        [long]$bundleRead.Size -ne [long]$attestation.bundle.size -or
+        [string]$bundleRead.Sha256 -cne [string]$attestation.bundle.sha256) {
+        throw "The signer portable-attestation subject or bundle binding is invalid."
+    }
+    Assert-SteinPortableExactProperties -Value $bundleRead.Value `
+        -Expected @('mediaType', 'verificationMaterial', 'dsseEnvelope') `
+        -FailureCode 'portable_attestation_bundle_invalid'
+    if ([string]$bundleRead.Value.mediaType -cne
+            'application/vnd.dev.sigstore.bundle.v0.3+json') {
+        throw "The signer portable-attestation bundle media type is invalid."
+    }
+
+    $workflowPath = Resolve-SteinPackageRegularFileUnderRoot `
+        -Root $candidatePath `
+        -Path (Join-Path $candidatePath '.github\workflows\portable-semantic.yml')
+    $cargoLockPath = Resolve-SteinPackageRegularFileUnderRoot `
+        -Root $candidatePath `
+        -Path (Join-Path $candidatePath 'Cargo.lock')
+    $rustToolchainPath = Resolve-SteinPackageRegularFileUnderRoot `
+        -Root $candidatePath `
+        -Path (Join-Path $candidatePath 'rust-toolchain.toml')
+    $workflowSha256 = Get-SteinPackageFileSha256 -Path $workflowPath
+    $cargoLockSha256 = Get-SteinPackageFileSha256 -Path $cargoLockPath
+    $rustToolchainSha256 = Get-SteinPackageFileSha256 -Path $rustToolchainPath
+    $cargoLockRecords = @($SourceReport.provenance.dependency_locks |
+        Where-Object { [string]$_.path -ceq 'Cargo.lock' })
+    if ($cargoLockRecords.Count -ne 1 -or
+        [string]$cargoLockRecords[0].sha256 -cne $cargoLockSha256 -or
+        [string]$attestation.workflow_sha256 -cne $workflowSha256) {
+        throw "The signer portable-attestation candidate binding is invalid."
+    }
+    $validatedFixture = Assert-SteinPortableFixture `
+        -Fixture $fixtureRead.Value `
+        -ExpectedCommit $ExpectedCandidateGitCommit `
+        -ExpectedTree $ExpectedCandidateGitTree `
+        -ExpectedWorkflowSha256 $workflowSha256 `
+        -ExpectedCargoLockSha256 $cargoLockSha256 `
+        -ExpectedRustToolchainSha256 $rustToolchainSha256
+
+    foreach ($artifact in @($validatedFixture.Artifacts)) {
+        $manifestPath = "portable-runner-attestation/$([string]$artifact.Path)"
+        $descriptor = $PortableContract.FilesByPath[$manifestPath]
+        if ([long]$artifact.Size -ne [long]$descriptor.size -or
+            [string]$artifact.Sha256 -cne [string]$descriptor.sha256) {
+            throw "A signer portable-attestation subcheck differs from staged bytes."
+        }
+    }
+    $expectedText = [ordered]@{
+        'portable-runner-attestation/cargo.txt' =
+            "$([string]$fixtureRead.Value.toolchain.cargo_version)`n"
+        'portable-runner-attestation/clean-after.txt' = "true`n"
+        'portable-runner-attestation/clean-before.txt' = "true`n"
+        'portable-runner-attestation/portable_check.exit' = "0`n"
+        'portable-runner-attestation/portable_clippy.exit' = "0`n"
+        'portable-runner-attestation/portable_full_suite.exit' = "0`n"
+        'portable-runner-attestation/repository-commit.txt' =
+            "$ExpectedCandidateGitCommit`n"
+        'portable-runner-attestation/repository-tree.txt' =
+            "$ExpectedCandidateGitTree`n"
+        'portable-runner-attestation/rust_format.exit' = "0`n"
+        'portable-runner-attestation/rustc.txt' =
+            [string]$fixtureRead.Value.toolchain.rustc_verbose
+        'portable-runner-attestation/semantic_full_loop.exit' = "0`n"
+        'portable-runner-attestation/semantic_outbox_recovery.exit' = "0`n"
+        'portable-runner-attestation/semantic_restart_recovery.exit' = "0`n"
+    }
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    foreach ($entry in $expectedText.GetEnumerator()) {
+        $descriptor = $PortableContract.FilesByPath[[string]$entry.Key]
+        if ([long]$descriptor.size -ne
+                [long]$utf8.GetByteCount([string]$entry.Value) -or
+            [string]$descriptor.sha256 -cne
+                (Get-SteinPackageTextSha256 -Value ([string]$entry.Value))) {
+            throw "A signer portable-attestation companion file is invalid."
+        }
+    }
+    return [pscustomobject]@{
+        Attestation = $attestation
+        ValidatedFixture = $validatedFixture
+    }
+}
+
+function Assert-SteinPackagePortableAttestationEvidence {
+    param(
+        [Parameter(Mandatory = $true)] $SourceReport,
+        [Parameter(Mandatory = $true)] $CommandContract,
+        [Parameter(Mandatory = $true)] $SourceGeneratorByPath,
+        [Parameter(Mandatory = $true)] $PortableReceipt,
+        [Parameter(Mandatory = $true)][string] $CandidateRoot,
+        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
+        [Parameter(Mandatory = $true)][string] $ReportDirectory,
+        [Parameter(Mandatory = $true)][string] $EvidenceRootRelative,
+        [Parameter(Mandatory = $true)][string] $ExpectedCandidateGitCommit,
+        [Parameter(Mandatory = $true)][string] $ExpectedCandidateGitTree
+    )
+
+    $portableRows = @($SourceReport.checks | Where-Object {
+            [string]$_.id -ceq 'portable-runner-attestation'
+        })
+    if ($portableRows.Count -ne 1 -or
+        [string]$portableRows[0].status -cne 'pass') {
+        throw "The signer portable-attestation report row is invalid."
+    }
+    try {
+        $portableContract = Assert-SteinPhase2PortableAttestationRecord `
+            -Row $portableRows[0] `
+            -SourceGeneratorByPath $SourceGeneratorByPath
+    }
+    catch {
+        throw "The signer portable-attestation record is invalid."
+    }
+    $candidatePath = Resolve-SteinPackageRegularDirectoryWithAncestors `
+        -Path $CandidateRoot
+    $portableLibraryRelative =
+        'scripts/windows/phase2/Portable-Attestation.ps1'
+    if (-not $SourceGeneratorByPath.ContainsKey($portableLibraryRelative)) {
+        throw "The signer portable-attestation validator is not a generator."
+    }
+    $portableLibraryPath = Resolve-SteinPackageRegularFileUnderRoot `
+        -Root $candidatePath `
+        -Path (Join-Path $candidatePath ($portableLibraryRelative.Replace(
+                    '/', [IO.Path]::DirectorySeparatorChar)))
+    $portableLibraryItem = Get-Item -LiteralPath $portableLibraryPath `
+        -Force -ErrorAction Stop
+    $portableLibraryDescriptor =
+        $SourceGeneratorByPath[$portableLibraryRelative]
+    if ([long]$portableLibraryItem.Length -ne
+            [long]$portableLibraryDescriptor.size -or
+        (Get-SteinPackageFileSha256 -Path $portableLibraryPath) -cne
+            [string]$portableLibraryDescriptor.sha256) {
+        throw "The signer portable-attestation validator differs from candidate bytes."
+    }
+    . $portableLibraryPath
+    foreach ($functionName in @(
+            'Assert-SteinPortableExactProperties',
+            'Assert-SteinPortableVerificationJsonDocument',
+            'Assert-SteinPortableAttestationVerification',
+            'Assert-SteinPortableFixture')) {
+        if ($null -eq (Get-Command $functionName -CommandType Function `
+                    -ErrorAction SilentlyContinue)) {
+            throw "The signer portable-attestation validator is incomplete."
+        }
+    }
+    $fileSet = Open-SteinPackagePortableAttestationFileSet `
+        -PortableContract $portableContract `
+        -ReportDirectory $ReportDirectory
+    $gh = $null
+    $ghStream = $null
+    try {
+        $fixtureBinding = Assert-SteinPackagePortableFixtureFiles `
+            -SourceReport $SourceReport `
+            -SourceGeneratorByPath $SourceGeneratorByPath `
+            -PortableContract $portableContract `
+            -FileSet $fileSet `
+            -CandidateRoot $CandidateRoot `
+            -ExpectedCandidateGitCommit $ExpectedCandidateGitCommit `
+            -ExpectedCandidateGitTree $ExpectedCandidateGitTree
+        $attestation = $fixtureBinding.Attestation
+        $portableDefinitions = @($CommandContract.Checks | Where-Object {
+                [string]$_.id -ceq 'portable-runner-attestation'
+            })
+        if ($portableDefinitions.Count -ne 1) {
+            throw "The signer portable-attestation command is missing."
+        }
+        $expectedArguments = @(Get-SteinPhase2SourceCommandExpectedArguments `
+            -RegistryCheck $portableDefinitions[0] `
+            -EvidenceRootRelative $EvidenceRootRelative `
+            -CandidateCommit $ExpectedCandidateGitCommit `
+            -PortableSourceRef ([string]$attestation.source_ref))
+        $actualArguments = @($PortableReceipt.command.arguments |
+            ForEach-Object { [string]$_ })
+        if ([string]$PortableReceipt.command.executable_role -cne 'gh' -or
+            [string]$PortableReceipt.command.executable_name -cne 'gh.exe' -or
+            [string]$PortableReceipt.command.working_directory -cne '.' -or
+            $actualArguments.Count -ne $expectedArguments.Count -or
+            @(Compare-Object -ReferenceObject $expectedArguments `
+                    -DifferenceObject $actualArguments -CaseSensitive `
+                    -SyncWindow 0).Count -ne 0) {
+            throw "The signer portable-attestation argument vector is invalid."
+        }
+
+        $receiptArtifacts = @($PortableReceipt.artifacts)
+        $expectedReceiptArtifacts = @(
+            [pscustomobject]@{
+                Role = 'portable_fixture_subject'
+                Descriptor = $attestation.subject
+            },
+            [pscustomobject]@{
+                Role = 'portable_sigstore_bundle'
+                Descriptor = $attestation.bundle
+            })
+        if ($receiptArtifacts.Count -ne $expectedReceiptArtifacts.Count) {
+            throw "The signer portable-attestation receipt artifact set is invalid."
+        }
+        for ($artifactIndex = 0;
+            $artifactIndex -lt $expectedReceiptArtifacts.Count;
+            $artifactIndex++) {
+            $actual = $receiptArtifacts[$artifactIndex]
+            $expected = $expectedReceiptArtifacts[$artifactIndex]
+            Assert-SteinPackageJsonShape -Value $actual `
+                -Description 'A portable-attestation receipt artifact' `
+                -ExpectedProperties @('role', 'size', 'sha256')
+            if ([string]$actual.role -cne [string]$expected.Role -or
+                [long]$actual.size -ne [long]$expected.Descriptor.size -or
+                [string]$actual.sha256 -cne
+                    [string]$expected.Descriptor.sha256) {
+                throw "A signer portable-attestation receipt artifact is invalid."
+            }
+        }
+
+        # gh is a concrete signer prerequisite: its authenticated binary must
+        # be the same executable whose digest the source-command receipt bound.
+        $gh = Resolve-SteinPackageAuthenticatedGitHubCli `
+            -ExpectedSha256 ([string]$PortableReceipt.command.executable_sha256)
+        if ($null -eq $gh.PSObject.Properties['Stream'] -or
+            $gh.Stream -isnot [IO.FileStream]) {
+            throw "The portable-attestation GitHub CLI lock is unavailable."
+        }
+        $ghStream = [IO.FileStream]$gh.Stream
+        $null = Assert-SteinPackageAuthenticatedGitHubCliLock `
+            -GitHubCli $gh `
+            -ExpectedStream $ghStream
+        $verificationResults = @(
+            Invoke-SteinPackagePortableAttestationVerification `
+                -GitHubCli $gh `
+                -Arguments $expectedArguments `
+                -WorkingDirectory $RepositoryRoot)
+        try {
+            $verified = Assert-SteinPortableAttestationVerification `
+                -VerificationResults $verificationResults `
+                -ExpectedCommit $ExpectedCandidateGitCommit `
+                -ExpectedSourceRef ([string]$attestation.source_ref) `
+                -ExpectedSubjectSha256 ([string]$attestation.subject.sha256)
+        }
+        catch {
+            throw "Independent portable-attestation authentication is invalid."
+        }
+        $generatedAt = $fixtureBinding.ValidatedFixture.GeneratedAt
+        $generatedAtText = $generatedAt.UtcDateTime.ToString(
+            'o', [Globalization.CultureInfo]::InvariantCulture)
+        $earliestText =
+            $verified.EarliestVerifiedTimestamp.UtcDateTime.ToString(
+                'o', [Globalization.CultureInfo]::InvariantCulture)
+        $latestText = $verified.LatestVerifiedTimestamp.UtcDateTime.ToString(
+            'o', [Globalization.CultureInfo]::InvariantCulture)
+        if ([string]$verified.CandidateCommit -cne $ExpectedCandidateGitCommit -or
+            [string]$verified.SourceRef -cne [string]$attestation.source_ref -or
+            [string]$verified.SubjectSha256 -cne
+                [string]$attestation.subject.sha256 -or
+            [string]$verified.RunInvocationUri -cne
+                [string]$attestation.run_invocation_uri -or
+            $generatedAtText -cne [string]$attestation.generated_at -or
+            $earliestText -cne [string]$attestation.earliest_verified_at -or
+            $latestText -cne [string]$attestation.latest_verified_at -or
+            [long]$verified.VerifiedTimestampCount -ne
+                [long]$attestation.verified_timestamp_count -or
+            $generatedAt -gt $verified.EarliestVerifiedTimestamp -or
+            ($verified.LatestVerifiedTimestamp - $generatedAt).TotalMinutes -gt 30) {
+            throw "The independent portable-attestation result differs from the report."
+        }
+
+        foreach ($relativePath in @($fileSet.FileKeys)) {
+            $lock = $fileSet.LocksByPath[[string]$relativePath]
+            $descriptor = $portableContract.FilesByPath[[string]$relativePath]
+            if ([long]$lock.Stream.Length -ne [long]$descriptor.size -or
+                (Get-SteinPackageStreamSha256 -Stream $lock.Stream) -cne
+                    [string]$descriptor.sha256) {
+                throw "A signer portable-attestation file changed during verification."
+            }
+        }
+        # Retain and rehash the exact non-write/non-delete-sharing gh stream
+        # through the independent process and all semantic/report validation.
+        $null = Assert-SteinPackageAuthenticatedGitHubCliLock `
+            -GitHubCli $gh `
+            -ExpectedStream $ghStream
+        return [pscustomobject]@{
+            Verified = $true
+            SourceRef = [string]$verified.SourceRef
+            RunInvocationUri = [string]$verified.RunInvocationUri
+            GeneratedAt = $generatedAtText
+            EarliestVerifiedAt = $earliestText
+            LatestVerifiedAt = $latestText
+            VerifiedTimestampCount = [long]$verified.VerifiedTimestampCount
+            GhExecutableSha256 = [string]$gh.Sha256
+            GhSignerSubject = [string]$gh.SignerSubject
+            GhSignerThumbprint = [string]$gh.SignerThumbprint
+        }
+    }
+    finally {
+        if ($ghStream -is [IDisposable]) { $ghStream.Dispose() }
+        foreach ($lock in @($fileSet.Locks)) { $lock.Stream.Dispose() }
+    }
+}
+
 function Assert-SteinPackageSourceCommandEvidenceFiles {
     param(
         [Parameter(Mandatory = $true)] $SourceReport,
         [Parameter(Mandatory = $true)] $EvidenceSpecification,
         [Parameter(Mandatory = $true)] $CommandContract,
         [Parameter(Mandatory = $true)] $SourceGeneratorByPath,
+        [Parameter(Mandatory = $true)][string] $CandidateRoot,
         [Parameter(Mandatory = $true)][string] $RepositoryRoot,
         [Parameter(Mandatory = $true)][string] $ReportDirectory,
         [Parameter(Mandatory = $true)][string] $ExpectedCandidateGitCommit,
@@ -3181,9 +3936,10 @@ function Assert-SteinPackageSourceCommandEvidenceFiles {
     $expectedFixturePaths = [Collections.Generic.HashSet[string]]::new(
         [StringComparer]::Ordinal)
     $validatedFixtureArtifacts = @{}
+    $portableReceipt = $null
     $executedChecks = @($CommandContract.ExecutedChecks)
     $indexReceipts = @($indexFile.Value.receipts)
-    if ($executedChecks.Count -ne 37 -or $indexReceipts.Count -ne 37) {
+    if ($executedChecks.Count -ne 38 -or $indexReceipts.Count -ne 38) {
         throw "The signer source-command receipt coverage is incomplete."
     }
     for ($position = 0; $position -lt $executedChecks.Count; $position++) {
@@ -3218,6 +3974,12 @@ function Assert-SteinPackageSourceCommandEvidenceFiles {
         }
 
         $receipt = $receiptFile.Value
+        if ($id -ceq 'portable-runner-attestation') {
+            if ($null -ne $portableReceipt) {
+                throw "The signer portable-attestation receipt is duplicated."
+            }
+            $portableReceipt = $receipt
+        }
         Assert-SteinPackageJsonShape `
             -Value $receipt.bindings `
             -Description "A signer source-command receipt binding" `
@@ -3309,7 +4071,7 @@ function Assert-SteinPackageSourceCommandEvidenceFiles {
 
     $actualReceiptEntries = @(Get-ChildItem `
             -LiteralPath $receiptDirectory -Force -ErrorAction Stop)
-    if ($expectedReceiptNames.Count -ne 38 -or
+    if ($expectedReceiptNames.Count -ne 39 -or
         $actualReceiptEntries.Count -ne $expectedReceiptNames.Count) {
         throw "The signer source-command receipt directory is not closed."
     }
@@ -3322,7 +4084,7 @@ function Assert-SteinPackageSourceCommandEvidenceFiles {
     }
     $actualLogEntries = @(Get-ChildItem `
             -LiteralPath $logDirectory -Force -ErrorAction Stop)
-    if ($expectedLogNames.Count -ne 50 -or
+    if ($expectedLogNames.Count -ne 52 -or
         $actualLogEntries.Count -ne $expectedLogNames.Count) {
         throw "The signer source-command log directory is not closed."
     }
@@ -3350,7 +4112,20 @@ function Assert-SteinPackageSourceCommandEvidenceFiles {
             throw "The signer source-fixture directory is not closed."
         }
     }
-    return $true
+    if ($null -eq $portableReceipt) {
+        throw "The signer portable-attestation receipt is missing."
+    }
+    return Assert-SteinPackagePortableAttestationEvidence `
+        -SourceReport $SourceReport `
+        -CommandContract $CommandContract `
+        -SourceGeneratorByPath $SourceGeneratorByPath `
+        -PortableReceipt $portableReceipt `
+        -CandidateRoot $CandidateRoot `
+        -RepositoryRoot $repositoryPath `
+        -ReportDirectory $reportPath `
+        -EvidenceRootRelative $evidenceRootRelative `
+        -ExpectedCandidateGitCommit $ExpectedCandidateGitCommit `
+        -ExpectedCandidateGitTree $ExpectedCandidateGitTree
 }
 
 function Get-SteinVerifiedSourceBuildBinding {
@@ -3522,6 +4297,8 @@ function Get-SteinVerifiedSourceBuildBinding {
         'scripts/windows/phase2/Source-Command-Registry.json',
         'scripts/windows/phase2/Run-Source-Check.ps1',
         'scripts/windows/phase2/Test-SourceCommand.ps1',
+        'scripts/windows/phase2/Portable-Attestation.ps1',
+        'scripts/windows/phase2/Test-PortableAttestation.ps1',
         'scripts/windows/phase2/Source-Fixture-Registry.json',
         'scripts/windows/phase2/Run-Source-Fixture.ps1',
         'scripts/windows/phase2/Test-SourceFixture.ps1',
@@ -3535,6 +4312,7 @@ function Get-SteinVerifiedSourceBuildBinding {
         'scripts/windows/phase2/Scan-NoLeaks.ps1',
         'scripts/windows/phase2/Scan-NoLeaks.cmd',
         'scripts/windows/phase2/Test-ScanNoLeaks.ps1',
+        '.github/workflows/portable-semantic.yml',
         'packaging/windows-msix/PackageTools.ps1')
     if ($requiredGeneratorPaths.Count -ne $expectedGeneratorPaths.Count -or
         @(Compare-Object `
@@ -3707,11 +4485,12 @@ function Get-SteinVerifiedSourceBuildBinding {
         -ReportDirectory (Split-Path -Parent $reportPath) `
         -ExpectedCandidateGitCommit $ExpectedCandidateGitCommit `
         -ExpectedCandidateGitTree $ExpectedCandidateGitTree
-    $null = Assert-SteinPackageSourceCommandEvidenceFiles `
+    $portableVerification = Assert-SteinPackageSourceCommandEvidenceFiles `
         -SourceReport $report `
         -EvidenceSpecification $evidenceSpec `
         -CommandContract $commandContract `
         -SourceGeneratorByPath $generatorByPath `
+        -CandidateRoot $candidatePath `
         -RepositoryRoot $repositoryPath `
         -ReportDirectory (Split-Path -Parent $reportPath) `
         -ExpectedCandidateGitCommit $ExpectedCandidateGitCommit `
@@ -3738,8 +4517,8 @@ function Get-SteinVerifiedSourceBuildBinding {
         })
     if ($checks.Count -ne 44 -or
         $failCount -ne 0 -or
-        $passCount -ne 39 -or
-        $notRunCount -ne 5 -or
+        $passCount -ne 40 -or
+        $notRunCount -ne 4 -or
         $passCount -ne [int]$report.summary.pass -or
         $failCount -ne [int]$report.summary.fail -or
         $notRunCount -ne [int]$report.summary.not_run -or
@@ -3875,6 +4654,20 @@ function Get-SteinVerifiedSourceBuildBinding {
         SourceVerificationSha256 = $reportFile.Sha256
         SourceRootAnchorSha256 = $anchorFile.Sha256
         SourceRootDigestSha256 = [string]$anchor.root_digest_sha256
+        PortableAttestationVerified = [bool]$portableVerification.Verified
+        PortableSourceRef = [string]$portableVerification.SourceRef
+        PortableRunInvocationUri =
+            [string]$portableVerification.RunInvocationUri
+        PortableGeneratedAt = [string]$portableVerification.GeneratedAt
+        PortableEarliestVerifiedAt =
+            [string]$portableVerification.EarliestVerifiedAt
+        PortableLatestVerifiedAt =
+            [string]$portableVerification.LatestVerifiedAt
+        PortableVerifiedTimestampCount =
+            [long]$portableVerification.VerifiedTimestampCount
+        GhExecutableSha256 = [string]$portableVerification.GhExecutableSha256
+        GhSignerSubject = [string]$portableVerification.GhSignerSubject
+        GhSignerThumbprint = [string]$portableVerification.GhSignerThumbprint
         GitVersion = [string]$toolchain.git.version
         GitExecutableSha256 = [string]$toolchain.git.executable_sha256
         GitResolvedExecutableSha256 = [string]$toolchain.git.resolved_executable_sha256

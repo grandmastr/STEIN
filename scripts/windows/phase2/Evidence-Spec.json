@@ -10,7 +10,7 @@
   ],
   "source_report_contract": {
     "source_fixture_registry_sha256": "d2414e552dfbc00b3ecf5837cfc431c64f670508ae4e8696b9fce4f85a75c5c5",
-    "source_command_registry_sha256": "9a1bb265a11a3b7ca18d1e8b67a2b1c47f9cb090910a458ca3d41fb221b50cbc",
+    "source_command_registry_sha256": "8263b2c63295dae6fbd05940639fc8b23bde77263833d4d5af5f249cd4d7865e",
     "required_pass_check_ids": [
       "boundary-contract",
       "desktop-build",
@@ -27,6 +27,7 @@
       "installed-reviewer-windows-powershell-contract",
       "msix-static-contract",
       "no-leaks-scanner-static",
+      "portable-runner-attestation",
       "phase2-source-fixture-goals",
       "phase2-source-fixture-identity",
       "phase2-source-fixture-intervention",
@@ -56,7 +57,6 @@
       "native-toolchain-provenance",
       "no-leaks-producer-workflow",
       "pinned-clean-build-environment",
-      "portable-runner-attestation",
       "windows-native-ignored-fixtures"
     ],
     "required_generator_paths": [
@@ -66,6 +66,8 @@
       "scripts/windows/phase2/Source-Command-Registry.json",
       "scripts/windows/phase2/Run-Source-Check.ps1",
       "scripts/windows/phase2/Test-SourceCommand.ps1",
+      "scripts/windows/phase2/Portable-Attestation.ps1",
+      "scripts/windows/phase2/Test-PortableAttestation.ps1",
       "scripts/windows/phase2/Source-Fixture-Registry.json",
       "scripts/windows/phase2/Run-Source-Fixture.ps1",
       "scripts/windows/phase2/Test-SourceFixture.ps1",

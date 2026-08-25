@@ -225,14 +225,14 @@ dependency closure and immutable isolated execution obligations remain exact
 `not_run` rows, so the fixture passes still cannot by themselves promote a
 source-backed gate. Native-only rows remain independently reviewable.
 
-The source-report contract fixes 44 exact checks—39 required `pass` rows and five
-exact frozen `not_run` rows—and twenty-one generator files. The frozen
+The source-report contract fixes 44 exact checks—40 required `pass` rows and four
+exact frozen `not_run` rows—and twenty-three generator files. The frozen
 source-command registry (`SHA-256
-9a1bb265a11a3b7ca18d1e8b67a2b1c47f9cb090910a458ca3d41fb221b50cbc`)
-defines every row category and, for the 37 executed rows, the executable role,
+8263b2c63295dae6fbd05940639fc8b23bde77263833d4d5af5f249cd4d7865e`)
+defines every row category and, for the 38 executed rows, the executable role,
 ordered argument vector, working directory, environment profile, timeout, and
-execution group. Its 24 direct executions plus one shared fixture-suite launch
-produce 37 per-check receipts across 25 groups and 50 unique bounded logs. The
+execution group. Its 25 direct executions plus one shared fixture-suite launch
+produce 38 per-check receipts across 26 groups and 52 unique bounded logs. The
 receipt candidate manifest is the canonical Git tree record set
 (`UTF-8 path length:path|mode|blob object ID`). The runner holds every tracked
 worktree file open and accepts its raw stream only when it is the exact blob or
@@ -257,27 +257,33 @@ The closed private-diagnostic and toast-COM denial receipts have fixed CLI
 fixture/runner IDs and exact ordered subchecks. The portable Linux receipt has
 fixed workflow/fixture/runner IDs, candidate commit/tree and toolchain/workflow
 hashes, seven exact ordered checks, and separately extracted log files whose
-sizes and hashes are recomputed. Its `runner_id` is still a content claim, not
-authenticated GitHub execution provenance. `P2-NO-LEAKS` additionally requires
+sizes and hashes are recomputed. Its `runner_id` remains only a content claim;
+the separate passing `portable-runner-attestation` row supplies authenticated
+GitHub execution provenance for the exact subject. `P2-NO-LEAKS` additionally requires
 the fixed sentinel-producer receipt, producer source and manifest hashes, and
 the exact `no-leaks-producer-workflow` source check; producer and scanner must
 bind the same package, commit, source report, artifact-catalog digest, and count.
 Until that real candidate-owned producer/check exists, the gate remains
 `not_run`; a synthetic scanner self-test or clean filler cannot promote it.
-`P2-PORTABLE-FIXTURE` also requires `portable-runner-attestation=pass`. That
-check remains `not_run` until an authenticated GitHub artifact attestation (or
-equivalent Sigstore bundle) binds the repository, workflow, candidate commit,
-and exact portable-artifact digest; self-declared runner JSON cannot promote it.
+`P2-PORTABLE-FIXTURE` also requires `portable-runner-attestation=pass`. The
+source verifier now earns that pass only by replaying `gh attestation verify`
+against a retained offline Sigstore bundle with the exact repository, workflow
+identity and digest, branch ref, candidate commit, GitHub OIDC issuer,
+GitHub-hosted runner, SLSA predicate type, and fixture subject SHA-256. The
+report retains an exact ordered manifest of the combined artifact's 22 files;
+self-declared runner JSON cannot promote the gate.
 The pull-request workflow deliberately remains read-only. Only a manually
 dispatched exact candidate ref enters the separate write-scoped attestation job,
 which revalidates the successful portable artifact before signing the canonical
 `portable-fixture.json` subject and retaining its offline bundle. Bundle
-generation alone is still insufficient: source verification must independently
-verify and bind that bundle before the retained source check may change to
-`pass`. Export the combined artifact into the candidate evidence root before
-its 30-day retention expires. This authenticates the GitHub-hosted run, not a
-hermetic environment: mutable `ubuntu-latest` and Rust `stable` inputs remain
-separate retained obligations.
+generation alone is still insufficient: source verification independently
+verifies and binds that external bundle after the candidate commit exists. The
+dependency graph is candidate commit to workflow fixture to external bundle to
+source report to signed package; the candidate-specific bundle is deliberately
+not committed. Export the combined artifact into the candidate evidence root
+before its 30-day retention expires. This authenticates the GitHub-hosted run,
+not a hermetic environment: mutable `ubuntu-latest` and Rust `stable` inputs
+remain separate retained obligations.
 
 A screenshot never changes a result. Native `fail` or `blocked` results are
 reflected conservatively; a structurally valid native `pass` remains `not_run`
@@ -402,8 +408,19 @@ and private-client gates remain `NOT RUN` or `BLOCKED`, never `PASS`.
 Run the non-installing source/build suite from native Windows with:
 
 ```text
-scripts\windows\phase2\Verify-Source.cmd
+scripts\windows\phase2\Verify-Source.cmd ^
+  -PortableAttestationRoot artifacts\evidence\phase-2\portable-attested-<commit> ^
+  -PortableSourceRef refs/heads/<candidate-branch>
 ```
+
+The portable root must be the exported, unmodified 22-file combined artifact
+for the exact candidate commit. `gh.exe` is mandatory and must carry a valid
+GitHub, Inc. Authenticode signature; verification is offline against the
+retained bundle, with inherited GitHub tokens cleared for the child process.
+The verifier locks the exact executable bytes before publisher validation and
+holds that non-write/non-delete-sharing handle through process completion. The
+publisher check inherits the host's Windows Authenticode trust-store semantics;
+it is not a separate root or SPKI pin.
 
 It records format, all-target/all-feature Rust check/Clippy/tests, renderer
 typecheck/lint/tests/build, Edge-extension policy tests, isolated native-host
@@ -428,7 +445,7 @@ non-reparse file with a valid Authenticode signature whose exact signer Subject
 is Microsoft Corporation; an unsigned earlier PATH entry is rejected. Its
 validated signer Subject, signature status, version, and executable hash are
 retained in the bounded provenance. The verifier samples provenance before and
-after the suite and fails the run if it changes. Its twenty-file generator also
+after the suite and fails the run if it changes. Its twenty-three-file generator also
 binds the frozen source-command registry, runner, and contract test, plus the
 source-fixture registry, runner, and contract test, along with the source
 verifier, installed reviewer, fail-closed evidence

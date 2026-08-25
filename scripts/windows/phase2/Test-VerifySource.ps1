@@ -17,6 +17,10 @@ $evidenceContractPath = Join-Path $PSScriptRoot "Evidence-Contract.ps1"
 $sourceCommandRegistryPath = Join-Path $PSScriptRoot "Source-Command-Registry.json"
 $sourceCommandRunnerPath = Join-Path $PSScriptRoot "Run-Source-Check.ps1"
 $sourceCommandTestPath = Join-Path $PSScriptRoot "Test-SourceCommand.ps1"
+$portableAttestationContractPath =
+    Join-Path $PSScriptRoot "Portable-Attestation.ps1"
+$portableAttestationTestPath =
+    Join-Path $PSScriptRoot "Test-PortableAttestation.ps1"
 $sourceFixtureRegistryPath = Join-Path $PSScriptRoot "Source-Fixture-Registry.json"
 $sourceFixtureRunnerPath = Join-Path $PSScriptRoot "Run-Source-Fixture.ps1"
 $sourceFixtureTestPath = Join-Path $PSScriptRoot "Test-SourceFixture.ps1"
@@ -38,6 +42,8 @@ foreach ($path in @(
         $sourceCommandRegistryPath,
         $sourceCommandRunnerPath,
         $sourceCommandTestPath,
+        $portableAttestationContractPath,
+        $portableAttestationTestPath,
         $sourceFixtureRegistryPath,
         $sourceFixtureRunnerPath,
         $sourceFixtureTestPath,
@@ -51,6 +57,7 @@ foreach ($path in @(
     }
 }
 . $helperPath
+. $portableAttestationContractPath
 
 function Copy-SteinVerifySourceTestValue {
     param([Parameter(Mandatory = $true)] $Value)
@@ -108,6 +115,196 @@ function Get-SteinVerifySourceTestOrdinalOccurrenceCount {
     return [int]$count
 }
 
+function New-SteinVerifySourcePortableEvidenceFixture {
+    param(
+        [Parameter(Mandatory = $true)][string] $Root,
+        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
+        [Parameter(Mandatory = $true)][string] $SourceCommandLogRoot,
+        [Parameter(Mandatory = $true)][string] $CandidateCommit,
+        [Parameter(Mandatory = $true)][string] $CandidateTree,
+        [Parameter(Mandatory = $true)][string] $PortableSourceRef
+    )
+
+    $portableRoot = Join-Path $Root 'portable-runner-attestation'
+    $portableLogRoot = Join-Path $portableRoot 'logs'
+    $null = New-Item -ItemType Directory -Path $portableLogRoot `
+        -Force -ErrorAction Stop
+    $encoding = [Text.UTF8Encoding]::new($false)
+    $subchecks = New-Object Collections.Generic.List[object]
+    foreach ($entry in $script:SteinPortableCommands.GetEnumerator()) {
+        $id = [string]$entry.Key
+        $relative = "logs/$id.log"
+        $logPath = Join-Path $portableRoot $relative.Replace(
+            '/', [IO.Path]::DirectorySeparatorChar)
+        [IO.File]::WriteAllText(
+            $logPath,
+            "synthetic portable evidence for $id`n",
+            $encoding)
+        [IO.File]::WriteAllText(
+            (Join-Path $portableRoot "$id.exit"),
+            "0`n",
+            $encoding)
+        $item = Get-Item -LiteralPath $logPath -Force -ErrorAction Stop
+        $subchecks.Add([ordered]@{
+                artifact = [ordered]@{
+                    path = $relative
+                    sha256 = Get-SteinSourceEvidenceSha256 -Path $logPath
+                    size_bytes = [long]$item.Length
+                }
+                command = [string]$entry.Value
+                exit_code = 0
+                id = $id
+                result = 'pass'
+            })
+    }
+
+    $cargoVersion = 'cargo 1.98.0 (797e8a9bc 2026-08-05)'
+    $rustcVerbose = "rustc 1.98.0 (88d9e12ae 2026-08-18)`n" +
+        "binary: rustc`n" +
+        "commit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea`n" +
+        "commit-date: 2026-08-18`n" +
+        "host: x86_64-unknown-linux-gnu`n" +
+        "release: 1.98.0`n" +
+        "LLVM version: 22.1.8`n"
+    $companions = [ordered]@{
+        'cargo.txt' = "$cargoVersion`n"
+        'clean-after.txt' = "true`n"
+        'clean-before.txt' = "true`n"
+        'repository-commit.txt' = "$CandidateCommit`n"
+        'repository-tree.txt' = "$CandidateTree`n"
+        'rustc.txt' = $rustcVerbose
+    }
+    foreach ($entry in $companions.GetEnumerator()) {
+        [IO.File]::WriteAllText(
+            (Join-Path $portableRoot ([string]$entry.Key)),
+            [string]$entry.Value,
+            $encoding)
+    }
+
+    $fixture = [ordered]@{
+        fixture_id = 'phase2-portable-semantic-v1'
+        gate_id = 'P2-PORTABLE-FIXTURE'
+        generated_at = '2026-08-25T01:23:18.452251Z'
+        generator = [ordered]@{
+            workflow_path = '.github/workflows/portable-semantic.yml'
+            workflow_sha256 = Get-SteinSourceEvidenceSha256 -Path (
+                Join-Path $RepositoryRoot '.github\workflows\portable-semantic.yml')
+        }
+        repository = [ordered]@{
+            clean_after = $true
+            clean_before = $true
+            commit = $CandidateCommit
+            tree = $CandidateTree
+        }
+        result = 'pass'
+        runner_id = 'github-actions-ubuntu-portable-v1'
+        schema_version = 1
+        subchecks = $subchecks.ToArray()
+        toolchain = [ordered]@{
+            cargo_lock_sha256 = Get-SteinSourceEvidenceSha256 -Path (
+                Join-Path $RepositoryRoot 'Cargo.lock')
+            cargo_version = $cargoVersion
+            rust_toolchain_sha256 = Get-SteinSourceEvidenceSha256 -Path (
+                Join-Path $RepositoryRoot 'rust-toolchain.toml')
+            rustc_verbose = $rustcVerbose
+        }
+    }
+    $fixturePath = Join-Path $portableRoot 'portable-fixture.json'
+    Write-SteinVerifySourceTestJson -Path $fixturePath -Value $fixture
+    $subjectSha256 = Get-SteinSourceEvidenceSha256 -Path $fixturePath
+
+    $bundle = [ordered]@{
+        mediaType = 'application/vnd.dev.sigstore.bundle.v0.3+json'
+        verificationMaterial = [ordered]@{ content = 'synthetic' }
+        dsseEnvelope = [ordered]@{
+            payloadType = 'application/vnd.in-toto+json'
+            signatures = @([ordered]@{ sig = 'synthetic' })
+        }
+    }
+    $bundlePath = Join-Path $portableRoot `
+        'portable-fixture.attestation.json'
+    Write-SteinVerifySourceTestJson -Path $bundlePath -Value $bundle
+
+    $workflowIdentity =
+        "https://github.com/grandmastr/STEIN/.github/workflows/portable-semantic.yml@$PortableSourceRef"
+    $certificate = [ordered]@{
+        certificateIssuer = 'CN=sigstore-intermediate,O=sigstore.dev'
+        subjectAlternativeName = $workflowIdentity
+        issuer = 'https://token.actions.githubusercontent.com'
+        githubWorkflowTrigger = 'workflow_dispatch'
+        githubWorkflowSHA = $CandidateCommit
+        githubWorkflowName = 'portable-semantic-fixture'
+        githubWorkflowRepository = 'grandmastr/STEIN'
+        githubWorkflowRef = $PortableSourceRef
+        buildSignerURI = $workflowIdentity
+        buildSignerDigest = $CandidateCommit
+        runnerEnvironment = 'github-hosted'
+        sourceRepositoryURI = 'https://github.com/grandmastr/STEIN'
+        sourceRepositoryDigest = $CandidateCommit
+        sourceRepositoryRef = $PortableSourceRef
+        sourceRepositoryIdentifier = '1335864815'
+        sourceRepositoryOwnerURI = 'https://github.com/grandmastr'
+        sourceRepositoryOwnerIdentifier = '24866656'
+        buildConfigURI = $workflowIdentity
+        buildConfigDigest = $CandidateCommit
+        buildTrigger = 'workflow_dispatch'
+        runInvocationURI =
+            'https://github.com/grandmastr/STEIN/actions/runs/32797206475/attempts/1'
+        sourceRepositoryVisibilityAtSigning = 'public'
+    }
+    $verificationEntry = [ordered]@{
+        attestation = [ordered]@{
+            bundle = $bundle
+            bundle_url = ''
+            initiator = ''
+        }
+        verificationResult = [ordered]@{
+            mediaType =
+                'application/vnd.dev.sigstore.verificationresult+json;version=0.1'
+            signature = [ordered]@{ certificate = $certificate }
+            verifiedTimestamps = @([ordered]@{
+                    type = 'Tlog'
+                    uri = 'https://rekor.sigstore.dev'
+                    timestamp = '2026-08-25T01:24:00Z'
+                })
+            verifiedIdentity = [ordered]@{
+                subjectAlternativeName = [ordered]@{
+                    subjectAlternativeName = $workflowIdentity
+                }
+                issuer = [ordered]@{ issuer = ''; regexp = '.*' }
+                runnerEnvironment = 'github-hosted'
+            }
+            statement = [ordered]@{
+                _type = 'https://in-toto.io/Statement/v1'
+                subject = @([ordered]@{
+                        name = 'portable-fixture.json'
+                        digest = [ordered]@{ sha256 = $subjectSha256 }
+                    })
+                predicateType = 'https://slsa.dev/provenance/v1'
+                predicate = [ordered]@{ ignored = 'workflow-controlled' }
+            }
+        }
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $SourceCommandLogRoot `
+            'portable-runner-attestation.stdout.txt'),
+        (ConvertTo-Json -InputObject @($verificationEntry) -Depth 30),
+        $encoding)
+
+    $fixtureItem = Get-Item -LiteralPath $fixturePath -Force -ErrorAction Stop
+    $bundleItem = Get-Item -LiteralPath $bundlePath -Force -ErrorAction Stop
+    return [pscustomobject]@{
+        Fixture = [pscustomobject]@{
+            Size = [long]$fixtureItem.Length
+            Sha256 = $subjectSha256
+        }
+        Bundle = [pscustomobject]@{
+            Size = [long]$bundleItem.Length
+            Sha256 = Get-SteinSourceEvidenceSha256 -Path $bundlePath
+        }
+    }
+}
+
 function New-SteinVerifySourceCommandEvidenceFixture {
     param(
         [Parameter(Mandatory = $true)][string] $Root,
@@ -117,9 +314,11 @@ function New-SteinVerifySourceCommandEvidenceFixture {
         [Parameter(Mandatory = $true)][string] $RunnerPath,
         [Parameter(Mandatory = $true)][string] $CandidateCommit,
         [Parameter(Mandatory = $true)][string] $CandidateTree,
+        [Parameter(Mandatory = $true)][string] $PortableSourceRef,
         [ValidateSet(
             'none', 'receipt_shape', 'receipt_argv', 'index_shape',
-            'index_order', 'descriptor_hash', 'group_identity', 'git_binding')]
+            'index_order', 'descriptor_hash', 'group_identity', 'git_binding',
+            'portable_extra', 'portable_companion')]
         [string] $Mutation = 'none'
     )
 
@@ -129,6 +328,26 @@ function New-SteinVerifySourceCommandEvidenceFixture {
     $fixtureArtifactRoot = Join-Path $Root 'source-fixtures'
     foreach ($directory in @($receiptRoot, $logRoot, $fixtureArtifactRoot)) {
         $null = New-Item -ItemType Directory -Path $directory -ErrorAction Stop
+    }
+    $portableArtifacts = New-SteinVerifySourcePortableEvidenceFixture `
+        -Root $Root `
+        -RepositoryRoot $RepositoryRoot `
+        -SourceCommandLogRoot $logRoot `
+        -CandidateCommit $CandidateCommit `
+        -CandidateTree $CandidateTree `
+        -PortableSourceRef $PortableSourceRef
+    if ($Mutation -ceq 'portable_extra') {
+        [IO.File]::WriteAllText(
+            (Join-Path $Root 'portable-runner-attestation\extra.txt'),
+            'unexpected',
+            [Text.UTF8Encoding]::new($false))
+    }
+    elseif ($Mutation -ceq 'portable_companion') {
+        [IO.File]::WriteAllText(
+            (Join-Path $Root `
+                'portable-runner-attestation\repository-commit.txt'),
+            "$(('f' * $CandidateCommit.Length))`n",
+            [Text.UTF8Encoding]::new($false))
     }
 
     $repositoryCanonical = [IO.Path]::GetFullPath($RepositoryRoot).TrimEnd(
@@ -207,7 +426,9 @@ function New-SteinVerifySourceCommandEvidenceFixture {
         $expanded = Expand-SteinSourceEvidenceCommandDefinition `
             -Check $check `
             -RepositoryRoot $RepositoryRoot `
-            -EvidenceRoot $Root
+            -EvidenceRoot $Root `
+            -CandidateCommit $CandidateCommit `
+            -PortableSourceRef $PortableSourceRef
         $arguments = @($expanded.NormalizedArguments | ForEach-Object {
                 [string]$_
             })
@@ -258,7 +479,20 @@ function New-SteinVerifySourceCommandEvidenceFixture {
             -Command $command `
             -Execution $execution
         $artifacts = @()
-        if ($isGrouped) {
+        if ($id -ceq 'portable-runner-attestation') {
+            $artifacts = @(
+                [ordered]@{
+                    role = 'portable_fixture_subject'
+                    size = [long]$portableArtifacts.Fixture.Size
+                    sha256 = [string]$portableArtifacts.Fixture.Sha256
+                },
+                [ordered]@{
+                    role = 'portable_sigstore_bundle'
+                    size = [long]$portableArtifacts.Bundle.Size
+                    sha256 = [string]$portableArtifacts.Bundle.Sha256
+                })
+        }
+        elseif ($isGrouped) {
             $suiteArtifact = $fixtureArtifacts['source-fixtures/index.json']
             $receiptArtifact = $fixtureArtifacts[[string]$check.fixture_receipt_path]
             $artifacts = @(
@@ -280,7 +514,7 @@ function New-SteinVerifySourceCommandEvidenceFixture {
         }
         $bindings.check_definition_sha256 =
             Get-SteinSourceEvidenceCommandDefinitionDigest -Check $check
-        $bindings.execution_group_count = 25
+        $bindings.execution_group_count = 26
         $receipt = [ordered]@{
             schema_version = 1
             claim = 'closed_source_command_execution_only'
@@ -314,8 +548,8 @@ function New-SteinVerifySourceCommandEvidenceFixture {
         claim = 'closed_source_command_receipt_index'
         registry_id = 'stein.phase2.source-command-registry.v1'
         bindings = $commonBindings
-        executed_check_count = 37
-        execution_group_count = 25
+        executed_check_count = 38
+        execution_group_count = 26
         receipts = $descriptors.ToArray()
     }
     if ($Mutation -ceq 'index_shape') {
@@ -341,6 +575,7 @@ function Assert-SteinVerifySourceCommandEvidenceFixture {
         [Parameter(Mandatory = $true)][string] $EvidenceRoot,
         [Parameter(Mandatory = $true)][string] $CandidateCommit,
         [Parameter(Mandatory = $true)][string] $CandidateTree,
+        [Parameter(Mandatory = $true)][string] $PortableSourceRef,
         [Parameter(Mandatory = $true)][string] $RunnerPath,
         [Parameter(Mandatory = $true)][Collections.IDictionary] $ToolExecutables
     )
@@ -353,13 +588,16 @@ function Assert-SteinVerifySourceCommandEvidenceFixture {
             -EvidenceRoot $EvidenceRoot `
             -CandidateCommit $CandidateCommit `
             -CandidateTree $CandidateTree `
+            -PortableSourceRef $PortableSourceRef `
+            -ReportStartedAt '2026-08-23T00:00:00.0000000Z' `
+            -ReportCompletedAt '2026-08-27T00:00:00.0000000Z' `
             -RunnerPath $RunnerPath `
             -ToolExecutables $ToolExecutables `
             -ExpectedCandidateManifestSha256 ('a' * 64) `
             -ExpectedCandidateFileCount 1
-        if ([long]$validated.ExecutedCheckCount -ne 37 -or
-            [long]$validated.ExecutionGroupCount -ne 25 -or
-            @($validated.Receipts).Count -ne 37 -or
+        if ([long]$validated.ExecutedCheckCount -ne 38 -or
+            [long]$validated.ExecutionGroupCount -ne 26 -or
+            @($validated.Receipts).Count -ne 38 -or
             -not (Assert-SteinSourceEvidenceCommandEvidenceStable `
                 -Evidence $validated)) {
             throw "The synthetic source-command evidence contract is invalid."
@@ -399,12 +637,38 @@ if (@($sourceCommandTestParseErrors).Count -ne 0 -or
     $null -eq $sourceCommandTestAst) {
     throw "Test-SourceCommand.ps1 does not parse."
 }
+$portableAttestationTokens = $null
+$portableAttestationParseErrors = $null
+$portableAttestationAst = [Management.Automation.Language.Parser]::ParseFile(
+    $portableAttestationContractPath,
+    [ref]$portableAttestationTokens,
+    [ref]$portableAttestationParseErrors)
+if (@($portableAttestationParseErrors).Count -ne 0 -or
+    $null -eq $portableAttestationAst) {
+    throw "Portable-Attestation.ps1 does not parse."
+}
+$portableAttestationTestTokens = $null
+$portableAttestationTestParseErrors = $null
+$portableAttestationTestAst = [Management.Automation.Language.Parser]::ParseFile(
+    $portableAttestationTestPath,
+    [ref]$portableAttestationTestTokens,
+    [ref]$portableAttestationTestParseErrors)
+if (@($portableAttestationTestParseErrors).Count -ne 0 -or
+    $null -eq $portableAttestationTestAst) {
+    throw "Test-PortableAttestation.ps1 does not parse."
+}
 . $sourceCommandRunnerPath -LibraryOnly
 
 $verifySource = [IO.File]::ReadAllText($verifyPath)
 $portableWorkflowSource = [IO.File]::ReadAllText($portableWorkflowPath)
 foreach ($required in @(
         'Source-Evidence.ps1',
+        'PortableAttestationRoot',
+        'PortableSourceRef',
+        'Portable-Attestation.ps1',
+        'Copy-SteinSourcePortableAttestationEvidence',
+        'Get-SteinSourcePortableAttestationRecord',
+        'Assert-SteinSourcePortableAttestationEvidenceStable',
         'schema_version = 2',
         'Get-SteinSourceEvidenceProvenance',
         'source-provenance-stability',
@@ -446,12 +710,13 @@ foreach ($required in @(
 $bootstrapRoles = @(
     [regex]::Matches(
         $verifySource,
-        "role = '(?<role>harness|package-tools|source-evidence|source-command-registry|source-command-runner|source-fixture-runner)'") |
+        "role = '(?<role>harness|package-tools|portable-attestation-contract|source-evidence|source-command-registry|source-command-runner|source-fixture-runner)'") |
         ForEach-Object { [string]$_.Groups['role'].Value })
 $expectedBootstrapRoles = @(
-    'harness', 'package-tools', 'source-evidence', 'source-command-registry',
-    'source-command-runner', 'source-fixture-runner')
-if ($bootstrapRoles.Count -ne 6 -or
+    'harness', 'package-tools', 'portable-attestation-contract',
+    'source-evidence', 'source-command-registry', 'source-command-runner',
+    'source-fixture-runner')
+if ($bootstrapRoles.Count -ne 7 -or
     @(Compare-Object `
         -ReferenceObject $expectedBootstrapRoles `
         -DifferenceObject $bootstrapRoles `
@@ -489,6 +754,8 @@ $expectedGeneratorRelativePaths = @(
     "scripts/windows/phase2/Source-Command-Registry.json",
     "scripts/windows/phase2/Run-Source-Check.ps1",
     "scripts/windows/phase2/Test-SourceCommand.ps1",
+    "scripts/windows/phase2/Portable-Attestation.ps1",
+    "scripts/windows/phase2/Test-PortableAttestation.ps1",
     "scripts/windows/phase2/Source-Fixture-Registry.json",
     "scripts/windows/phase2/Run-Source-Fixture.ps1",
     "scripts/windows/phase2/Test-SourceFixture.ps1",
@@ -672,6 +939,17 @@ if (-not [regex]::IsMatch(
         [StringComparison]::Ordinal) -lt 0) {
     throw "The portable attestation subject validation is not exact."
 }
+$portableAttestationTest = & $portableAttestationTestPath
+if ($null -eq $portableAttestationTest -or
+    -not [bool]$portableAttestationTest.verified -or
+    [int]$portableAttestationTest.attestation_negative_case_count -lt 24 -or
+    [int]$portableAttestationTest.fixture_negative_case_count -lt 17 -or
+    [int]$portableAttestationTest.exact_subcheck_count -ne 7 -or
+    -not [bool]$portableAttestationTest.authenticated_certificate_bound -or
+    -not [bool]$portableAttestationTest.verification_array_document_bound -or
+    -not [bool]$portableAttestationTest.workflow_controlled_predicate_not_trusted) {
+    throw "The portable-attestation semantic contract is invalid."
+}
 
 $evidenceSpec = Get-Content -LiteralPath $evidenceSpecPath -Raw -Encoding UTF8 |
     ConvertFrom-Json -ErrorAction Stop
@@ -682,7 +960,7 @@ $sourceCommandRegistry = Get-Content `
 $sourceCommandRegistrySha256 = Get-SteinSourceEvidenceSha256 `
     -Path $sourceCommandRegistryPath
 $expectedSourceCommandRegistrySha256 =
-    '9a1bb265a11a3b7ca18d1e8b67a2b1c47f9cb090910a458ca3d41fb221b50cbc'
+    '8263b2c63295dae6fbd05940639fc8b23bde77263833d4d5af5f249cd4d7865e'
 $sourceCommandContract = Assert-SteinSourceEvidenceCommandRegistry `
     -Registry $sourceCommandRegistry
 $runnerSourceCommandContract = Assert-SteinSourceCommandRegistry `
@@ -704,15 +982,15 @@ if ($sourceCommandRegistrySha256 -cne $expectedSourceCommandRegistrySha256 -or
     [string]$evidenceSpec.source_report_contract.source_command_registry_sha256 -cne
         $expectedSourceCommandRegistrySha256 -or
     $sourceCommandChecks.Count -ne 44 -or
-    $directSourceCommandChecks.Count -ne 24 -or
+    $directSourceCommandChecks.Count -ne 25 -or
     $groupedSourceCommandChecks.Count -ne 13 -or
     $derivedSourceCommandChecks.Count -ne 2 -or
-    $retainedSourceCommandChecks.Count -ne 5 -or
-    @($sourceCommandContract.ExecutedChecks).Count -ne 37 -or
+    $retainedSourceCommandChecks.Count -ne 4 -or
+    @($sourceCommandContract.ExecutedChecks).Count -ne 38 -or
     (@($runnerSourceCommandContract.DirectIds).Count +
-        @($runnerSourceCommandContract.GroupedIds).Count) -ne 37 -or
-    [long]$sourceCommandContract.ExecutionGroupCount -ne 25 -or
-    [long]$runnerSourceCommandContract.ExecutionGroupCount -ne 25) {
+        @($runnerSourceCommandContract.GroupedIds).Count) -ne 38 -or
+    [long]$sourceCommandContract.ExecutionGroupCount -ne 26 -or
+    [long]$runnerSourceCommandContract.ExecutionGroupCount -ne 26) {
     throw "The exact source-command registry contract is not frozen."
 }
 
@@ -746,7 +1024,7 @@ foreach ($required in @(
 foreach ($required in @(
         '. $runnerPath -LibraryOnly',
         'checks.Count -ne 44',
-        'ExecutionGroupCount -ne 25',
+        'ExecutionGroupCount -ne 26',
         'profileDrift',
         'reasonDrift',
         'source_command_security_module_shadow_not_rejected',
@@ -754,7 +1032,7 @@ foreach ($required in @(
         'WaitForExit(660000)',
         'orderedDigest',
         'mismatched resolved Git payload',
-        'finalizer accepted incomplete 37-check coverage')) {
+        'finalizer accepted incomplete 38-check coverage')) {
     if ($sourceCommandTestSource.IndexOf(
             $required, [StringComparison]::Ordinal) -lt 0) {
         throw "Test-SourceCommand.ps1 is not bound to the closed runner contract."
@@ -845,8 +1123,8 @@ $implementedSourceCheckIds = @($sourceCommandChecks | ForEach-Object {
 $contractSourceCheckIds = @(
     @($evidenceSpec.source_report_contract.required_pass_check_ids) +
     @($evidenceSpec.source_report_contract.allowed_not_run_check_ids))
-if (@($evidenceSpec.source_report_contract.required_pass_check_ids).Count -ne 39 -or
-    @($evidenceSpec.source_report_contract.allowed_not_run_check_ids).Count -ne 5 -or
+if (@($evidenceSpec.source_report_contract.required_pass_check_ids).Count -ne 40 -or
+    @($evidenceSpec.source_report_contract.allowed_not_run_check_ids).Count -ne 4 -or
     $implementedSourceCheckIds.Count -ne 44 -or
     $contractSourceCheckIds.Count -ne 44 -or
     @(Compare-Object `
@@ -1077,6 +1355,8 @@ $sourceCommandToolExecutables = [ordered]@{
     pnpm = [string]$toolExecutables['pnpm']
     windows_powershell = $windowsPowerShell
     pwsh = $resolvedTrustedPwsh
+    gh = [string]@(Get-Command 'gh.exe' -CommandType Application `
+        -ErrorAction Stop)[0].Source
     git_launcher = $gitLauncherPath
     git_resolved = $gitResolvedPath
 }
@@ -1096,6 +1376,7 @@ $candidateCommit = $candidateCommit.Trim()
 $candidateTree = [string](& ([string]$toolExecutables['git']) `
     -C $repoRoot rev-parse 'HEAD^{tree}')
 $candidateTree = $candidateTree.Trim()
+$portableSourceRef = 'refs/heads/phase-2-completion'
 if ($LASTEXITCODE -ne 0 -or
     $candidateCommit -cnotmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$' -or
     $candidateTree -cnotmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$' -or
@@ -1116,7 +1397,8 @@ try {
         -RegistryPath $sourceCommandRegistryPath
     foreach ($mutation in @(
             'none', 'receipt_shape', 'receipt_argv', 'index_shape',
-            'index_order', 'descriptor_hash', 'group_identity', 'git_binding')) {
+            'index_order', 'descriptor_hash', 'group_identity', 'git_binding',
+            'portable_extra', 'portable_companion')) {
         $evidenceRoot = Join-Path $sourceCommandFixtureParent $mutation
         New-SteinVerifySourceCommandEvidenceFixture `
             -Root $evidenceRoot `
@@ -1126,6 +1408,7 @@ try {
             -RunnerPath $sourceCommandRunnerPath `
             -CandidateCommit $candidateCommit `
             -CandidateTree $candidateTree `
+            -PortableSourceRef $portableSourceRef `
             -Mutation $mutation
         if ($mutation -ceq 'none') {
             Assert-SteinVerifySourceCommandEvidenceFixture `
@@ -1134,6 +1417,7 @@ try {
                 -EvidenceRoot $evidenceRoot `
                 -CandidateCommit $candidateCommit `
                 -CandidateTree $candidateTree `
+                -PortableSourceRef $portableSourceRef `
                 -RunnerPath $sourceCommandRunnerPath `
                 -ToolExecutables $sourceCommandToolExecutables
         }
@@ -1147,6 +1431,7 @@ try {
                         -EvidenceRoot $evidenceRoot `
                         -CandidateCommit $candidateCommit `
                         -CandidateTree $candidateTree `
+                        -PortableSourceRef $portableSourceRef `
                         -RunnerPath $sourceCommandRunnerPath `
                         -ToolExecutables $sourceCommandToolExecutables
                 }
@@ -1307,6 +1592,8 @@ $generator = Get-SteinSourceEvidenceGenerator `
         $sourceCommandRegistryPath,
         $sourceCommandRunnerPath,
         $sourceCommandTestPath,
+        $portableAttestationContractPath,
+        $portableAttestationTestPath,
         $sourceFixtureRegistryPath,
         $sourceFixtureRunnerPath,
         $sourceFixtureTestPath,
@@ -1324,7 +1611,7 @@ $generator = Get-SteinSourceEvidenceGenerator `
         $packageToolsPath)
 $generatorJson = $generator | ConvertTo-Json -Depth 8 -Compress
 if ([int]$generator.schema_version -ne 1 -or
-    @($generator.files).Count -ne 21 -or
+    @($generator.files).Count -ne 23 -or
     [string]$generator.digest_sha256 -notmatch '^[0-9a-f]{64}$' -or
     $generatorJson.IndexOf($repoRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
     throw "Source generator provenance is invalid."
@@ -1555,12 +1842,13 @@ finally {
     source_report_contract_bound = $true
     source_command_registry_sha256 = $sourceCommandRegistrySha256
     source_command_registry_row_count = $sourceCommandChecks.Count
-    source_command_executed_receipt_count = 37
-    source_command_execution_group_count = 25
+    source_command_executed_receipt_count = 38
+    source_command_execution_group_count = 26
     source_command_tamper_contracts_bound = $true
     source_command_runner_library_bound = $true
     source_command_test_parsed = $true
     portable_attestation_workflow_bound = $true
+    portable_attestation_contract_bound = $true
     gate_specific_source_mapping_bound = $true
     repository_state_content_free = $true
     generated_outputs_ignored = $true

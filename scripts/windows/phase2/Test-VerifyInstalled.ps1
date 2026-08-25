@@ -220,6 +220,53 @@ $sourceCommandRegistry = Read-SteinPhase2SourceCommandRegistry `
 if (@($sourceCommandRegistry.value.checks).Count -ne 44) {
     throw "The checked-in source command registry is incomplete."
 }
+$registryCategories = @($sourceCommandRegistry.value.checks |
+    Group-Object -Property category)
+$registryCategoryCounts = @{}
+foreach ($registryCategory in $registryCategories) {
+    $registryCategoryCounts[[string]$registryCategory.Name] =
+        [int]$registryCategory.Count
+}
+if (@($evidenceSpecification.specification.source_report_contract.
+        required_pass_check_ids).Count -ne 40 -or
+    @($evidenceSpecification.specification.source_report_contract.
+        allowed_not_run_check_ids).Count -ne 4 -or
+    @($evidenceSpecification.specification.source_report_contract.
+        required_generator_paths).Count -ne 23 -or
+    [int]$registryCategoryCounts['direct_execution'] -ne 25 -or
+    [int]$registryCategoryCounts['grouped_fixture_execution'] -ne 13 -or
+    [int]$registryCategoryCounts['derived'] -ne 2 -or
+    [int]$registryCategoryCounts['retained_obligation'] -ne 4) {
+    throw "The promoted portable source-report contract is incomplete."
+}
+$portableCommand = @($sourceCommandRegistry.value.checks | Where-Object {
+        [string]$_.id -ceq 'portable-runner-attestation'
+    })
+$portableSourceRef = 'refs/heads/phase-2-completion'
+$portableCandidateCommit = '8' * 40
+$portableArguments = if ($portableCommand.Count -eq 1) {
+    @(Get-SteinPhase2SourceCommandExpectedArguments `
+            -RegistryCheck $portableCommand[0] `
+            -EvidenceRootRelative 'artifacts/evidence/phase-2/source-synthetic' `
+            -CandidateCommit $portableCandidateCommit `
+            -PortableSourceRef $portableSourceRef)
+}
+else { @() }
+if ($portableCommand.Count -ne 1 -or
+    [string]$portableCommand[0].category -cne 'direct_execution' -or
+    [string]$portableCommand[0].executable_role -cne 'gh' -or
+    $portableArguments.Count -ne 26 -or
+    [string]$portableArguments[6] -cne
+        'artifacts/evidence/phase-2/source-synthetic/portable-runner-attestation/portable-fixture.json' -or
+    [string]$portableArguments[8] -cne
+        'artifacts/evidence/phase-2/source-synthetic/portable-runner-attestation/portable-fixture.attestation.json' -or
+    [string]$portableArguments[12] -cne
+        "https://github.com/grandmastr/STEIN/.github/workflows/portable-semantic.yml@$portableSourceRef" -or
+    [string]$portableArguments[14] -cne $portableCandidateCommit -or
+    [string]$portableArguments[16] -cne $portableCandidateCommit -or
+    [string]$portableArguments[18] -cne $portableSourceRef) {
+    throw "The portable attestation command is not exact."
+}
 $productionCommand = @($sourceCommandRegistry.value.checks | Where-Object {
         [string]$_.id -ceq "release-production-core"
     })
@@ -331,6 +378,120 @@ catch {
 }
 if (-not $noLeaksPairMismatchRejected) {
     throw "Mismatched no-leaks scanner and producer receipts were accepted."
+}
+
+function New-SteinInstalledTestPortableRow {
+    $hash = 'a' * 64
+    $files = @(
+        (Get-SteinPhase2PortableAttestationFileContract).Keys |
+            ForEach-Object {
+                [pscustomobject]@{
+                    path = [string]$_
+                    size = 1L
+                    sha256 = $hash
+                }
+            })
+    $subcheckIds = @(
+        'rust_format', 'portable_check', 'portable_clippy',
+        'semantic_full_loop', 'semantic_outbox_recovery',
+        'semantic_restart_recovery', 'portable_full_suite')
+    return [pscustomobject]@{
+        portable_attestation = [pscustomobject]@{
+            source_ref = 'refs/heads/phase-2-completion'
+            subject = [pscustomobject]@{
+                path = 'portable-runner-attestation/portable-fixture.json'
+                size = 1L
+                sha256 = $hash
+            }
+            bundle = [pscustomobject]@{
+                path =
+                    'portable-runner-attestation/portable-fixture.attestation.json'
+                size = 1L
+                sha256 = $hash
+                media_type =
+                    'application/vnd.dev.sigstore.bundle.v0.3+json'
+            }
+            workflow_sha256 = $hash
+            run_invocation_uri =
+                'https://github.com/grandmastr/STEIN/actions/runs/1/attempts/1'
+            generated_at = '2026-01-01T00:00:00.0000000Z'
+            earliest_verified_at = '2026-01-01T00:00:01.0000000Z'
+            latest_verified_at = '2026-01-01T00:00:01.0000000Z'
+            verified_timestamp_count = 1L
+            subchecks = @($subcheckIds | ForEach-Object {
+                    [pscustomobject]@{
+                        id = [string]$_
+                        path = "logs/$_.log"
+                        size = 1L
+                        sha256 = $hash
+                    }
+                })
+            files = $files
+        }
+        source_command_receipt = [pscustomobject]@{
+            execution = [pscustomobject]@{
+                started_at = '2026-01-01T00:00:02.0000000Z'
+            }
+        }
+    }
+}
+
+$portableGenerator = @{
+    '.github/workflows/portable-semantic.yml' = [pscustomobject]@{
+        sha256 = 'a' * 64
+    }
+}
+$portableRecord = Assert-SteinPhase2PortableAttestationRecord `
+    -Row (New-SteinInstalledTestPortableRow) `
+    -SourceGeneratorByPath $portableGenerator
+if ($portableRecord.FilesByPath.Count -ne 22) {
+    throw "The portable attestation record did not retain its exact closure."
+}
+$portableOrderRejected = $false
+$portableOrderRow = New-SteinInstalledTestPortableRow
+$firstPortableFile = $portableOrderRow.portable_attestation.files[0]
+$portableOrderRow.portable_attestation.files[0] =
+    $portableOrderRow.portable_attestation.files[1]
+$portableOrderRow.portable_attestation.files[1] = $firstPortableFile
+try {
+    $null = Assert-SteinPhase2PortableAttestationRecord `
+        -Row $portableOrderRow `
+        -SourceGeneratorByPath $portableGenerator
+}
+catch {
+    $portableOrderRejected = $true
+}
+$portableExtraRejected = $false
+$portableExtraRow = New-SteinInstalledTestPortableRow
+$portableExtraRow.portable_attestation.files =
+    @($portableExtraRow.portable_attestation.files) + @(
+        [pscustomobject]@{
+            path = 'portable-runner-attestation/extra.txt'
+            size = 1L
+            sha256 = 'b' * 64
+        })
+try {
+    $null = Assert-SteinPhase2PortableAttestationRecord `
+        -Row $portableExtraRow `
+        -SourceGeneratorByPath $portableGenerator
+}
+catch {
+    $portableExtraRejected = $true
+}
+$portableAliasMismatchRejected = $false
+$portableAliasRow = New-SteinInstalledTestPortableRow
+$portableAliasRow.portable_attestation.subject.sha256 = 'c' * 64
+try {
+    $null = Assert-SteinPhase2PortableAttestationRecord `
+        -Row $portableAliasRow `
+        -SourceGeneratorByPath $portableGenerator
+}
+catch {
+    $portableAliasMismatchRejected = $true
+}
+if (-not $portableOrderRejected -or -not $portableExtraRejected -or
+    -not $portableAliasMismatchRejected) {
+    throw "The portable attestation manifest accepted a structural mismatch."
 }
 
 $gateFunction = @($ast.FindAll({
@@ -483,6 +644,10 @@ if ($verifySource.IndexOf("Source-Command-Registry.json", [StringComparison]::Or
     $verifySource.IndexOf("Assert-SteinSourceEvidenceCommandReceiptIndex", [StringComparison]::Ordinal) -lt 0 -or
     $sourceCommandRunner.IndexOf("STEIN_EDGE_EXTENSION_VERSION", [StringComparison]::Ordinal) -lt 0 -or
     $sourceCommandRunner.IndexOf("Resolve-SteinSourceCommandExecutable", [StringComparison]::Ordinal) -lt 0 -or
+    $sourceCommandRunner.IndexOf("portable-runner-attestation", [StringComparison]::Ordinal) -lt 0 -or
+    $sourceCommandRunner.IndexOf("Assert-SteinPortableAttestationVerification", [StringComparison]::Ordinal) -lt 0 -or
+    $sourceCommandRunner.IndexOf("GH_TOKEN", [StringComparison]::Ordinal) -lt 0 -or
+    $sourceCommandRunner.IndexOf("GITHUB_TOKEN", [StringComparison]::Ordinal) -lt 0 -or
     $sourceCommandRunner.IndexOf("[Environment+SpecialFolder]::System", [StringComparison]::Ordinal) -lt 0 -or
     $sourceCommandRunner.IndexOf('Get-Command "powershell.exe"', [StringComparison]::OrdinalIgnoreCase) -ge 0) {
     throw "The registered source command path is missing an exact production or trusted-host invariant."
@@ -638,6 +803,10 @@ finally {
     evidence_spec_swap_rejected = $specificationSwapRejected
     closed_runner_order_enforced = $runnerOrderRejected
     no_leaks_pair_mismatch_rejected = $noLeaksPairMismatchRejected
+    portable_attestation_contract_bound = $true
+    portable_file_order_rejected = $portableOrderRejected
+    portable_extra_file_rejected = $portableExtraRejected
+    portable_alias_mismatch_rejected = $portableAliasMismatchRejected
     runtime_source_swap_rejected = $true
     exact_gate_evidence_contract = $true
 }

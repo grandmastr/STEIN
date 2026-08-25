@@ -977,14 +977,46 @@ function Test-SteinSourceEvidenceCommandToken {
     param([AllowNull()] $Value)
 
     if ($Value -isnot [string] -or $Value.Length -lt 1 -or
-        $Value.Length -gt 512 -or
-        $Value -cnotmatch '^[A-Za-z0-9._/,+@=-]+$' -or
+        $Value.Length -gt 512) {
+        return $false
+    }
+    $portableWorkflowIdentity =
+        'https://github.com/grandmastr/STEIN/.github/workflows/portable-semantic.yml@'
+    if ($Value -ceq 'https://slsa.dev/provenance/v1' -or
+        $Value -ceq 'https://token.actions.githubusercontent.com') {
+        return $true
+    }
+    if ($Value.StartsWith($portableWorkflowIdentity, [StringComparison]::Ordinal)) {
+        return Test-SteinSourceEvidenceCommandPortableSourceRef `
+            -Value $Value.Substring($portableWorkflowIdentity.Length)
+    }
+    if ($Value -cnotmatch '^[A-Za-z0-9._/,+@=-]+$' -or
         $Value -match '[\s"''&|;<>`$(){}\[\]!?*\\:]' -or
         $Value.StartsWith('/')) {
         return $false
     }
     foreach ($segment in $Value.Split('/')) {
         if ($segment -cin @('.', '..')) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-SteinSourceEvidenceCommandPortableSourceRef {
+    param([AllowNull()] $Value)
+
+    if ($Value -isnot [string] -or $Value.Length -lt 12 -or
+        $Value.Length -gt 255 -or
+        $Value -cnotmatch '^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*$' -or
+        $Value.Contains('//') -or $Value.Contains('..') -or
+        $Value.EndsWith('/') -or $Value.EndsWith('.') -or
+        $Value.EndsWith('.lock')) {
+        return $false
+    }
+    foreach ($segment in $Value.Substring('refs/heads/'.Length).Split('/')) {
+        if ([string]::IsNullOrWhiteSpace($segment) -or
+            $segment -cin @('.', '..')) {
             return $false
         }
     }
@@ -1164,6 +1196,12 @@ function ConvertFrom-SteinSourceEvidenceCommandJson {
     return $Text | ConvertFrom-Json -ErrorAction Stop
 }
 
+function Test-SteinSourceEvidenceJsonWhitespace {
+    param([Parameter(Mandatory = $true)][char] $Value)
+
+    return [int]$Value -in @(0x20, 0x09, 0x0A, 0x0D)
+}
+
 function MoveTo-SteinSourceEvidenceJsonToken {
     param(
         [Parameter(Mandatory = $true)][string] $Text,
@@ -1171,7 +1209,8 @@ function MoveTo-SteinSourceEvidenceJsonToken {
     )
 
     while ($Position.Value -lt $Text.Length -and
-        [char]::IsWhiteSpace($Text[$Position.Value])) {
+        (Test-SteinSourceEvidenceJsonWhitespace `
+            -Value $Text[$Position.Value])) {
         $Position.Value++
     }
 }
@@ -1340,7 +1379,8 @@ function Assert-SteinSourceEvidenceJsonValue {
     $start = [int]$Position.Value
     while ($Position.Value -lt $Text.Length -and
         $Text[$Position.Value] -cnotin @(',', '}', ']') -and
-        -not [char]::IsWhiteSpace($Text[$Position.Value])) {
+        -not (Test-SteinSourceEvidenceJsonWhitespace `
+            -Value $Text[$Position.Value])) {
         $Position.Value++
     }
     if ($Position.Value -le $start) {
@@ -1422,6 +1462,7 @@ function Get-SteinSourceEvidenceCommandCatalog {
             'edge-host-check', 'edge-host-clippy', 'edge-host-tests',
             'boundary-contract', 'source-evidence-contract',
             'installed-evidence-harness-static', 'no-leaks-scanner-static',
+            'portable-runner-attestation',
             'installed-reviewer-windows-powershell-contract',
             'installed-reviewer-pwsh-contract', 'msix-static-contract',
             'release-workspace', 'release-production-core',
@@ -1446,7 +1487,6 @@ function Get-SteinSourceEvidenceCommandCatalog {
         retained = @(
             'no-leaks-producer-workflow', 'native-toolchain-provenance',
             'pinned-clean-build-environment',
-            'portable-runner-attestation',
             'windows-native-ignored-fixtures')
         ordered = @(
             'rust-format', 'rust-check', 'rust-clippy', 'rust-tests',
@@ -1497,9 +1537,9 @@ function Assert-SteinSourceEvidenceCommandRegistry {
         throw "The source-command registry identity is invalid."
     }
     $checks = @($Registry.checks)
-    if ($checks.Count -ne 44 -or $catalog.direct.Count -ne 24 -or
+    if ($checks.Count -ne 44 -or $catalog.direct.Count -ne 25 -or
         $catalog.grouped.Count -ne 13 -or $catalog.derived.Count -ne 2 -or
-        $catalog.retained.Count -ne 5 -or $catalog.ordered.Count -ne 44) {
+        $catalog.retained.Count -ne 4 -or $catalog.ordered.Count -ne 44) {
         throw "The source-command registry coverage is invalid."
     }
 
@@ -1515,8 +1555,6 @@ function Assert-SteinSourceEvidenceCommandRegistry {
             'authenticated_native_toolchain_provenance_unimplemented'
         'pinned-clean-build-environment' =
             'immutable_candidate_and_fresh_build_isolation_unimplemented'
-        'portable-runner-attestation' =
-            'authenticated_portable_artifact_attestation_unimplemented'
         'windows-native-ignored-fixtures' =
             'versioned_closed_native_fixture_receipts_unimplemented'
     }
@@ -1593,7 +1631,7 @@ function Assert-SteinSourceEvidenceCommandRegistry {
             -FailureMessage "An executable source-command check is invalid."
         if ($check.executable_role -isnot [string] -or
             [string]$check.executable_role -cnotin @(
-                'cargo', 'pnpm', 'windows_powershell', 'pwsh') -or
+                'cargo', 'pnpm', 'windows_powershell', 'pwsh', 'gh') -or
             $check.working_directory -isnot [string] -or
             -not (Test-SteinSourceEvidenceCommandRelativePath `
                 -Value $check.working_directory `
@@ -1608,6 +1646,10 @@ function Assert-SteinSourceEvidenceCommandRegistry {
             [long]$check.timeout_seconds -gt 14400) {
             throw "An executable source-command definition is invalid."
         }
+        if (([string]$check.executable_role -ceq 'gh') -ne
+            ($id -ceq 'portable-runner-attestation')) {
+            throw "An executable source-command role is invalid."
+        }
         if ($category -ceq 'direct_execution' -and
             [string]$check.environment_profile -cne
                 'phase2_synthetic_compile_v1') {
@@ -1620,7 +1662,7 @@ function Assert-SteinSourceEvidenceCommandRegistry {
         }
 
         $arguments = @($check.arguments)
-        if ($arguments.Count -lt 1 -or $arguments.Count -gt 24) {
+        if ($arguments.Count -lt 1 -or $arguments.Count -gt 28) {
             throw "A source-command argument vector is outside its bound."
         }
         foreach ($argument in $arguments) {
@@ -1628,13 +1670,24 @@ function Assert-SteinSourceEvidenceCommandRegistry {
                 -Value $argument `
                 -Expected @('kind', 'value') `
                 -FailureMessage "A source-command argument is invalid."
+            $kind = [string]$argument.kind
+            $value = [string]$argument.value
+            $portableUrlLiteral = $id -ceq 'portable-runner-attestation' -and
+                $kind -ceq 'literal' -and $value -cin @(
+                    'https://slsa.dev/provenance/v1',
+                    'https://token.actions.githubusercontent.com')
+            $hasUrlSyntax = $value.StartsWith(
+                'https://', [StringComparison]::Ordinal)
             if ($argument.kind -isnot [string] -or
                 [string]$argument.kind -cnotin @(
                     'literal', 'repository_relative_path',
-                    'evidence_relative_path') -or
+                    'evidence_relative_path', 'candidate_commit',
+                    'portable_source_ref') -or
                 $argument.value -isnot [string] -or
-                -not (Test-SteinSourceEvidenceCommandToken `
-                    -Value $argument.value)) {
+                ($hasUrlSyntax -and -not $portableUrlLiteral) -or
+                (-not $portableUrlLiteral -and
+                    -not (Test-SteinSourceEvidenceCommandToken `
+                        -Value $argument.value))) {
                 throw "A source-command argument is invalid."
             }
             if ([string]$argument.kind -ceq 'literal') {
@@ -1643,14 +1696,74 @@ function Assert-SteinSourceEvidenceCommandRegistry {
                     throw "A source-command shell argument is forbidden."
                 }
             }
-            elseif (-not (Test-SteinSourceEvidenceCommandRelativePath `
+            elseif ($kind -cin @(
+                    'repository_relative_path', 'evidence_relative_path') -and
+                -not (Test-SteinSourceEvidenceCommandRelativePath `
                     -Value $argument.value)) {
                 throw "A source-command path argument is invalid."
             }
-            if ([string]$argument.kind -ceq 'evidence_relative_path' -and
-                [string]$argument.value -cne 'source-fixtures') {
+            if ($kind -ceq 'evidence_relative_path' -and
+                $value -cnotin @(
+                    'source-fixtures',
+                    'portable-runner-attestation/portable-fixture.json',
+                    'portable-runner-attestation/portable-fixture.attestation.json')) {
                 throw "A source-command evidence argument is invalid."
             }
+            if ($kind -cin @('candidate_commit', 'portable_source_ref') -and
+                $id -cne 'portable-runner-attestation') {
+                throw "A dynamic source-command argument is invalid."
+            }
+        }
+        if ($id -ceq 'portable-runner-attestation') {
+            $expectedPortableArguments = @(
+                'literal|attestation',
+                'literal|verify',
+                'literal|--predicate-type',
+                'literal|https://slsa.dev/provenance/v1',
+                'literal|--cert-oidc-issuer',
+                'literal|https://token.actions.githubusercontent.com',
+                'evidence_relative_path|portable-runner-attestation/portable-fixture.json',
+                'literal|--bundle',
+                'evidence_relative_path|portable-runner-attestation/portable-fixture.attestation.json',
+                'literal|--repo',
+                'literal|grandmastr/STEIN',
+                'literal|--cert-identity',
+                'portable_source_ref|portable_cert_identity',
+                'literal|--signer-digest',
+                'candidate_commit|candidate_commit',
+                'literal|--source-digest',
+                'candidate_commit|candidate_commit',
+                'literal|--source-ref',
+                'portable_source_ref|portable_source_ref',
+                'literal|--deny-self-hosted-runners',
+                'literal|--digest-alg',
+                'literal|sha256',
+                'literal|--hostname',
+                'literal|github.com',
+                'literal|--format',
+                'literal|json')
+            $actualPortableArguments = @($arguments | ForEach-Object {
+                    "$([string]$_.kind)|$([string]$_.value)"
+                })
+            if ($actualPortableArguments.Count -ne
+                $expectedPortableArguments.Count) {
+                throw "The portable attestation command vector is invalid."
+            }
+            for ($position = 0;
+                    $position -lt $expectedPortableArguments.Count;
+                    $position++) {
+                if ([string]$actualPortableArguments[$position] -cne
+                    [string]$expectedPortableArguments[$position]) {
+                    throw "The portable attestation command vector is invalid."
+                }
+            }
+        }
+        elseif (@($arguments | Where-Object {
+                    [string]$_.kind -cin @(
+                        'candidate_commit', 'portable_source_ref') -or
+                    [string]$_.value -like 'portable-runner-attestation/*'
+                }).Count -ne 0) {
+            throw "A non-portable command contains a portable argument."
         }
 
         if ($category -ceq 'grouped_fixture_execution') {
@@ -1681,7 +1794,7 @@ function Assert-SteinSourceEvidenceCommandRegistry {
             $null = $executionGroups.Add("direct:$id")
         }
     }
-    if ($executionGroups.Count -ne 25 -or $seen.Count -ne 44) {
+    if ($executionGroups.Count -ne 26 -or $seen.Count -ne 44) {
         throw "The source-command execution-group coverage is invalid."
     }
 
@@ -1689,7 +1802,7 @@ function Assert-SteinSourceEvidenceCommandRegistry {
             [string]$_.category -cin @(
                 'direct_execution', 'grouped_fixture_execution')
         })
-    if ($executed.Count -ne 37) {
+    if ($executed.Count -ne 38) {
         throw "The source-command executable-check coverage is invalid."
     }
     return [pscustomobject]@{
@@ -1699,7 +1812,7 @@ function Assert-SteinSourceEvidenceCommandRegistry {
         RetainedIds = @($catalog.retained)
         OrderedIds = @($catalog.ordered)
         ExecutedChecks = $executed
-        ExecutionGroupCount = 25
+        ExecutionGroupCount = 26
     }
 }
 
@@ -1778,7 +1891,9 @@ function Expand-SteinSourceEvidenceCommandDefinition {
     param(
         [Parameter(Mandatory = $true)] $Check,
         [Parameter(Mandatory = $true)][string] $RepositoryRoot,
-        [Parameter(Mandatory = $true)][string] $EvidenceRoot
+        [Parameter(Mandatory = $true)][string] $EvidenceRoot,
+        [AllowEmptyString()][string] $CandidateCommit = '',
+        [AllowEmptyString()][string] $PortableSourceRef = ''
     )
 
     $repositoryPath = [IO.Path]::GetFullPath($RepositoryRoot).TrimEnd(
@@ -1829,11 +1944,40 @@ function Expand-SteinSourceEvidenceCommandDefinition {
                 throw "A normalized source-command evidence argument is invalid."
             }
             $null = Resolve-SteinSourceEvidenceCommandPath `
-                -Root $repositoryPath `
-                -RelativePath $combined `
-                -Kind Container `
-                -AllowMissingLeaf
+                -Root $evidencePath `
+                -RelativePath $value `
+                -Kind $(if ($value -ceq 'source-fixtures') {
+                        'Container'
+                    }
+                    else {
+                        'Leaf'
+                    })
             $normalized.Add($combined)
+            continue
+        }
+        if ($kind -ceq 'candidate_commit') {
+            if ($value -cne 'candidate_commit' -or
+                $CandidateCommit -cnotmatch
+                    '^(?:[0-9a-f]{40}|[0-9a-f]{64})$') {
+                throw "A dynamic candidate-commit argument is invalid."
+            }
+            $normalized.Add($CandidateCommit)
+            continue
+        }
+        if ($kind -ceq 'portable_source_ref') {
+            if ($value -cnotin @(
+                    'portable_source_ref', 'portable_cert_identity') -or
+                -not (Test-SteinSourceEvidenceCommandPortableSourceRef `
+                    -Value $PortableSourceRef)) {
+                throw "A portable source-ref argument is invalid."
+            }
+            if ($value -ceq 'portable_cert_identity') {
+                $normalized.Add(
+                    "https://github.com/grandmastr/STEIN/.github/workflows/portable-semantic.yml@$PortableSourceRef")
+            }
+            else {
+                $normalized.Add($PortableSourceRef)
+            }
             continue
         }
         throw "A source-command argument kind is invalid."
@@ -1880,6 +2024,7 @@ function Get-SteinSourceEvidenceCommandEnvironmentProfileDigest {
     return Get-SteinSourceEvidenceObjectDigest -Value ([ordered]@{
             profile = $Profile
             values = $values
+            cleared = @('GH_TOKEN', 'GITHUB_TOKEN')
         })
 }
 
@@ -1903,6 +2048,313 @@ function ConvertFrom-SteinSourceEvidenceCommandTimestamp {
         throw "A source-command timestamp is invalid."
     }
     return $parsed
+}
+
+function Read-SteinSourceEvidenceCommandLockedUtf8Text {
+    param([Parameter(Mandatory = $true)] $Lock)
+
+    $bytes = $null
+    try {
+        if ($null -eq $Lock -or $null -eq $Lock.Stream -or
+            -not $Lock.Stream.CanRead -or -not $Lock.Stream.CanSeek -or
+            [long]$Lock.Size -lt 1 -or [long]$Lock.Size -gt [int]::MaxValue) {
+            throw "A locked source-command UTF-8 file is invalid."
+        }
+        $bytes = New-Object byte[] ([int]$Lock.Size)
+        $offset = 0
+        $Lock.Stream.Position = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $Lock.Stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) {
+                throw "A locked source-command UTF-8 file could not be read."
+            }
+            $offset += $read
+        }
+        $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+        if ($text.Length -lt 1 -or [int][char]$text[0] -eq 0xFEFF -or
+            $text.IndexOf([char]0) -ge 0) {
+            throw "A locked source-command UTF-8 file is invalid."
+        }
+        return $text
+    }
+    finally {
+        if ($null -ne $Lock -and $null -ne $Lock.Stream -and
+            $Lock.Stream.CanSeek) {
+            $Lock.Stream.Position = 0
+        }
+        if ($null -ne $bytes) {
+            [Array]::Clear($bytes, 0, $bytes.Length)
+        }
+    }
+}
+
+function Read-SteinSourceEvidenceCommandLockedJsonValue {
+    param([Parameter(Mandatory = $true)] $Lock)
+
+    $text = Read-SteinSourceEvidenceCommandLockedUtf8Text -Lock $Lock
+    Assert-SteinSourceEvidenceJsonUniqueObjectKeys -Text $text
+    $value = ConvertFrom-SteinSourceEvidenceCommandJson -Text $text
+    if ($null -eq $value) {
+        throw "A locked source-command JSON file is empty."
+    }
+    return $value
+}
+
+function Get-SteinSourceEvidencePortableAttestationFileContract {
+    return [ordered]@{
+        'cargo.txt' = 4096L
+        'clean-after.txt' = 16L
+        'clean-before.txt' = 16L
+        'logs/portable_check.log' = 16777216L
+        'logs/portable_clippy.log' = 16777216L
+        'logs/portable_full_suite.log' = 16777216L
+        'logs/rust_format.log' = 16777216L
+        'logs/semantic_full_loop.log' = 16777216L
+        'logs/semantic_outbox_recovery.log' = 16777216L
+        'logs/semantic_restart_recovery.log' = 16777216L
+        'portable-fixture.attestation.json' = 4194304L
+        'portable-fixture.json' = 1048576L
+        'portable_check.exit' = 16L
+        'portable_clippy.exit' = 16L
+        'portable_full_suite.exit' = 16L
+        'repository-commit.txt' = 128L
+        'repository-tree.txt' = 128L
+        'rust_format.exit' = 16L
+        'rustc.txt' = 16384L
+        'semantic_full_loop.exit' = 16L
+        'semantic_outbox_recovery.exit' = 16L
+        'semantic_restart_recovery.exit' = 16L
+    }
+}
+
+function Assert-SteinSourceEvidencePortableAttestationDirectory {
+    param([Parameter(Mandatory = $true)][string] $EvidenceRoot)
+
+    $portableRoot = Resolve-SteinSourceEvidenceCommandPath `
+        -Root $EvidenceRoot `
+        -RelativePath 'portable-runner-attestation' `
+        -Kind Container
+    $contract = Get-SteinSourceEvidencePortableAttestationFileContract
+    if (@($contract.Keys).Count -ne 22) {
+        throw "The portable-attestation file contract is invalid."
+    }
+    $rootFileNames = @($contract.Keys | Where-Object {
+            -not ([string]$_).Contains('/')
+        })
+    $logFileNames = @($contract.Keys | Where-Object {
+            ([string]$_).StartsWith('logs/', [StringComparison]::Ordinal)
+        } | ForEach-Object { ([string]$_).Substring('logs/'.Length) })
+    $rootEntries = @(Get-ChildItem -LiteralPath $portableRoot -Force `
+            -ErrorAction Stop)
+    if ($rootEntries.Count -ne ($rootFileNames.Count + 1)) {
+        throw "The portable-attestation directory is not closed."
+    }
+    foreach ($name in $rootFileNames) {
+        $matches = @($rootEntries | Where-Object {
+                [string]$_.Name -ceq [string]$name
+            })
+        if ($matches.Count -ne 1 -or $matches[0].PSIsContainer -or
+            (($matches[0].Attributes -band
+                    [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            [long]$matches[0].Length -lt 1 -or
+            [long]$matches[0].Length -gt [long]$contract[$name]) {
+            throw "The portable-attestation directory is not closed."
+        }
+    }
+    $logs = @($rootEntries | Where-Object {
+            [string]$_.Name -ceq 'logs'
+        })
+    if ($logs.Count -ne 1 -or -not $logs[0].PSIsContainer -or
+        (($logs[0].Attributes -band
+                [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "The portable-attestation directory is not closed."
+    }
+    $logEntries = @(Get-ChildItem -LiteralPath $logs[0].FullName -Force `
+            -ErrorAction Stop)
+    if ($logEntries.Count -ne $logFileNames.Count) {
+        throw "The portable-attestation log directory is not closed."
+    }
+    foreach ($name in $logFileNames) {
+        $matches = @($logEntries | Where-Object {
+                [string]$_.Name -ceq [string]$name
+            })
+        $relative = "logs/$name"
+        if ($matches.Count -ne 1 -or $matches[0].PSIsContainer -or
+            (($matches[0].Attributes -band
+                    [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            [long]$matches[0].Length -lt 1 -or
+            [long]$matches[0].Length -gt [long]$contract[$relative]) {
+            throw "The portable-attestation log directory is not closed."
+        }
+    }
+    return $portableRoot
+}
+
+function Assert-SteinSourceEvidencePortableAttestationReceipt {
+    param(
+        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
+        [Parameter(Mandatory = $true)][string] $EvidenceRoot,
+        [Parameter(Mandatory = $true)][string] $ExpectedCommit,
+        [Parameter(Mandatory = $true)][string] $ExpectedTree,
+        [Parameter(Mandatory = $true)][string] $ExpectedSourceRef,
+        [Parameter(Mandatory = $true)] $Receipt,
+        [Parameter(Mandatory = $true)][Collections.IDictionary] $FileLocks,
+        [Parameter(Mandatory = $true)] $Locks
+    )
+
+    $portableRoot = Assert-SteinSourceEvidencePortableAttestationDirectory `
+        -EvidenceRoot $EvidenceRoot
+    $contract = Get-SteinSourceEvidencePortableAttestationFileContract
+    foreach ($relative in @($contract.Keys)) {
+        $evidenceRelative = "portable-runner-attestation/$relative"
+        if (-not $FileLocks.Contains($evidenceRelative)) {
+            $path = Resolve-SteinSourceEvidenceCommandPath `
+                -Root $EvidenceRoot `
+                -RelativePath $evidenceRelative `
+                -Kind Leaf
+            $lock = Open-SteinSourceEvidenceCommandFile `
+                -Path $path `
+                -MaximumBytes ([long]$contract[$relative])
+            $FileLocks[$evidenceRelative] = $lock
+            $Locks.Add($lock)
+        }
+    }
+
+    $candidateLocks = @{}
+    foreach ($definition in @(
+            [pscustomobject]@{
+                Key = 'workflow'
+                Path = '.github/workflows/portable-semantic.yml'
+                MaximumBytes = 1048576L
+            },
+            [pscustomobject]@{
+                Key = 'cargo_lock'
+                Path = 'Cargo.lock'
+                MaximumBytes = 16777216L
+            },
+            [pscustomobject]@{
+                Key = 'rust_toolchain'
+                Path = 'rust-toolchain.toml'
+                MaximumBytes = 1048576L
+            })) {
+        $key = "candidate:$([string]$definition.Path)"
+        if (-not $FileLocks.Contains($key)) {
+            $path = Resolve-SteinSourceEvidenceCommandPath `
+                -Root $RepositoryRoot `
+                -RelativePath ([string]$definition.Path) `
+                -Kind Leaf
+            $lock = Open-SteinSourceEvidenceCommandFile `
+                -Path $path `
+                -MaximumBytes ([long]$definition.MaximumBytes)
+            $FileLocks[$key] = $lock
+            $Locks.Add($lock)
+        }
+        $candidateLocks[[string]$definition.Key] = $FileLocks[$key]
+    }
+
+    $fixtureLock = $FileLocks[
+        'portable-runner-attestation/portable-fixture.json']
+    $bundleLock = $FileLocks[
+        'portable-runner-attestation/portable-fixture.attestation.json']
+    $fixture = Read-SteinSourceEvidenceCommandLockedJsonValue `
+        -Lock $fixtureLock
+    $bundle = Read-SteinSourceEvidenceCommandLockedJsonValue `
+        -Lock $bundleLock
+    Assert-SteinPortableExactProperties `
+        -Value $bundle `
+        -Expected @('mediaType', 'verificationMaterial', 'dsseEnvelope') `
+        -FailureCode 'portable_attestation_bundle_invalid'
+    if ([string]$bundle.mediaType -cne
+            'application/vnd.dev.sigstore.bundle.v0.3+json' -or
+        $null -eq $bundle.verificationMaterial -or
+        $null -eq $bundle.dsseEnvelope -or
+        [string]$bundle.dsseEnvelope.payloadType -cne
+            'application/vnd.in-toto+json' -or
+        @($bundle.dsseEnvelope.signatures).Count -lt 1) {
+        throw "The portable-attestation bundle is invalid."
+    }
+    $validatedFixture = Assert-SteinPortableFixture `
+        -Fixture $fixture `
+        -ExpectedCommit $ExpectedCommit `
+        -ExpectedTree $ExpectedTree `
+        -ExpectedWorkflowSha256 ([string]$candidateLocks['workflow'].Sha256) `
+        -ExpectedCargoLockSha256 ([string]$candidateLocks['cargo_lock'].Sha256) `
+        -ExpectedRustToolchainSha256 `
+            ([string]$candidateLocks['rust_toolchain'].Sha256)
+
+    foreach ($artifact in @($validatedFixture.Artifacts)) {
+        $relative = "portable-runner-attestation/$([string]$artifact.Path)"
+        $lock = $FileLocks[$relative]
+        if ($null -eq $lock -or [long]$lock.Size -ne [long]$artifact.Size -or
+            [string]$lock.Sha256 -cne [string]$artifact.Sha256) {
+            throw "A portable-attestation subcheck log binding is invalid."
+        }
+    }
+    $expectedText = [ordered]@{
+        'cargo.txt' = "$([string]$fixture.toolchain.cargo_version)`n"
+        'clean-after.txt' = "true`n"
+        'clean-before.txt' = "true`n"
+        'portable_check.exit' = "0`n"
+        'portable_clippy.exit' = "0`n"
+        'portable_full_suite.exit' = "0`n"
+        'repository-commit.txt' = "$ExpectedCommit`n"
+        'repository-tree.txt' = "$ExpectedTree`n"
+        'rust_format.exit' = "0`n"
+        'rustc.txt' = [string]$fixture.toolchain.rustc_verbose
+        'semantic_full_loop.exit' = "0`n"
+        'semantic_outbox_recovery.exit' = "0`n"
+        'semantic_restart_recovery.exit' = "0`n"
+    }
+    foreach ($entry in $expectedText.GetEnumerator()) {
+        $relative = "portable-runner-attestation/$([string]$entry.Key)"
+        $actual = Read-SteinSourceEvidenceCommandLockedUtf8Text `
+            -Lock $FileLocks[$relative]
+        if ([string]$actual -cne [string]$entry.Value) {
+            throw "A portable-attestation companion file is invalid."
+        }
+    }
+
+    $receiptArtifacts = @($Receipt.artifacts)
+    if ($receiptArtifacts.Count -ne 2 -or
+        [long]$receiptArtifacts[0].size -ne [long]$fixtureLock.Size -or
+        [string]$receiptArtifacts[0].sha256 -cne [string]$fixtureLock.Sha256 -or
+        [long]$receiptArtifacts[1].size -ne [long]$bundleLock.Size -or
+        [string]$receiptArtifacts[1].sha256 -cne [string]$bundleLock.Sha256) {
+        throw "The portable-attestation receipt artifacts are invalid."
+    }
+    if ([string]$Receipt.status -ceq 'pass') {
+        if ([string]$Receipt.execution.stdout.path -cne
+                'source-command-logs/portable-runner-attestation.stdout.txt') {
+            throw "The portable-attestation verification output is invalid."
+        }
+        $verificationLock = $FileLocks[
+            'source-command-logs/portable-runner-attestation.stdout.txt']
+        $null = Assert-SteinPortableVerificationJsonDocument `
+            -Text (Read-SteinSourceEvidenceCommandLockedUtf8Text `
+                -Lock $verificationLock)
+        $verification = Read-SteinSourceEvidenceCommandLockedJsonValue `
+            -Lock $verificationLock
+        $verified = Assert-SteinPortableAttestationVerification `
+            -VerificationResults @($verification) `
+            -ExpectedCommit $ExpectedCommit `
+            -ExpectedSourceRef $ExpectedSourceRef `
+            -ExpectedSubjectSha256 ([string]$fixtureLock.Sha256)
+        if ($validatedFixture.GeneratedAt -gt
+                $verified.EarliestVerifiedTimestamp -or
+            ($verified.LatestVerifiedTimestamp -
+                $validatedFixture.GeneratedAt).TotalMinutes -gt 30) {
+            throw "The portable-attestation chronology is invalid."
+        }
+    }
+    $closedRoot = Assert-SteinSourceEvidencePortableAttestationDirectory `
+        -EvidenceRoot $EvidenceRoot
+    if (-not [string]::Equals(
+            $closedRoot,
+            $portableRoot,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The portable-attestation directory changed during validation."
+    }
+    return $true
 }
 
 function Get-SteinSourceEvidenceCommandExecutionId {
@@ -1988,6 +2440,9 @@ function Assert-SteinSourceEvidenceCommandReceiptIndex {
         [Parameter(Mandatory = $true)]
         [ValidatePattern('^(?:[0-9a-f]{40}|[0-9a-f]{64})$')]
         [string] $CandidateTree,
+        [Parameter(Mandatory = $true)][string] $PortableSourceRef,
+        [Parameter(Mandatory = $true)][string] $ReportStartedAt,
+        [Parameter(Mandatory = $true)][string] $ReportCompletedAt,
         [Parameter(Mandatory = $true)][string] $RunnerPath,
         [Parameter(Mandatory = $true)]
         [Collections.IDictionary] $ToolExecutables,
@@ -1997,6 +2452,29 @@ function Assert-SteinSourceEvidenceCommandReceiptIndex {
 
     $validatedContract = Assert-SteinSourceEvidenceCommandRegistry `
         -Registry $RegistryRead.Registry
+    if (-not (Test-SteinSourceEvidenceCommandPortableSourceRef `
+            -Value $PortableSourceRef)) {
+        throw "The portable source ref is invalid."
+    }
+    foreach ($functionName in @(
+            'Assert-SteinPortableSourceRef',
+            'Assert-SteinPortableVerificationJsonDocument',
+            'Assert-SteinPortableAttestationVerification',
+            'Assert-SteinPortableFixture',
+            'Assert-SteinPortableExactProperties')) {
+        if (@(Get-Command -Name $functionName -CommandType Function `
+                    -ErrorAction Stop).Count -ne 1) {
+            throw "The portable-attestation contract is unavailable."
+        }
+    }
+    $null = Assert-SteinPortableSourceRef -SourceRef $PortableSourceRef
+    $reportStarted = ConvertFrom-SteinSourceEvidenceCommandTimestamp `
+        -Value $ReportStartedAt
+    $reportCompleted = ConvertFrom-SteinSourceEvidenceCommandTimestamp `
+        -Value $ReportCompletedAt
+    if ($reportCompleted -lt $reportStarted) {
+        throw "The source report interval is invalid."
+    }
     $expectedRegistryPath = [IO.Path]::GetFullPath((Join-Path `
                 ([IO.Path]::GetFullPath($RepositoryRoot)) `
                 'scripts\windows\phase2\Source-Command-Registry.json'))
@@ -2015,8 +2493,8 @@ function Assert-SteinSourceEvidenceCommandReceiptIndex {
         [string]$RegistryRead.Sha256 -cnotmatch '^[0-9a-f]{64}$' -or
         [string]$RegistryRead.Sha256 -cne
             (Get-SteinSourceEvidenceSha256 -Path $expectedRegistryPath) -or
-        @($validatedContract.ExecutedChecks).Count -ne 37 -or
-        [long]$validatedContract.ExecutionGroupCount -ne 25) {
+        @($validatedContract.ExecutedChecks).Count -ne 38 -or
+        [long]$validatedContract.ExecutionGroupCount -ne 26) {
         throw "The source-command validation binding is invalid."
     }
     if ($ExpectedCandidateManifestSha256.Length -gt 0 -and
@@ -2130,10 +2608,10 @@ function Assert-SteinSourceEvidenceCommandReceiptIndex {
                 'stein.phase2.source-command-registry.v1' -or
             -not (Test-SteinSourceEvidenceInteger `
                 -Value $index.executed_check_count) -or
-            [long]$index.executed_check_count -ne 37 -or
+            [long]$index.executed_check_count -ne 38 -or
             -not (Test-SteinSourceEvidenceInteger `
                 -Value $index.execution_group_count) -or
-            [long]$index.execution_group_count -ne 25) {
+            [long]$index.execution_group_count -ne 26) {
             throw "The source-command receipt index identity is invalid."
         }
 
@@ -2187,7 +2665,7 @@ function Assert-SteinSourceEvidenceCommandReceiptIndex {
         $actualReceiptEntries = @(
             Get-ChildItem -LiteralPath $receiptDirectory -Force `
                 -ErrorAction Stop)
-        if ($actualReceiptEntries.Count -ne 38 -or
+        if ($actualReceiptEntries.Count -ne 39 -or
             @($actualReceiptEntries | Where-Object {
                     $_.PSIsContainer -or
                     (($_.Attributes -band
@@ -2210,8 +2688,8 @@ function Assert-SteinSourceEvidenceCommandReceiptIndex {
 
         $descriptors = @($index.receipts)
         $executedChecks = @($validatedContract.ExecutedChecks)
-        if ($descriptors.Count -ne 37 -or
-            $executedChecks.Count -ne 37) {
+        if ($descriptors.Count -ne 38 -or
+            $executedChecks.Count -ne 38) {
             throw "The source-command receipt descriptor coverage is invalid."
         }
         $expectedLogPaths = [Collections.Generic.HashSet[string]]::new(
@@ -2328,7 +2806,7 @@ function Assert-SteinSourceEvidenceCommandReceiptIndex {
                         -Check $check) -or
                 -not (Test-SteinSourceEvidenceInteger `
                     -Value $bindings.execution_group_count) -or
-                [long]$bindings.execution_group_count -ne 25) {
+                [long]$bindings.execution_group_count -ne 26) {
                 throw "A source-command receipt binding is invalid."
             }
 
@@ -2344,7 +2822,9 @@ function Assert-SteinSourceEvidenceCommandReceiptIndex {
             $expanded = Expand-SteinSourceEvidenceCommandDefinition `
                 -Check $check `
                 -RepositoryRoot $repositoryPath `
-                -EvidenceRoot $evidencePath
+                -EvidenceRoot $evidencePath `
+                -CandidateCommit $CandidateCommit `
+                -PortableSourceRef $PortableSourceRef
             $receiptArguments = @($command.arguments)
             $expectedArguments = @($expanded.NormalizedArguments)
             if ($receiptArguments.Count -ne $expectedArguments.Count) {
@@ -2414,6 +2894,7 @@ function Assert-SteinSourceEvidenceCommandReceiptIndex {
                 pnpm = 'pnpm.cmd'
                 windows_powershell = 'powershell.exe'
                 pwsh = 'pwsh.exe'
+                gh = 'gh.exe'
             }
             $tool = $toolLocks[$role]
             if ([string]$command.executable_name -cne
@@ -2424,6 +2905,20 @@ function Assert-SteinSourceEvidenceCommandReceiptIndex {
                 [string]$command.executable_sha256 -cne
                     [string]$tool.Sha256) {
                 throw "A source-command executable descriptor is invalid."
+            }
+            if ($role -ceq 'gh') {
+                $signature =
+                    Microsoft.PowerShell.Security\Get-AuthenticodeSignature `
+                        -LiteralPath ([string]$tool.Path) `
+                        -ErrorAction Stop
+                $expectedSubject =
+                    'CN="GitHub, Inc.", O="GitHub, Inc.", L=San Francisco, S=California, C=US'
+                if ([string]$signature.Status -cne 'Valid' -or
+                    $null -eq $signature.SignerCertificate -or
+                    [string]$signature.SignerCertificate.Subject -cne
+                        $expectedSubject) {
+                    throw "The gh source-command executable publisher is invalid."
+                }
             }
 
             Assert-SteinSourceEvidenceExactProperties `
@@ -2462,6 +2957,8 @@ function Assert-SteinSourceEvidenceCommandReceiptIndex {
             $completed = ConvertFrom-SteinSourceEvidenceCommandTimestamp `
                 -Value $execution.completed_at
             if ($completed -lt $started -or
+                $started -lt $reportStarted -or
+                $completed -gt $reportCompleted -or
                 [long]$execution.duration_ms -ne
                     [long]($completed - $started).TotalMilliseconds) {
                 throw "A source-command execution duration is invalid."
@@ -2469,6 +2966,11 @@ function Assert-SteinSourceEvidenceCommandReceiptIndex {
             $failureCodes = @(
                 'timeout', 'cancelled', 'log_limit_exceeded', 'launch_failed',
                 'nonzero_exit', 'candidate_changed', 'group_output_invalid')
+            if ($id -ceq 'portable-runner-attestation') {
+                $failureCodes += @(
+                    'portable_attestation_input_changed',
+                    'portable_attestation_verification_invalid')
+            }
             if ([string]$receipt.status -ceq 'pass') {
                 if ([long]$execution.exit_code -ne 0 -or
                     $null -ne $execution.failure_code) {
@@ -2530,62 +3032,75 @@ function Assert-SteinSourceEvidenceCommandReceiptIndex {
             }
 
             $artifacts = @($receipt.artifacts)
-            if ($category -ceq 'direct_execution') {
-                if ($artifacts.Count -ne 0) {
-                    throw "A direct source-command receipt has unexpected artifacts."
-                }
+            $expectedArtifactRoles = @()
+            $expectedArtifactPaths = @()
+            if ($id -ceq 'portable-runner-attestation') {
+                $expectedArtifactRoles = @(
+                    'portable_fixture_subject', 'portable_sigstore_bundle')
+                $expectedArtifactPaths = @(
+                    'portable-runner-attestation/portable-fixture.json',
+                    'portable-runner-attestation/portable-fixture.attestation.json')
             }
-            elseif ([string]$receipt.status -ceq 'pass') {
-                if ($artifacts.Count -ne 2) {
-                    throw "A grouped source-command receipt is missing artifacts."
-                }
+            elseif ($category -ceq 'grouped_fixture_execution' -and
+                [string]$receipt.status -ceq 'pass') {
                 $expectedArtifactRoles = @(
                     'source_fixture_suite_index', 'source_fixture_receipt')
                 $expectedArtifactPaths = @(
                     'source-fixtures/index.json',
                     [string]$check.fixture_receipt_path)
-                for ($artifactIndex = 0;
-                    $artifactIndex -lt 2;
-                    $artifactIndex++) {
-                    $artifact = $artifacts[$artifactIndex]
-                    Assert-SteinSourceEvidenceExactProperties `
-                        -Value $artifact `
-                        -Expected @('role', 'size', 'sha256') `
-                        -FailureMessage "A grouped source-command artifact is invalid."
-                    if ($artifact.role -isnot [string] -or
-                        [string]$artifact.role -cne
-                            $expectedArtifactRoles[$artifactIndex] -or
-                        -not (Test-SteinSourceEvidenceInteger `
-                            -Value $artifact.size) -or
-                        [long]$artifact.size -lt 1 -or
-                        [long]$artifact.size -gt 4194304 -or
-                        $artifact.sha256 -isnot [string] -or
-                        [string]$artifact.sha256 -cnotmatch '^[0-9a-f]{64}$') {
-                        throw "A grouped source-command artifact is invalid."
-                    }
-                    $artifactRelative = $expectedArtifactPaths[$artifactIndex]
-                    if (-not $fileLocks.ContainsKey($artifactRelative)) {
-                        $artifactPath = Resolve-SteinSourceEvidenceCommandPath `
-                            -Root $evidencePath `
-                            -RelativePath $artifactRelative `
-                            -Kind Leaf
-                        $artifactLock = Open-SteinSourceEvidenceCommandFile `
-                            -Path $artifactPath `
-                            -MaximumBytes 4194304
-                        $fileLocks[$artifactRelative] = $artifactLock
-                        $locks.Add($artifactLock)
-                    }
-                    $capturedArtifact = $fileLocks[$artifactRelative]
-                    if ([long]$artifact.size -ne
-                            [long]$capturedArtifact.Size -or
-                        [string]$artifact.sha256 -cne
-                            [string]$capturedArtifact.Sha256) {
-                        throw "A grouped artifact descriptor does not match its file."
-                    }
+            }
+            if ($artifacts.Count -ne $expectedArtifactRoles.Count) {
+                throw "A source-command receipt artifact set is invalid."
+            }
+            for ($artifactIndex = 0;
+                $artifactIndex -lt $expectedArtifactRoles.Count;
+                $artifactIndex++) {
+                $artifact = $artifacts[$artifactIndex]
+                Assert-SteinSourceEvidenceExactProperties `
+                    -Value $artifact `
+                    -Expected @('role', 'size', 'sha256') `
+                    -FailureMessage "A source-command artifact is invalid."
+                if ($artifact.role -isnot [string] -or
+                    [string]$artifact.role -cne
+                        $expectedArtifactRoles[$artifactIndex] -or
+                    -not (Test-SteinSourceEvidenceInteger `
+                        -Value $artifact.size) -or
+                    [long]$artifact.size -lt 1 -or
+                    [long]$artifact.size -gt 4194304 -or
+                    $artifact.sha256 -isnot [string] -or
+                    [string]$artifact.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+                    throw "A source-command artifact is invalid."
+                }
+                $artifactRelative = $expectedArtifactPaths[$artifactIndex]
+                if (-not $fileLocks.ContainsKey($artifactRelative)) {
+                    $artifactPath = Resolve-SteinSourceEvidenceCommandPath `
+                        -Root $evidencePath `
+                        -RelativePath $artifactRelative `
+                        -Kind Leaf
+                    $artifactLock = Open-SteinSourceEvidenceCommandFile `
+                        -Path $artifactPath `
+                        -MaximumBytes 4194304
+                    $fileLocks[$artifactRelative] = $artifactLock
+                    $locks.Add($artifactLock)
+                }
+                $capturedArtifact = $fileLocks[$artifactRelative]
+                if ([long]$artifact.size -ne
+                        [long]$capturedArtifact.Size -or
+                    [string]$artifact.sha256 -cne
+                        [string]$capturedArtifact.Sha256) {
+                    throw "A source-command artifact descriptor does not match its file."
                 }
             }
-            elseif ($artifacts.Count -ne 0) {
-                throw "A failed grouped source-command receipt has artifacts."
+            if ($id -ceq 'portable-runner-attestation') {
+                $null = Assert-SteinSourceEvidencePortableAttestationReceipt `
+                    -RepositoryRoot $repositoryPath `
+                    -EvidenceRoot $evidencePath `
+                    -ExpectedCommit $CandidateCommit `
+                    -ExpectedTree $CandidateTree `
+                    -ExpectedSourceRef $PortableSourceRef `
+                    -Receipt $receipt `
+                    -FileLocks $fileLocks `
+                    -Locks $locks
             }
 
             if ($category -ceq 'grouped_fixture_execution') {
@@ -2614,13 +3129,13 @@ function Assert-SteinSourceEvidenceCommandReceiptIndex {
                 })
         }
 
-        if ($executionGroups.Count -ne 25 -or
-            $expectedLogPaths.Count -ne 50) {
+        if ($executionGroups.Count -ne 26 -or
+            $expectedLogPaths.Count -ne 52) {
             throw "The source-command execution coverage is invalid."
         }
         $actualLogs = @(Get-ChildItem -LiteralPath $logDirectory -Force `
                 -ErrorAction Stop)
-        if ($actualLogs.Count -ne 50 -or
+        if ($actualLogs.Count -ne 52 -or
             @($actualLogs | Where-Object {
                     $_.PSIsContainer -or
                     (($_.Attributes -band
@@ -2650,8 +3165,8 @@ function Assert-SteinSourceEvidenceCommandReceiptIndex {
             CandidateManifestSha256 =
                 [string]$common.candidate_manifest_sha256
             EvidenceRootSha256 = [string]$common.evidence_root_sha256
-            ExecutedCheckCount = 37
-            ExecutionGroupCount = 25
+            ExecutedCheckCount = 38
+            ExecutionGroupCount = 26
             Receipts = $receiptRecords.ToArray()
             Locks = $locks.ToArray()
         }

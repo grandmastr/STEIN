@@ -156,12 +156,12 @@ does not substitute the operator's mutable checkout for that signer-grounded
 candidate.
 
 The frozen source-command registry (`SHA-256
-9a1bb265a11a3b7ca18d1e8b67a2b1c47f9cb090910a458ca3d41fb221b50cbc`)
-also fixes every row category and, for the 37 executed rows, the executable
+8263b2c63295dae6fbd05940639fc8b23bde77263833d4d5af5f249cd4d7865e`)
+also fixes every row category and, for the 38 executed rows, the executable
 role, ordered argument vector, working directory, environment profile, timeout,
 and execution group. Packaging independently
-validates and rehashes the resulting 37 per-check receipts, 25 execution groups,
-and 50 unique bounded logs before the signed binding can select the report. It
+validates and rehashes the resulting 38 per-check receipts, 26 execution groups,
+and 52 unique bounded logs before the signed binding can select the report. It
 also recomputes the receipt candidate manifest from the locked candidate's
 canonical Git tree records (`UTF-8 path length:path|mode|blob object ID`). The
 runner separately locks every worktree file and permits only exact blob bytes or
@@ -172,8 +172,8 @@ The command index and every receipt bind the source report's exact
 Git-for-Windows launcher and resolved payload SHA-256 values; packaging rejects
 any divergent Git identity before signing.
 
-The source contract has 44 checks: 39 required `pass` and five exact frozen
-`not_run`, with twenty-one generator files. This is deliberately not a hermetic
+The source contract has 44 checks: 40 required `pass` and four exact frozen
+`not_run`, with twenty-three generator files. This is deliberately not a hermetic
 native-toolchain claim. The selected
 VS/MSVC compiler, linker, assembler, librarian and library catalogs, Windows
 SDK resource/libraries, and MakeAppx/SignTool payloads are not yet represented
@@ -183,16 +183,25 @@ files and integrity digests. `source-report-command-provenance` is now a require
 pass derived from the closed registry and receipt set. The independent
 `native-toolchain-provenance` and `pinned-clean-build-environment` receipts
 remain explicit P2-BUILD NOT RUN obligations. This slice cannot promote
-P2-BUILD until dedicated closed receipts satisfy those obligations. The source
-contract can also carry other
-named NOT RUN rows, including `portable-runner-attestation`; accepting their
-exact presence for signing never promotes the gate to which they belong.
-The portable workflow can now create a GitHub/Sigstore bundle only from a
+P2-BUILD until dedicated closed receipts satisfy those obligations. The
+remaining named NOT RUN rows are exact retained obligations; accepting their
+presence for signing never promotes the gates to which they belong. The
+`portable-runner-attestation` row is instead a required pass. The portable
+workflow can create a GitHub/Sigstore bundle only from a
 manually dispatched exact candidate ref, after a separate write-scoped job
 revalidates the successful read-only fixture artifact. Packaging must continue
-to reject promotion until the source report contains a passing, independently
-verified `portable-runner-attestation` binding for that exact fixture and bundle;
+to reject promotion unless the source report contains a passing, independently
+verified `portable-runner-attestation` binding for that exact fixture and bundle,
+including the closed ordered 22-file manifest, verified certificate identity,
+source ref/commit, subject digest, and workflow generator hash. The external
+bundle follows the candidate commit and is never a checked-in fixed-point input;
 the workflow's bundle file or upload result is not a packaging trust shortcut.
+The signer therefore requires a GitHub-signed `gh.exe` and independently replays
+the same offline verification policy before it can select the source report. It
+locks those exact executable bytes before publisher validation and retains the
+handle through the replay and semantic result checks. This uses the host's
+Windows Authenticode chain plus the exact GitHub subject and code-signing EKU;
+it is not an out-of-band root or SPKI pin.
 
 Every new MSIX, companion, and identity record is built and verified at an
 explicit sibling temporary path. Existing final artifacts are left untouched

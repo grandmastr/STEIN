@@ -327,6 +327,7 @@ function New-SteinReviewTestSourceChecks {
         [Parameter(Mandatory = $true)][string] $SourceProvenanceSha256,
         [Parameter(Mandatory = $true)][Collections.IDictionary] $SourceFixtureByCheck,
         [Parameter(Mandatory = $true)] $SourceFixtureSuite,
+        [Parameter(Mandatory = $true)] $PortableAttestation,
         [switch] $OmitMandatorySourceCheck,
         [switch] $CommandProvenanceNotRun,
         [string] $PromoteFrozenSourceCheckId
@@ -355,7 +356,9 @@ function New-SteinReviewTestSourceChecks {
         $category = [string]$definition.category
         $arguments = @(Get-SteinPhase2SourceCommandExpectedArguments `
                 -RegistryCheck $definition `
-                -EvidenceRootRelative $EvidenceRootRelative)
+                -EvidenceRootRelative $EvidenceRootRelative `
+                -CandidateCommit $CandidateCommit `
+                -PortableSourceRef ([string]$PortableAttestation.source_ref))
         $tool = switch ([string]$definition.executable_role) {
             "cargo" {
                 [ordered]@{
@@ -383,6 +386,13 @@ function New-SteinReviewTestSourceChecks {
                     name = "pwsh.exe"
                     size = 12288L
                     sha256 = [string]$SourceProvenance.toolchain.pwsh.executable_sha256
+                }
+            }
+            "gh" {
+                [ordered]@{
+                    name = "gh.exe"
+                    size = 16384L
+                    sha256 = "b" * 64
                 }
             }
             default { throw "The synthetic source-command role is invalid." }
@@ -485,6 +495,19 @@ function New-SteinReviewTestSourceChecks {
                     sha256 = [string]$fixtureReceiptArtifact.sha256
                 })
         }
+        elseif ($id -ceq "portable-runner-attestation") {
+            $fixtureArtifacts = @(
+                [ordered]@{
+                    role = "portable_fixture_subject"
+                    size = [long]$PortableAttestation.subject.size
+                    sha256 = [string]$PortableAttestation.subject.sha256
+                },
+                [ordered]@{
+                    role = "portable_sigstore_bundle"
+                    size = [long]$PortableAttestation.bundle.size
+                    sha256 = [string]$PortableAttestation.bundle.sha256
+                })
+        }
         $receipt = [ordered]@{
             schema_version = 1
             claim = "closed_source_command_execution_only"
@@ -505,7 +528,7 @@ function New-SteinReviewTestSourceChecks {
                 evidence_root_sha256 = $evidenceRootSha256
                 check_definition_sha256 =
                     Get-SteinPhase2EvidenceObjectSha256 -Value $definition
-                execution_group_count = 25L
+                execution_group_count = 26L
             }
             command = $command
             execution = $execution
@@ -555,10 +578,13 @@ function New-SteinReviewTestSourceChecks {
             $record.source_fixture_receipt_artifact = $fixtureReceiptArtifact
             $record.source_fixture_suite_index = $fixtureIndexArtifact
         }
+        elseif ($id -ceq "portable-runner-attestation") {
+            $record.portable_attestation = $PortableAttestation
+        }
         $recordsById[$id] = $record
     }
 
-    if ($receiptDescriptors.Count -ne 37) {
+    if ($receiptDescriptors.Count -ne 38) {
         throw "The synthetic source-command receipt set is incomplete."
     }
     $index = [ordered]@{
@@ -578,8 +604,8 @@ function New-SteinReviewTestSourceChecks {
             runner_sha256 = $RunnerSha256
             evidence_root_sha256 = $evidenceRootSha256
         }
-        executed_check_count = 37L
-        execution_group_count = 25L
+        executed_check_count = 38L
+        execution_group_count = 26L
         receipts = @($receiptDescriptors | ForEach-Object { $_ })
     }
     $indexJson = $index | ConvertTo-Json -Depth 32 -Compress
@@ -598,8 +624,8 @@ function New-SteinReviewTestSourceChecks {
             derivation = "exact_registry_and_receipt_coverage"
             registry_sha256 = $RegistrySha256
             runner_sha256 = $RunnerSha256
-            executed_check_count = 37L
-            execution_group_count = 25L
+            executed_check_count = 38L
+            execution_group_count = 26L
             source_command_receipt_index = $index
             source_command_receipt_index_artifact = [ordered]@{
                 path = "source-command-receipts/index.json"
@@ -614,7 +640,6 @@ function New-SteinReviewTestSourceChecks {
         "native-toolchain-provenance" = "Authenticated Rust/rustup/Git/VS/MSVC/Windows SDK/package-tool payload, runtime, sysroot, library, and linker provenance is not implemented."
         "no-leaks-producer-workflow" = "Candidate-owned installed artifact producer is not implemented."
         "pinned-clean-build-environment" = "Authenticated immutable candidate input and fresh dependency, build, and output isolation are not implemented for every source check."
-        "portable-runner-attestation" = "Authenticated GitHub artifact attestation tied to repository, workflow, commit, and artifact digest is not implemented."
         "windows-native-ignored-fixtures" = "Requires explicit native-fixture workflow support; interactive native fixtures remain unimplemented source evidence."
     }
     foreach ($id in $notRunReasons.Keys) {
@@ -663,6 +688,9 @@ function New-SteinReviewSyntheticFixture {
         [switch] $PinnedExecutionNotRun,
         [switch] $CommandProvenanceNotRun,
         [switch] $PortableAttestationNotRun,
+        [switch] $PortableFileOrderMismatch,
+        [switch] $PortableLinuxSubjectMismatch,
+        [switch] $PortableExtraFile,
         [switch] $MismatchedPackageBinding,
         [switch] $CorruptSourceFixtureReceipt,
         [switch] $CorruptSourceCommandReceipt,
@@ -989,6 +1017,205 @@ function New-SteinReviewSyntheticFixture {
     if ($sourceCommandRunnerGenerator.Count -ne 1) {
         throw "The synthetic source report has no exact command runner."
     }
+    $portableWorkflowGenerator = @($sourceGeneratorFiles | Where-Object {
+            [string]$_.path -ceq '.github/workflows/portable-semantic.yml'
+        })
+    if ($portableWorkflowGenerator.Count -ne 1) {
+        throw "The synthetic source report has no exact portable workflow."
+    }
+    $portableSourceRef = 'refs/heads/phase-2-completion'
+    $portableLeaf = 'p2-portable-fixture'
+    $portableLinuxArtifactId = 'portable-linux-result'
+    $portableLinuxLogRecords = @{}
+    $portableLinuxSubchecks = @(
+        foreach ($linuxSubcheckId in @(
+                $evidenceSpecification.gates_by_id['P2-PORTABLE-FIXTURE'].
+                    linux_artifact.required_subchecks)) {
+            $linuxLogArtifactId =
+                [string]$evidenceSpecification.gates_by_id[
+                    'P2-PORTABLE-FIXTURE'].linux_artifact.artifact_id_prefix +
+                [string]$linuxSubcheckId
+            $linuxLogPath = Join-Path `
+                $attachmentRoot `
+                "$portableLeaf-$linuxLogArtifactId.log"
+            [IO.File]::WriteAllText(
+                $linuxLogPath,
+                "synthetic portable log for $linuxSubcheckId`n",
+                [Text.UTF8Encoding]::new($false))
+            $linuxLogItem = Get-Item `
+                -LiteralPath $linuxLogPath `
+                -Force `
+                -ErrorAction Stop
+            $linuxLogHash = Get-SteinPhase2Sha256 -Path $linuxLogPath
+            $portableLinuxLogRecords[[string]$linuxSubcheckId] =
+                [pscustomobject]@{
+                    ArtifactId = $linuxLogArtifactId
+                    Path = $linuxLogPath
+                    Size = [long]$linuxLogItem.Length
+                    Sha256 = $linuxLogHash
+                }
+            [ordered]@{
+                id = [string]$linuxSubcheckId
+                command = "cargo synthetic $linuxSubcheckId"
+                exit_code = 0
+                result = 'pass'
+                artifact = [ordered]@{
+                    path = "logs/$linuxSubcheckId.log"
+                    size_bytes = [long]$linuxLogItem.Length
+                    sha256 = $linuxLogHash
+                }
+            }
+        })
+    $portableLinuxArtifactRecord = [ordered]@{
+        schema_version = 1
+        gate_id = 'P2-PORTABLE-FIXTURE'
+        fixture_id = 'phase2-portable-semantic-v1'
+        runner_id = 'github-actions-ubuntu-portable-v1'
+        result = 'pass'
+        generated_at = $recordedAt
+        repository = [ordered]@{
+            commit = $sourceCommit
+            tree = $sourceTree
+            clean_before = $true
+            clean_after = $true
+        }
+        toolchain = [ordered]@{
+            rustc_verbose = "rustc synthetic linux`n"
+            cargo_version = 'cargo synthetic'
+            rust_toolchain_sha256 = 'd' * 64
+            cargo_lock_sha256 = 'e' * 64
+        }
+        generator = [ordered]@{
+            workflow_path = '.github/workflows/portable-semantic.yml'
+            workflow_sha256 = [string]$portableWorkflowGenerator[0].sha256
+        }
+        subchecks = $portableLinuxSubchecks
+    }
+    $portableLinuxPath = Join-Path $attachmentRoot "$portableLeaf-linux.json"
+    $null = Write-SteinReviewTestJson `
+        -Path $portableLinuxPath `
+        -Value $portableLinuxArtifactRecord
+    $portableLinuxItem = Get-Item `
+        -LiteralPath $portableLinuxPath `
+        -Force `
+        -ErrorAction Stop
+    $portableLinuxHash = Get-SteinPhase2Sha256 -Path $portableLinuxPath
+
+    $portableFixedText = [ordered]@{
+        'portable-runner-attestation/cargo.txt' = "cargo synthetic`n"
+        'portable-runner-attestation/clean-after.txt' = "true`n"
+        'portable-runner-attestation/clean-before.txt' = "true`n"
+        'portable-runner-attestation/portable_check.exit' = "0`n"
+        'portable-runner-attestation/portable_clippy.exit' = "0`n"
+        'portable-runner-attestation/portable_full_suite.exit' = "0`n"
+        'portable-runner-attestation/repository-commit.txt' = "$sourceCommit`n"
+        'portable-runner-attestation/repository-tree.txt' = "$sourceTree`n"
+        'portable-runner-attestation/rust_format.exit' = "0`n"
+        'portable-runner-attestation/rustc.txt' = "rustc synthetic linux`n"
+        'portable-runner-attestation/semantic_full_loop.exit' = "0`n"
+        'portable-runner-attestation/semantic_outbox_recovery.exit' = "0`n"
+        'portable-runner-attestation/semantic_restart_recovery.exit' = "0`n"
+    }
+    $portableFiles = @(
+        foreach ($portablePath in @(
+                (Get-SteinPhase2PortableAttestationFileContract).Keys)) {
+            $portablePath = [string]$portablePath
+            $relativePath = $portablePath.Substring(
+                'portable-runner-attestation/'.Length)
+            if ($portablePath -ceq
+                'portable-runner-attestation/portable-fixture.json') {
+                [ordered]@{
+                    path = $portablePath
+                    size = [long]$portableLinuxItem.Length
+                    sha256 = $portableLinuxHash
+                }
+            }
+            elseif ($portablePath -ceq
+                'portable-runner-attestation/portable-fixture.attestation.json') {
+                [ordered]@{
+                    path = $portablePath
+                    size = 1L
+                    sha256 = '0' * 64
+                }
+            }
+            elseif ($relativePath.StartsWith(
+                    'logs/', [StringComparison]::Ordinal)) {
+                $subcheckId = [IO.Path]::GetFileNameWithoutExtension(
+                    $relativePath)
+                $log = $portableLinuxLogRecords[$subcheckId]
+                [ordered]@{
+                    path = $portablePath
+                    size = [long]$log.Size
+                    sha256 = [string]$log.Sha256
+                }
+            }
+            else {
+                $text = [string]$portableFixedText[$portablePath]
+                if ($null -eq $text) {
+                    throw "The synthetic portable file contract is incomplete."
+                }
+                [ordered]@{
+                    path = $portablePath
+                    size = [long][Text.UTF8Encoding]::new($false).
+                        GetByteCount($text)
+                    sha256 = Get-SteinPhase2EvidenceTextSha256 -Value $text
+                }
+            }
+        })
+    $portableVerifiedAt = $sourceReportBaseTime.AddTicks(1).ToString(
+        "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'",
+        [Globalization.CultureInfo]::InvariantCulture)
+    $portableAttestation = [ordered]@{
+        source_ref = $portableSourceRef
+        subject = [ordered]@{
+            path = 'portable-runner-attestation/portable-fixture.json'
+            size = [long]$portableLinuxItem.Length
+            sha256 = $portableLinuxHash
+        }
+        bundle = [ordered]@{
+            path =
+                'portable-runner-attestation/portable-fixture.attestation.json'
+            size = 1L
+            sha256 = '0' * 64
+            media_type = 'application/vnd.dev.sigstore.bundle.v0.3+json'
+        }
+        workflow_sha256 = [string]$portableWorkflowGenerator[0].sha256
+        run_invocation_uri =
+            'https://github.com/grandmastr/STEIN/actions/runs/1/attempts/1'
+        generated_at = $recordedAt
+        earliest_verified_at = $portableVerifiedAt
+        latest_verified_at = $portableVerifiedAt
+        verified_timestamp_count = 1L
+        files = $portableFiles
+        subchecks = @($portableLinuxSubchecks | ForEach-Object {
+                [ordered]@{
+                    id = [string]$_.id
+                    path = [string]$_.artifact.path
+                    size = [long]$_.artifact.size_bytes
+                    sha256 = [string]$_.artifact.sha256
+                }
+            })
+    }
+    if ($PortableFileOrderMismatch) {
+        $firstPortableFile = $portableAttestation.files[0]
+        $portableAttestation.files[0] = $portableAttestation.files[1]
+        $portableAttestation.files[1] = $firstPortableFile
+    }
+    if ($PortableLinuxSubjectMismatch) {
+        $portableAttestation.subject.sha256 = '1' * 64
+        @($portableAttestation.files | Where-Object {
+                [string]$_.path -ceq
+                    'portable-runner-attestation/portable-fixture.json'
+            })[0].sha256 = '1' * 64
+    }
+    if ($PortableExtraFile) {
+        $portableAttestation.files = @($portableAttestation.files) + @(
+            [ordered]@{
+                path = 'portable-runner-attestation/extra.txt'
+                size = 1L
+                sha256 = '2' * 64
+            })
+    }
     $sourceChecks = @(New-SteinReviewTestSourceChecks `
             -Registry $sourceCommandRegistry.value `
             -RegistrySha256 ([string]$sourceCommandRegistry.sha256) `
@@ -1001,9 +1228,26 @@ function New-SteinReviewSyntheticFixture {
             -SourceProvenanceSha256 $sourceProvenanceHash `
             -SourceFixtureByCheck $sourceFixtureByCheck `
             -SourceFixtureSuite $sourceFixtureSuite `
+            -PortableAttestation $portableAttestation `
             -OmitMandatorySourceCheck:$OmitMandatorySourceCheck `
             -CommandProvenanceNotRun:$CommandProvenanceNotRun `
             -PromoteFrozenSourceCheckId $PromoteFrozenSourceCheckId)
+    if ($PortableAttestationNotRun) {
+        for ($sourceCheckIndex = 0;
+                $sourceCheckIndex -lt $sourceChecks.Count;
+                $sourceCheckIndex++) {
+            if ([string]$sourceChecks[$sourceCheckIndex].id -ceq
+                'portable-runner-attestation') {
+                $sourceChecks[$sourceCheckIndex] = [ordered]@{
+                    id = 'portable-runner-attestation'
+                    status = 'not_run'
+                    reason =
+                        'Authenticated portable attestation was deliberately omitted by the negative fixture.'
+                }
+                break
+            }
+        }
+    }
     if ($CorruptSourceFixtureReceipt) {
         $corruptReceiptCheck = @($sourceChecks | Where-Object {
                 [string]$_.id -clike 'phase2-source-fixture-*'
@@ -1023,7 +1267,7 @@ function New-SteinReviewSyntheticFixture {
                 [string]$_.id -ceq "source-report-command-provenance"
             })[0]
         $corruptCommandProvenance.source_command_receipt_index.execution_group_count =
-            24L
+            25L
     }
     $sourceChecksHash = Get-SteinPhase2EvidenceTextSha256 `
         -Value ($sourceChecks | ConvertTo-Json -Depth 40 -Compress)
@@ -1142,95 +1386,45 @@ function New-SteinReviewSyntheticFixture {
         $linuxArtifactId = $null
         $linuxLogArtifactIds = @{}
         if ($gateId -ceq "P2-PORTABLE-FIXTURE") {
-            $linuxArtifactId = "portable-linux-result"
-            $linuxSubchecks = @(
-                foreach ($linuxSubcheckId in @($gateSpecification.linux_artifact.required_subchecks)) {
-                    $linuxLogArtifactId =
-                        [string]$gateSpecification.linux_artifact.artifact_id_prefix +
-                        [string]$linuxSubcheckId
-                    $linuxLogPath = Join-Path `
-                        $attachmentRoot `
-                        "$leaf-$linuxLogArtifactId.log"
-                    [IO.File]::WriteAllText(
-                        $linuxLogPath,
-                        "synthetic portable log for $linuxSubcheckId`n",
-                        [Text.UTF8Encoding]::new($false))
-                    $linuxLogItem = Get-Item `
-                        -LiteralPath $linuxLogPath `
-                        -Force `
-                        -ErrorAction Stop
-                    $linuxLogHash = Get-SteinPhase2Sha256 -Path $linuxLogPath
-                    $linuxLogArtifactIds[[string]$linuxSubcheckId] = $linuxLogArtifactId
-                    $artifactRecords.Add([ordered]@{
-                        artifact_id = $linuxLogArtifactId
-                        proof_class = "portable_linux"
-                        origin = "linux_ci"
-                        sha256 = $linuxLogHash
-                        size = [long]$linuxLogItem.Length
-                    })
-                    $artifactMappings.Add([ordered]@{
-                        artifact_id = $linuxLogArtifactId
-                        path = "attachments/$([IO.Path]::GetFileName($linuxLogPath))"
-                        sha256 = $linuxLogHash
-                        size = [long]$linuxLogItem.Length
-                    })
-                    [ordered]@{
-                        id = [string]$linuxSubcheckId
-                        command = "cargo synthetic $linuxSubcheckId"
-                        exit_code = 0
-                        result = "pass"
-                        artifact = [ordered]@{
-                            path = "logs/$linuxSubcheckId.log"
-                            size_bytes = [long]$linuxLogItem.Length
-                            sha256 = $linuxLogHash
-                        }
-                    }
+            $linuxArtifactId = $portableLinuxArtifactId
+            foreach ($linuxSubcheckId in @(
+                    $gateSpecification.linux_artifact.required_subchecks)) {
+                $linuxLog = $portableLinuxLogRecords[[string]$linuxSubcheckId]
+                $linuxLogArtifactId = [string]$linuxLog.ArtifactId
+                $linuxLogArtifactIds[[string]$linuxSubcheckId] =
+                    $linuxLogArtifactId
+                $artifactRecords.Add([ordered]@{
+                    artifact_id = $linuxLogArtifactId
+                    proof_class = "portable_linux"
+                    origin = "linux_ci"
+                    sha256 = [string]$linuxLog.Sha256
+                    size = [long]$linuxLog.Size
                 })
-            $linuxArtifactRecord = [ordered]@{
-                schema_version = 1
-                gate_id = "P2-PORTABLE-FIXTURE"
-                fixture_id = "phase2-portable-semantic-v1"
-                runner_id = "github-actions-ubuntu-portable-v1"
-                result = "pass"
-                generated_at = $recordedAt
-                repository = [ordered]@{
-                    commit = $sourceCommit
-                    tree = "c" * 40
-                    clean_before = $true
-                    clean_after = $true
-                }
-                toolchain = [ordered]@{
-                    rustc_verbose = "rustc synthetic linux"
-                    cargo_version = "cargo synthetic"
-                    rust_toolchain_sha256 = "d" * 64
-                    cargo_lock_sha256 = "e" * 64
-                }
-                generator = [ordered]@{
-                    workflow_path = ".github/workflows/portable-semantic.yml"
-                    workflow_sha256 = "f" * 64
-                }
-                subchecks = $linuxSubchecks
+                $artifactMappings.Add([ordered]@{
+                    artifact_id = $linuxLogArtifactId
+                    path = "attachments/$([IO.Path]::GetFileName(
+                            [string]$linuxLog.Path))"
+                    sha256 = [string]$linuxLog.Sha256
+                    size = [long]$linuxLog.Size
+                })
             }
-            $linuxPath = Join-Path $attachmentRoot "$leaf-linux.json"
-            $null = Write-SteinReviewTestJson -Path $linuxPath -Value $linuxArtifactRecord
-            $linuxItem = Get-Item -LiteralPath $linuxPath -Force -ErrorAction Stop
-            $linuxHash = Get-SteinPhase2Sha256 -Path $linuxPath
             $artifactRecords.Add([ordered]@{
                 artifact_id = $linuxArtifactId
                 proof_class = "portable_linux"
                 origin = "linux_ci"
-                sha256 = $linuxHash
-                size = [long]$linuxItem.Length
+                sha256 = $portableLinuxHash
+                size = [long]$portableLinuxItem.Length
             })
             $artifactMappings.Add([ordered]@{
                 artifact_id = $linuxArtifactId
-                path = "attachments/$([IO.Path]::GetFileName($linuxPath))"
-                sha256 = $linuxHash
-                size = [long]$linuxItem.Length
+                path = "attachments/$([IO.Path]::GetFileName(
+                        $portableLinuxPath))"
+                sha256 = $portableLinuxHash
+                size = [long]$portableLinuxItem.Length
             })
             $linuxBinding = [ordered]@{
                 artifact_id = $linuxArtifactId
-                sha256 = $linuxHash
+                sha256 = $portableLinuxHash
                 fixture_id = "phase2-portable-semantic-v1"
                 runner_id = "github-actions-ubuntu-portable-v1"
             }
@@ -2119,18 +2313,18 @@ try {
             [string]$_.source_command_receipt.execution.stdout.path
             [string]$_.source_command_receipt.execution.stderr.path
         } | Sort-Object -Unique)
-    if ([long]$baselineSourceReport.summary.pass -ne 39 -or
-        [long]$baselineSourceReport.summary.not_run -ne 5 -or
-        @($baselineSourceReport.integrity.generator.files).Count -ne 20 -or
-        $baselineCommandRows.Count -ne 37 -or
+    if ([long]$baselineSourceReport.summary.pass -ne 40 -or
+        [long]$baselineSourceReport.summary.not_run -ne 4 -or
+        @($baselineSourceReport.integrity.generator.files).Count -ne 23 -or
+        $baselineCommandRows.Count -ne 38 -or
         $baselineCommandProvenance.Count -ne 1 -or
         [string]$baselineCommandProvenance[0].status -cne "pass" -or
         [string]$baselineCommandProvenance[0].registry_sha256 -cne
             [string]$sourceCommandRegistry.sha256 -or
         @($baselineCommandProvenance[0].source_command_receipt_index.receipts).Count -ne
-            37 -or
-        $baselineExecutionGroups.Count -ne 25 -or
-        $baselineLogPaths.Count -ne 50) {
+            38 -or
+        $baselineExecutionGroups.Count -ne 26 -or
+        $baselineLogPaths.Count -ne 52) {
         throw "The synthetic source-command baseline is incomplete."
     }
     $frozenLedger = Invoke-SteinReviewTestCase `
@@ -2177,7 +2371,6 @@ try {
             "native-toolchain-provenance",
             "no-leaks-producer-workflow",
             "pinned-clean-build-environment",
-            "portable-runner-attestation",
             "windows-native-ignored-fixtures")) {
         $forgedFrozenPass = New-SteinReviewSyntheticFixture `
             -Root (Join-Path $testRoot ("forged-" + $frozenCheckId)) `
@@ -2187,6 +2380,38 @@ try {
             -ExpectedExitCode 1
         $cases.Add("frozen_$($frozenCheckId.Replace('-', '_'))_pass_rejected")
     }
+
+    $portableNotRun = New-SteinReviewSyntheticFixture `
+        -Root (Join-Path $testRoot 'portable-attestation-not-run') `
+        -PortableAttestationNotRun
+    $null = Invoke-SteinReviewTestCase `
+        -Fixture $portableNotRun `
+        -ExpectedExitCode 1
+    $cases.Add('portable_attestation_not_run_rejected')
+
+    $portableOrderMismatch = New-SteinReviewSyntheticFixture `
+        -Root (Join-Path $testRoot 'portable-file-order-mismatch') `
+        -PortableFileOrderMismatch
+    $null = Invoke-SteinReviewTestCase `
+        -Fixture $portableOrderMismatch `
+        -ExpectedExitCode 1
+    $cases.Add('portable_attestation_file_order_mismatch_rejected')
+
+    $portableSubjectMismatch = New-SteinReviewSyntheticFixture `
+        -Root (Join-Path $testRoot 'portable-linux-subject-mismatch') `
+        -PortableLinuxSubjectMismatch
+    $null = Invoke-SteinReviewTestCase `
+        -Fixture $portableSubjectMismatch `
+        -ExpectedExitCode 1
+    $cases.Add('portable_linux_subject_mismatch_rejected')
+
+    $portableExtraFile = New-SteinReviewSyntheticFixture `
+        -Root (Join-Path $testRoot 'portable-extra-file') `
+        -PortableExtraFile
+    $null = Invoke-SteinReviewTestCase `
+        -Fixture $portableExtraFile `
+        -ExpectedExitCode 1
+    $cases.Add('portable_attestation_extra_file_rejected')
 
     $missingCommandProvenance = New-SteinReviewSyntheticFixture `
         -Root (Join-Path $testRoot "missing-command-provenance") `
