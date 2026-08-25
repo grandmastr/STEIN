@@ -226,7 +226,7 @@ dependency closure and immutable isolated execution obligations remain exact
 source-backed gate. Native-only rows remain independently reviewable.
 
 The source-report contract fixes 44 exact checks—39 required `pass` rows and five
-exact frozen `not_run` rows—and twenty generator files. The frozen
+exact frozen `not_run` rows—and twenty-one generator files. The frozen
 source-command registry (`SHA-256
 9a1bb265a11a3b7ca18d1e8b67a2b1c47f9cb090910a458ca3d41fb221b50cbc`)
 defines every row category and, for the 37 executed rows, the executable role,
@@ -268,6 +268,16 @@ Until that real candidate-owned producer/check exists, the gate remains
 check remains `not_run` until an authenticated GitHub artifact attestation (or
 equivalent Sigstore bundle) binds the repository, workflow, candidate commit,
 and exact portable-artifact digest; self-declared runner JSON cannot promote it.
+The pull-request workflow deliberately remains read-only. Only a manually
+dispatched exact candidate ref enters the separate write-scoped attestation job,
+which revalidates the successful portable artifact before signing the canonical
+`portable-fixture.json` subject and retaining its offline bundle. Bundle
+generation alone is still insufficient: source verification must independently
+verify and bind that bundle before the retained source check may change to
+`pass`. Export the combined artifact into the candidate evidence root before
+its 30-day retention expires. This authenticates the GitHub-hosted run, not a
+hermetic environment: mutable `ubuntu-latest` and Rust `stable` inputs remain
+separate retained obligations.
 
 A screenshot never changes a result. Native `fail` or `blocked` results are
 reflected conservatively; a structurally valid native `pass` remains `not_run`

@@ -79,6 +79,7 @@
       "scripts/windows/phase2/Scan-NoLeaks.ps1",
       "scripts/windows/phase2/Scan-NoLeaks.cmd",
       "scripts/windows/phase2/Test-ScanNoLeaks.ps1",
+      ".github/workflows/portable-semantic.yml",
       "packaging/windows-msix/PackageTools.ps1"
     ]
   },

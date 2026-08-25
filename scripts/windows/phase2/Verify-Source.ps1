@@ -670,6 +670,7 @@ $generator = Get-SteinSourceEvidenceGenerator `
         (Join-Path $PSScriptRoot "Scan-NoLeaks.ps1"),
         (Join-Path $PSScriptRoot "Scan-NoLeaks.cmd"),
         (Join-Path $PSScriptRoot "Test-ScanNoLeaks.ps1"),
+        (Join-Path $repoRoot ".github\workflows\portable-semantic.yml"),
         (Join-Path $repoRoot "packaging\windows-msix\PackageTools.ps1")
     )
 foreach ($binding in $script:SteinSourceBootstrapBindings) {

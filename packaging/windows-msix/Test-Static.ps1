@@ -3099,7 +3099,7 @@ if ($null -eq $sourceEvidenceStatic -or
     -not [bool]$sourceEvidenceStatic.verified -or
     [int]$sourceEvidenceStatic.report_schema_version -ne 2 -or
     [int]$sourceEvidenceStatic.provenance_schema_version -ne 2 -or
-    [int]$sourceEvidenceStatic.generator_file_count -ne 20 -or
+    [int]$sourceEvidenceStatic.generator_file_count -ne 21 -or
     [int]$sourceEvidenceStatic.source_report_check_count -ne 44 -or
     [int]$sourceEvidenceStatic.source_report_required_pass_count -ne 39 -or
     [int]$sourceEvidenceStatic.source_report_allowed_not_run_count -ne 5 -or
@@ -3112,6 +3112,7 @@ if ($null -eq $sourceEvidenceStatic -or
     -not [bool]$sourceEvidenceStatic.source_command_tamper_contracts_bound -or
     -not [bool]$sourceEvidenceStatic.source_command_runner_library_bound -or
     -not [bool]$sourceEvidenceStatic.source_command_test_parsed -or
+    -not [bool]$sourceEvidenceStatic.portable_attestation_workflow_bound -or
     -not [bool]$sourceEvidenceStatic.gate_specific_source_mapping_bound -or
     -not [bool]$sourceEvidenceStatic.repository_state_content_free -or
     -not [bool]$sourceEvidenceStatic.generated_outputs_ignored -or

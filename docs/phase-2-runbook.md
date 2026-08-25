@@ -265,6 +265,25 @@ attestation or equivalent Sigstore bundle binds the repository, workflow,
 candidate commit, and portable-artifact digest. A self-declared schema-1 JSON
 and `runner_id` cannot promote the gate.
 
+The automatic pull-request job remains read-only and emits only the existing
+content-integrity artifact. To create an attestation candidate, an operator must
+manually dispatch `portable-semantic.yml` at the exact candidate branch. A
+separate write-scoped job checks out that exact SHA without persisted Git
+credentials, downloads only the successful read-only job artifact, revalidates
+its commit/tree, workflow digest, exact seven checks, and referenced log bytes,
+then signs only `portable-fixture.json` and retains the offline Sigstore bundle
+beside it. Producing that bundle does not itself promote the source row: the
+candidate-owned source verifier must still replay the cryptographic verification
+and bind the exact fixture, bundle, repository, workflow, event, source ref,
+commit, GitHub-hosted runner, and subject digest before
+`portable-runner-attestation` can pass.
+
+The combined attested artifact has a 30-day GitHub retention window. Export it
+into the candidate evidence root before expiry; a later missing bundle is not
+durable completion evidence. The attestation authenticates a GitHub-hosted run,
+but it does not satisfy the separate hermetic build obligations while
+`ubuntu-latest` and the Rust `stable` channel remain mutable inputs.
+
 For installed-only gates, the explicit trust boundary is a trusted independent
 reviewer who inspects the exact signed package, closed fixture receipts,
 underlying artifact hashes, and native semantics before promotion. The retained

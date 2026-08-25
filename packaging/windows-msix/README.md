@@ -173,7 +173,7 @@ Git-for-Windows launcher and resolved payload SHA-256 values; packaging rejects
 any divergent Git identity before signing.
 
 The source contract has 44 checks: 39 required `pass` and five exact frozen
-`not_run`, with twenty generator files. This is deliberately not a hermetic
+`not_run`, with twenty-one generator files. This is deliberately not a hermetic
 native-toolchain claim. The selected
 VS/MSVC compiler, linker, assembler, librarian and library catalogs, Windows
 SDK resource/libraries, and MakeAppx/SignTool payloads are not yet represented
@@ -187,6 +187,12 @@ P2-BUILD until dedicated closed receipts satisfy those obligations. The source
 contract can also carry other
 named NOT RUN rows, including `portable-runner-attestation`; accepting their
 exact presence for signing never promotes the gate to which they belong.
+The portable workflow can now create a GitHub/Sigstore bundle only from a
+manually dispatched exact candidate ref, after a separate write-scoped job
+revalidates the successful read-only fixture artifact. Packaging must continue
+to reject promotion until the source report contains a passing, independently
+verified `portable-runner-attestation` binding for that exact fixture and bundle;
+the workflow's bundle file or upload result is not a packaging trust shortcut.
 
 Every new MSIX, companion, and identity record is built and verified at an
 explicit sibling temporary path. Existing final artifacts are left untouched

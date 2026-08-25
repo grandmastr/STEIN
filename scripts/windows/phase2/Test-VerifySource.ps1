@@ -23,6 +23,7 @@ $sourceFixtureTestPath = Join-Path $PSScriptRoot "Test-SourceFixture.ps1"
 $noLeaksScannerPath = Join-Path $PSScriptRoot "Scan-NoLeaks.ps1"
 $noLeaksScannerLauncherPath = Join-Path $PSScriptRoot "Scan-NoLeaks.cmd"
 $noLeaksScannerTestPath = Join-Path $PSScriptRoot "Test-ScanNoLeaks.ps1"
+$portableWorkflowPath = Join-Path $repoRoot ".github\workflows\portable-semantic.yml"
 $packageToolsPath = Join-Path $repoRoot "packaging\windows-msix\PackageTools.ps1"
 foreach ($path in @(
         $helperPath,
@@ -43,6 +44,7 @@ foreach ($path in @(
         $noLeaksScannerPath,
         $noLeaksScannerLauncherPath,
         $noLeaksScannerTestPath,
+        $portableWorkflowPath,
         $packageToolsPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "The source-evidence verifier is incomplete."
@@ -85,6 +87,25 @@ function Write-SteinVerifySourceTestJson {
         $Path,
         ($Value | ConvertTo-Json -Depth 20),
         [Text.UTF8Encoding]::new($false))
+}
+
+function Get-SteinVerifySourceTestOrdinalOccurrenceCount {
+    param(
+        [Parameter(Mandatory = $true)][string] $Source,
+        [Parameter(Mandatory = $true)][string] $Value
+    )
+
+    $count = 0
+    $offset = 0
+    while ($offset -lt $Source.Length) {
+        $index = $Source.IndexOf($Value, $offset, [StringComparison]::Ordinal)
+        if ($index -lt 0) {
+            break
+        }
+        $count++
+        $offset = $index + $Value.Length
+    }
+    return [int]$count
 }
 
 function New-SteinVerifySourceCommandEvidenceFixture {
@@ -381,6 +402,7 @@ if (@($sourceCommandTestParseErrors).Count -ne 0 -or
 . $sourceCommandRunnerPath -LibraryOnly
 
 $verifySource = [IO.File]::ReadAllText($verifyPath)
+$portableWorkflowSource = [IO.File]::ReadAllText($portableWorkflowPath)
 foreach ($required in @(
         'Source-Evidence.ps1',
         'schema_version = 2',
@@ -480,6 +502,7 @@ $expectedGeneratorRelativePaths = @(
     "scripts/windows/phase2/Scan-NoLeaks.ps1",
     "scripts/windows/phase2/Scan-NoLeaks.cmd",
     "scripts/windows/phase2/Test-ScanNoLeaks.ps1",
+    ".github/workflows/portable-semantic.yml",
     "packaging/windows-msix/PackageTools.ps1"
 )
 if ($generatorRelativePaths.Count -ne $expectedGeneratorRelativePaths.Count -or
@@ -489,6 +512,167 @@ if ($generatorRelativePaths.Count -ne $expectedGeneratorRelativePaths.Count -or
         -CaseSensitive).Count -ne 0) {
     throw "Verify-Source.ps1 does not hash its exact source-evidence generator set."
 }
+
+$workflowHeaderPattern = '(?ms)\Aname: portable-semantic-fixture\r?\n\r?\non:\r?\n  pull_request:\r?\n    branches:\r?\n      - main\r?\n  workflow_dispatch:\r?\n\r?\npermissions:\r?\n  contents: read\r?\n\r?\nconcurrency:\r?\n  group: portable-semantic-\$\{\{ github\.ref \}\}\r?\n  cancel-in-progress: true\r?\n\r?\njobs:\r?\n'
+if (-not [regex]::IsMatch($portableWorkflowSource, $workflowHeaderPattern) -or
+    [regex]::IsMatch(
+        $portableWorkflowSource,
+        '(?m)^\s*pull_request_target\s*:') -or
+    [regex]::IsMatch(
+        $portableWorkflowSource,
+        '(?m)^\s*continue-on-error\s*:')) {
+    throw "The portable workflow trigger or fail-closed contract is invalid."
+}
+
+$portableBuildJobMatch = [regex]::Match(
+    $portableWorkflowSource,
+    '(?ms)^  portable-semantic-fixture:\r?\n(?<body>.*?)^  attest-portable-semantic-fixture:\r?\n')
+$portableAttestationJobMatch = [regex]::Match(
+    $portableWorkflowSource,
+    '(?ms)^  attest-portable-semantic-fixture:\r?\n(?<body>.*)\z')
+if (-not $portableBuildJobMatch.Success -or
+    -not $portableAttestationJobMatch.Success) {
+    throw "The portable workflow does not have its exact two-job boundary."
+}
+$portableBuildJobSource = $portableBuildJobMatch.Groups['body'].Value
+$portableAttestationJobSource = $portableAttestationJobMatch.Groups['body'].Value
+foreach ($forbidden in @(
+        'permissions:',
+        'id-token:',
+        'attestations:',
+        'actions/attest@')) {
+    if ($portableBuildJobSource.IndexOf(
+            $forbidden,
+            [StringComparison]::Ordinal) -ge 0) {
+        throw "The portable build job has signing authority."
+    }
+}
+$attestationJobPrefixPattern = '(?ms)\A    name: Attest portable semantic fixture\r?\n    if: github\.event_name == ''workflow_dispatch'' && github\.ref_type == ''branch''\r?\n    needs: portable-semantic-fixture\r?\n    runs-on: ubuntu-latest\r?\n    timeout-minutes: 10\r?\n    permissions:\r?\n      contents: read\r?\n      id-token: write\r?\n      attestations: write\r?\n    env:\r?\n      STEIN_CANDIDATE_COMMIT: \$\{\{ github\.sha \}\}\r?\n    steps:'
+if (-not [regex]::IsMatch(
+        $portableAttestationJobSource,
+        $attestationJobPrefixPattern) -or
+    $portableAttestationJobSource.IndexOf(
+        'github.event.pull_request',
+        [StringComparison]::Ordinal) -ge 0 -or
+    $portableAttestationJobSource.IndexOf(
+        'artifact-metadata:',
+        [StringComparison]::Ordinal) -ge 0 -or
+    $portableAttestationJobSource.IndexOf(
+        'actions: write',
+        [StringComparison]::Ordinal) -ge 0 -or
+    $portableAttestationJobSource.IndexOf(
+        'contents: write',
+        [StringComparison]::Ordinal) -ge 0) {
+    throw "The portable attestation job authority boundary is invalid."
+}
+
+$actualActionReferences = @(
+    [regex]::Matches(
+        $portableWorkflowSource,
+        '(?m)^\s+uses:\s+(?<reference>\S+)(?:\s+#.*)?$') |
+        ForEach-Object { [string]$_.Groups['reference'].Value })
+$expectedActionReferences = @(
+    'actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
+    'actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
+    'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+    'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093',
+    'actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6',
+    'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02')
+if ($actualActionReferences.Count -ne $expectedActionReferences.Count -or
+    @(Compare-Object `
+        -ReferenceObject ($expectedActionReferences | Sort-Object) `
+        -DifferenceObject ($actualActionReferences | Sort-Object) `
+        -CaseSensitive).Count -ne 0) {
+    throw "The portable workflow action references are not exactly immutable."
+}
+
+$portableWorkflowExactCounts = [ordered]@{
+    'persist-credentials: false' = 2
+    'if: always()' = 2
+    'if-no-files-found: error' = 2
+    'retention-days: 30' = 2
+    'expected_files="$(printf ''%s\n'' \' = 2
+    'actual_files="$(find ' = 2
+    'actual_directories="$(find ' = 2
+    '! -type f ! -type d -print -quit)' = 3
+    'test "$actual_directories" = ''logs''' = 2
+    'test "$GITHUB_EVENT_NAME" = ''workflow_dispatch''' = 1
+    'test "$GITHUB_REF_TYPE" = ''branch''' = 1
+    'test "$GITHUB_REF" = "refs/heads/$GITHUB_REF_NAME"' = 1
+    'subject-path: ${{ runner.temp }}/phase2-portable-semantic-v1/portable-fixture.json' = 1
+    'portable-fixture.attestation.json' = 2
+    'name: phase2-portable-attested-${{ env.STEIN_CANDIDATE_COMMIT }}' = 1
+    'test "$(stat -c ''%s'' "$retained_bundle")" -le 4194304' = 1
+    '-type f | wc -l)" -eq 22' = 1
+}
+foreach ($entry in $portableWorkflowExactCounts.GetEnumerator()) {
+    $actualCount = Get-SteinVerifySourceTestOrdinalOccurrenceCount `
+        -Source $portableWorkflowSource `
+        -Value ([string]$entry.Key)
+    if ($actualCount -ne [int]$entry.Value) {
+        throw "The portable workflow retained-evidence contract is not exact."
+    }
+}
+
+$expectedPortableClosureFiles = @(
+    'clean-after.txt',
+    'clean-before.txt',
+    'cargo.txt',
+    'logs/portable_check.log',
+    'logs/portable_clippy.log',
+    'logs/portable_full_suite.log',
+    'logs/rust_format.log',
+    'logs/semantic_full_loop.log',
+    'logs/semantic_outbox_recovery.log',
+    'logs/semantic_restart_recovery.log',
+    'portable-fixture.json',
+    'portable_check.exit',
+    'portable_clippy.exit',
+    'portable_full_suite.exit',
+    'repository-commit.txt',
+    'repository-tree.txt',
+    'rust_format.exit',
+    'rustc.txt',
+    'semantic_full_loop.exit',
+    'semantic_outbox_recovery.exit',
+    'semantic_restart_recovery.exit')
+$portableClosureMatches = [regex]::Matches(
+    $portableWorkflowSource,
+    '(?ms)expected_files="\$\(printf ''%s\\n'' \\\r?\n(?<body>.*?) \| LC_ALL=C sort\)"')
+if ($portableClosureMatches.Count -ne 2) {
+    throw "The portable workflow does not close both evidence transfers."
+}
+foreach ($closureMatch in $portableClosureMatches) {
+    $actualClosureFiles = @(
+        [regex]::Matches(
+            $closureMatch.Groups['body'].Value,
+            '(?m)^\s+(?<path>[a-z0-9_./-]+)(?:\s+\\)?\s*$') |
+            ForEach-Object { [string]$_.Groups['path'].Value })
+    if ($actualClosureFiles.Count -ne $expectedPortableClosureFiles.Count -or
+        @(Compare-Object `
+            -ReferenceObject $expectedPortableClosureFiles `
+            -DifferenceObject $actualClosureFiles `
+            -CaseSensitive).Count -ne 0) {
+        throw "The portable workflow evidence-file closure is not exact."
+    }
+}
+
+$portableAttestedSubcheckPattern = '(?ms)\(\[\.subchecks\[\]\.id\] == \[\r?\n                "rust_format",\r?\n                "portable_check",\r?\n                "portable_clippy",\r?\n                "semantic_full_loop",\r?\n                "semantic_outbox_recovery",\r?\n                "semantic_restart_recovery",\r?\n                "portable_full_suite"\r?\n              \]\) and'
+if (-not [regex]::IsMatch(
+        $portableAttestationJobSource,
+        $portableAttestedSubcheckPattern) -or
+    $portableAttestationJobSource.IndexOf(
+        '.artifact.path == ("logs/" + .id + ".log")',
+        [StringComparison]::Ordinal) -lt 0 -or
+    $portableAttestationJobSource.IndexOf(
+        'test "$(stat -c ''%s'' "$artifact")" = "$expected_size"',
+        [StringComparison]::Ordinal) -lt 0 -or
+    $portableAttestationJobSource.IndexOf(
+        'test "$(sha256sum "$artifact" | cut -d '' '' -f 1)" = "$expected_sha256"',
+        [StringComparison]::Ordinal) -lt 0) {
+    throw "The portable attestation subject validation is not exact."
+}
+
 $evidenceSpec = Get-Content -LiteralPath $evidenceSpecPath -Raw -Encoding UTF8 |
     ConvertFrom-Json -ErrorAction Stop
 $sourceCommandRegistry = Get-Content `
@@ -1136,10 +1320,11 @@ $generator = Get-SteinSourceEvidenceGenerator `
         $noLeaksScannerPath,
         $noLeaksScannerLauncherPath,
         $noLeaksScannerTestPath,
+        $portableWorkflowPath,
         $packageToolsPath)
 $generatorJson = $generator | ConvertTo-Json -Depth 8 -Compress
 if ([int]$generator.schema_version -ne 1 -or
-    @($generator.files).Count -ne 20 -or
+    @($generator.files).Count -ne 21 -or
     [string]$generator.digest_sha256 -notmatch '^[0-9a-f]{64}$' -or
     $generatorJson.IndexOf($repoRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
     throw "Source generator provenance is invalid."
@@ -1375,6 +1560,7 @@ finally {
     source_command_tamper_contracts_bound = $true
     source_command_runner_library_bound = $true
     source_command_test_parsed = $true
+    portable_attestation_workflow_bound = $true
     gate_specific_source_mapping_bound = $true
     repository_state_content_free = $true
     generated_outputs_ignored = $true
